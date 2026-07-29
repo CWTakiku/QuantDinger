@@ -293,6 +293,25 @@ class EmailService:
             return False, code_or_msg
         
         code = code_or_msg
+
+        # Local/source-dev: no SMTP required; code is logged and returned to API caller.
+        email_dev_mode = (os.getenv('EMAIL_DEV_MODE', '') or '').strip().lower() in {
+            '1', 'true', 'yes', 'on',
+        }
+        if email_dev_mode and not self.email_enabled:
+            logger.warning(
+                "[EMAIL_DEV_MODE] verification code for %s (%s): %s",
+                email,
+                code_type,
+                code,
+            )
+            print(
+                f"\n========== EMAIL_DEV_MODE ==========\n"
+                f"email={email}\ntype={code_type}\ncode={code}\n"
+                f"====================================\n",
+                flush=True,
+            )
+            return True, f'dev:{code}'
         
         # Prepare email content based on type
         if code_type == 'register':

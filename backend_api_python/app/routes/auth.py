@@ -689,7 +689,11 @@ def send_verification_code():
         if success:
             security.log_security_event('verification_code_sent', None, ip_address, 
                                        _get_user_agent(), {'email': email, 'type': code_type})
-            return jsonify({'code': 1, 'msg': 'Verification code sent', 'data': None})
+            data = None
+            if isinstance(msg, str) and msg.startswith('dev:'):
+                data = {'dev_code': msg[4:]}
+                msg = 'Verification code sent (EMAIL_DEV_MODE)'
+            return jsonify({'code': 1, 'msg': msg, 'data': data})
         else:
             return jsonify({'code': 0, 'msg': msg, 'data': None}), 500
             
