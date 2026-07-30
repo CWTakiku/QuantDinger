@@ -1,6 +1,9 @@
 """
 中国A股数据源 — 多层 fallback
 
+已配置 TUSHARE_TOKEN:
+  日线 → Tushare（Tier 0） → Twelve Data → 腾讯 → yfinance → AkShare
+
 有 TWELVE_DATA_API_KEY:
   所有周期 → Twelve Data（主） → 腾讯日/周线 → yfinance → AkShare
 
@@ -22,13 +25,14 @@ from app.data_sources.asia_stock_kline import (
     fetch_akshare_minute_klines,
     fetch_akshare_weekly_klines,
 )
+from app.data_sources.tushare_cn import fetch_tushare_daily_klines, is_tushare_configured
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
 
 class CNStockDataSource(BaseDataSource):
-    """A股数据源（TwelveData + Tencent + yfinance + AkShare）"""
+    """A股数据源（Tushare + TwelveData + Tencent + yfinance + AkShare）"""
 
     name = "CNStock/multi-source"
 
@@ -61,6 +65,20 @@ class CNStockDataSource(BaseDataSource):
         code = normalize_cn_code(symbol)
         tf = normalize_chart_timeframe(timeframe)
         lim = max(int(limit or 300), 1)
+
+        # Tier 0: Tushare daily (operator token + optional custom HTTP URL)
+        if tf in ("1D",) and is_tushare_configured():
+            rows = fetch_tushare_daily_klines(
+                tencent_code=code, limit=lim, before_time=before_time
+            )
+            if rows:
+                return self.filter_and_limit(
+                    rows,
+                    limit=lim,
+                    before_time=before_time,
+                    after_time=after_time,
+                    truncate=(after_time is None),
+                )
 
         # Tier 1: Twelve Data (paid, most reliable)
         rows = fetch_twelvedata_klines(
