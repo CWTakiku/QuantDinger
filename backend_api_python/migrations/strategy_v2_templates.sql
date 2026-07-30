@@ -534,9 +534,11 @@ def rebalance(context, data):
         order_target_percent(symbol, weight, reason="low_volatility")
 $lowvol$, '{"params":[{"name":"lookback","type":"integer","default":60,"min":10,"max":250,"step":5,"labelKey":"strategyV2.params.lookback"},{"name":"top_n","type":"integer","default":4,"min":1,"max":10,"step":1,"labelKey":"strategyV2.params.topN"},{"name":"max_weight","type":"percent","default":0.25,"min":0.05,"max":1,"step":0.05,"labelKey":"strategyV2.params.maxWeight"}]}'::jsonb, '["strategy-v2","portfolio","cross-sectional","low-volatility","rotation"]'::jsonb, 'safety', 'cyan', 130, TRUE, '{"source":"system_seed","version":8,"apiVersion":2}'::jsonb, NOW()),
 
-('strategy_v2_quality_growth', 'portfolio_strategy', 'Quality Growth Multi-Factor', 'A weekly point-in-time portfolio combining profitability, growth, and balance-sheet quality.', $quality$"""
+('strategy_v2_quality_growth', 'portfolio_strategy', 'Quality Growth Multi-Factor', 'A weekly point-in-time CSI300 portfolio combining profitability, growth, and balance-sheet quality.', $quality$"""
 Quality Growth Multi-Factor
-Weekly point-in-time ranking by profitability, growth, and balance-sheet quality.
+Weekly point-in-time CSI300 ranking by profitability, growth, and balance-sheet quality (A-share fundamentals).
+
+For CSI500, change pool/benchmark to csi500 and CNStock:000905.SH.
 """
 
 # @param top_n int 5 range=1:10:1
@@ -546,14 +548,11 @@ Weekly point-in-time ranking by profitability, growth, and balance-sheet quality
 # @param max_weight float 0.2 range=0.05:1:0.05
 
 def initialize(context):
-    g.universe = [
-        "USStock:AAPL", "USStock:MSFT", "USStock:NVDA", "USStock:AMZN", "USStock:META",
-        "USStock:GOOGL", "USStock:AVGO", "USStock:COST", "USStock:JPM", "USStock:XOM",
-    ]
-    context.set_universe(g.universe)
-    context.set_benchmark("USStock:SPY")
+    context.set_universe(pool="csi300")
+    context.set_benchmark("CNStock:000300.SH")
     context.subscribe(frequency="1d")
     context.set_warmup(10)
+    context.set_metadata(direction_mode="long_only")
     run_weekly(rebalance, weekday=1, time="09:35")
 
 
@@ -563,7 +562,7 @@ def rebalance(context, data):
     min_growth = float(context.params.get("min_growth", 0.0))
     max_debt = float(context.params.get("max_debt_to_equity", 2.0))
     max_weight = float(context.params.get("max_weight", 0.2))
-    symbols = list(g.universe)
+    symbols = get_universe_stocks()
     factors = get_fundamentals(["ROE", "REVENUE_GROWTH", "DEBT_TO_EQUITY"], symbols)
     if factors.empty:
         return

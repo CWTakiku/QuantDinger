@@ -846,6 +846,23 @@ CONFIG_SCHEMA = {
                 'description': 'Tiingo API key for Forex/Metals data'
             },
             {
+                'key': 'TUSHARE_TOKEN',
+                'label': 'Tushare Token',
+                'type': 'password',
+                'required': False,
+                'link': 'https://tushare.pro/register',
+                'link_text': 'settings.link.getToken',
+                'description': 'Tushare token for China A-share daily bars (preferred CNStock source when set). Compatible gateways also work.'
+            },
+            {
+                'key': 'TUSHARE_HTTP_URL',
+                'label': 'Tushare HTTP API URL',
+                'type': 'text',
+                'required': False,
+                'default': '',
+                'description': 'Optional custom Tushare-compatible API base URL (e.g. https://ts.gyzcloud.top/api). Leave empty for the official endpoint.'
+            },
+            {
                 'key': 'TWELVE_DATA_API_KEY',
                 'label': 'Twelve Data API Key',
                 'type': 'password',

@@ -219,7 +219,11 @@ class FundamentalDataService:
     def sync_history(self, *, market: str, symbol: str) -> dict[str, Any]:
         normalized_market = str(market or "").strip()
         normalized_symbol = str(symbol or "").strip().upper()
-        if normalized_market != "USStock" or not normalized_symbol:
+        if not normalized_symbol:
+            raise ValueError("factor.fundamentalHistoryMarketUnsupported")
+        if normalized_market == "CNStock":
+            return self._sync_history_cn(normalized_symbol)
+        if normalized_market != "USStock":
             raise ValueError("factor.fundamentalHistoryMarketUnsupported")
 
         import yfinance as yf
@@ -312,6 +316,61 @@ class FundamentalDataService:
             "firstAvailableAt": _availability_date(periods[0], earnings_dates)[0].isoformat(),
             "lastAvailableAt": _availability_date(periods[-1], earnings_dates)[0].isoformat(),
         }
+
+    def _sync_history_cn(self, symbol: str) -> dict[str, Any]:
+        from app.data_sources.tushare_cn import fetch_tushare_fina_history, is_tushare_configured
+
+        if not is_tushare_configured():
+            raise ValueError("factor.fundamentalDataUnavailable")
+        storage_symbol = _cn_storage_symbol(symbol)
+        rows = fetch_tushare_fina_history(storage_symbol)
+        if not rows:
+            raise ValueError("factor.fundamentalDataUnavailable")
+        stored = 0
+        first_available: date | None = None
+        last_available: date | None = None
+        for row in rows:
+            available_at = row["available_at"]
+            payload = {
+                "market": "CNStock",
+                "symbol": storage_symbol,
+                "period_end": row["period_end"],
+                "available_at": available_at,
+                "frequency": "quarterly",
+                "currency": "CNY",
+                "return_on_equity": row.get("return_on_equity"),
+                "revenue_growth": row.get("revenue_growth"),
+                "debt_to_equity": row.get("debt_to_equity"),
+                "source": "tushare_fina_indicator",
+                "source_version": date.today().isoformat(),
+                "metadata": {
+                    "pointInTime": True,
+                    "availabilitySource": "ann_date",
+                },
+            }
+            if any(_finite_or_none(payload.get(field)) is not None for field in FUNDAMENTAL_FIELDS):
+                self.upsert(payload)
+                stored += 1
+                first_available = available_at if first_available is None else min(first_available, available_at)
+                last_available = available_at if last_available is None else max(last_available, available_at)
+        if not stored:
+            raise ValueError("factor.fundamentalDataUnavailable")
+        return {
+            "market": "CNStock",
+            "symbol": storage_symbol,
+            "observations": stored,
+            "firstAvailableAt": first_available.isoformat() if first_available else None,
+            "lastAvailableAt": last_available.isoformat() if last_available else None,
+        }
+
+
+def _cn_storage_symbol(symbol: str) -> str:
+    text = str(symbol or "").strip().upper()
+    if text.endswith(".SH") or text.endswith(".SZ"):
+        text = text[:-3]
+    if text.startswith("SH") or text.startswith("SZ"):
+        text = text[2:]
+    return text
 
 
 def _finite_or_none(value: Any) -> float | None:

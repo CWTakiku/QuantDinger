@@ -120,3 +120,68 @@ def fetch_tushare_daily_klines(
         except (TypeError, ValueError, KeyError):
             continue
     return out
+
+
+def _pct_to_ratio(value: Any) -> Optional[float]:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number != number or abs(number) == float("inf"):
+        return None
+    # Tushare fina_indicator ROE / YoY fields are percentages (e.g. 34.46).
+    return number / 100.0
+
+
+def fetch_tushare_fina_history(tencent_code: str) -> List[Dict[str, Any]]:
+    """Point-in-time financial indicators for A-shares via Tushare fina_indicator."""
+    if not is_tushare_configured():
+        return []
+    pro = _build_pro()
+    if pro is None:
+        return []
+    ts_code = tencent_code_to_ts_code(tencent_code)
+    fields = "ts_code,end_date,ann_date,roe,debt_to_eqt,or_yoy,tr_yoy"
+    try:
+        df = pro.fina_indicator(ts_code=ts_code, fields=fields)
+    except Exception as exc:
+        logger.warning("Tushare fina_indicator failed ts_code=%s: %s", ts_code, exc)
+        return []
+    if df is None or getattr(df, "empty", True):
+        return []
+    # Prefer the latest announcement row per report period.
+    df = df.sort_values(["end_date", "ann_date"]).drop_duplicates("end_date", keep="last")
+    out: List[Dict[str, Any]] = []
+    for _, row in df.iterrows():
+        end_raw = str(row.get("end_date") or "").strip()
+        ann_raw = str(row.get("ann_date") or "").strip() or end_raw
+        if len(end_raw) != 8 or len(ann_raw) != 8:
+            continue
+        try:
+            period_end = datetime.strptime(end_raw, "%Y%m%d").date()
+            available_at = datetime.strptime(ann_raw, "%Y%m%d").date()
+        except ValueError:
+            continue
+        growth = row.get("or_yoy")
+        if growth is None or (isinstance(growth, float) and growth != growth):
+            growth = row.get("tr_yoy")
+        out.append(
+            {
+                "period_end": period_end,
+                "available_at": available_at,
+                "return_on_equity": _pct_to_ratio(row.get("roe")),
+                "revenue_growth": _pct_to_ratio(growth),
+                "debt_to_equity": _finite_float(row.get("debt_to_eqt")),
+            }
+        )
+    return out
+
+
+def _finite_float(value: Any) -> Optional[float]:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number != number or abs(number) == float("inf"):
+        return None
+    return number

@@ -123,3 +123,35 @@ def test_sync_history_persists_reported_quarters_with_point_in_time_dates(monkey
     assert persisted[-1]["market_cap"] == 700.0
     assert persisted[-1]["revenue_growth"] == pytest.approx(0.4)
     assert persisted[-1]["metadata"]["pointInTime"] is True
+
+
+def test_sync_history_cn_uses_tushare_ann_date(monkeypatch):
+    from datetime import date
+
+    import app.data_sources.tushare_cn as tushare_cn
+
+    def fake_fetch(_symbol):
+        return [
+            {
+                "period_end": date(2025, 12, 31),
+                "available_at": date(2026, 3, 28),
+                "return_on_equity": 0.18,
+                "revenue_growth": 0.12,
+                "debt_to_equity": 0.4,
+            }
+        ]
+
+    monkeypatch.setattr(tushare_cn, "fetch_tushare_fina_history", fake_fetch)
+    monkeypatch.setattr(tushare_cn, "is_tushare_configured", lambda: True)
+
+    persisted = []
+    service = FundamentalDataService()
+    monkeypatch.setattr(service, "upsert", lambda payload: persisted.append(payload))
+
+    result = service.sync_history(market="CNStock", symbol="600519.SH")
+
+    assert result["symbol"] == "600519"
+    assert result["observations"] == 1
+    assert persisted[0]["available_at"] == date(2026, 3, 28)
+    assert persisted[0]["return_on_equity"] == pytest.approx(0.18)
+    assert persisted[0]["source"] == "tushare_fina_indicator"
