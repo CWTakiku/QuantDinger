@@ -22,6 +22,7 @@ from app.services.factors import (
 from .contract import CompiledStrategyV2, StrategyV2ContractError, compile_strategy_v2
 from .data import MultiAssetDataPortal
 from .protection import ProtectionDecision, ProtectionEngine, ProtectionSpec, ProtectionState
+from app.markets.cn_stock.lot_rules import cn_stock_lot_spec, cn_stock_min_open
 
 
 def _backtest_time_iso(value: Any) -> str:
@@ -549,18 +550,32 @@ class MultiAssetSimulationBroker:
             fill_price = open_price * (1.0 + self.slippage if delta > 0 else 1.0 - self.slippage)
             requested_delta = delta
             lot_size = self._lot_size(order.symbol, bar)
-            delta = self._round_to_lot(delta, lot_size)
-            if abs(delta) < lot_size - 1e-12:
-                self.order_ledger.append(self._order_event(
-                    order_id, order, timestamp, "rejected", "minimum_trade_unit",
-                    requested_quantity=abs(requested_delta),
-                ))
-                batch_event_indexes.append(len(self.order_ledger) - 1)
-                continue
+            min_open = self._min_open_quantity(order.symbol, bar)
+            if closes_position:
+                # A-share odd-lot exit is allowed when closing the whole position.
+                delta = -current.amount
+            else:
+                delta = self._round_to_lot(delta, lot_size)
+                if abs(delta) < lot_size - 1e-12:
+                    self.order_ledger.append(self._order_event(
+                        order_id, order, timestamp, "rejected", "minimum_trade_unit",
+                        requested_quantity=abs(requested_delta),
+                    ))
+                    batch_event_indexes.append(len(self.order_ledger) - 1)
+                    continue
+                if abs(current.amount) <= 1e-12 and abs(delta) + 1e-12 < min_open:
+                    self.order_ledger.append(self._order_event(
+                        order_id, order, timestamp, "rejected", "minimum_trade_unit",
+                        requested_quantity=abs(requested_delta),
+                    ))
+                    batch_event_indexes.append(len(self.order_ledger) - 1)
+                    continue
             liquidity_cap = None if forced_liquidation else self._liquidity_cap(bar, lot_size)
             if liquidity_cap is not None and abs(delta) > liquidity_cap:
                 delta = math.copysign(liquidity_cap, delta)
             if forced_liquidation:
+                feasible_delta, constraint_reason = delta, ""
+            elif closes_position:
                 feasible_delta, constraint_reason = delta, ""
             else:
                 feasible_delta, constraint_reason = self._feasible_delta(
@@ -571,13 +586,29 @@ class MultiAssetSimulationBroker:
                     lot_size=lot_size,
                     position_key=position_key,
                 )
-            if abs(feasible_delta) < lot_size - 1e-12:
+            min_fill = 0.0 if closes_position else (lot_size - 1e-12)
+            if abs(feasible_delta) < min_fill:
                 self.order_ledger.append(self._order_event(
                     order_id,
                     order,
                     timestamp,
                     "rejected",
                     constraint_reason or "position_limit",
+                    requested_quantity=abs(requested_delta),
+                ))
+                batch_event_indexes.append(len(self.order_ledger) - 1)
+                continue
+            if (
+                not closes_position
+                and abs(current.amount) <= 1e-12
+                and abs(feasible_delta) + 1e-12 < min_open
+            ):
+                self.order_ledger.append(self._order_event(
+                    order_id,
+                    order,
+                    timestamp,
+                    "rejected",
+                    "minimum_trade_unit",
                     requested_quantity=abs(requested_delta),
                 ))
                 batch_event_indexes.append(len(self.order_ledger) - 1)
@@ -801,7 +832,20 @@ class MultiAssetSimulationBroker:
         explicit = float((bar or {}).get("lot_size") or 0.0)
         if explicit > 0:
             return explicit
+        cn_spec = cn_stock_lot_spec(symbol)
+        if cn_spec is not None:
+            return cn_spec[0]
         return 1e-8 if str(symbol).startswith("Crypto:") else 1.0
+
+    @staticmethod
+    def _min_open_quantity(symbol: str, bar: Mapping[str, Any] | None) -> float:
+        explicit = float((bar or {}).get("min_lot") or (bar or {}).get("min_open") or 0.0)
+        if explicit > 0:
+            return explicit
+        cn_min = cn_stock_min_open(symbol)
+        if cn_min is not None:
+            return cn_min
+        return MultiAssetSimulationBroker._lot_size(symbol, bar)
 
     @staticmethod
     def _round_to_lot(value: float, lot_size: float) -> float:

@@ -26,6 +26,7 @@ from app.services.strategy_v2 import (
     compile_strategy_v2,
 )
 from app.services.strategy_v2.live_execution import LiveOrderRequest, StrategyV2OrderGateway
+from app.markets.cn_stock.lot_rules import adjust_cn_stock_target
 from app.utils.db import get_db_connection
 from app.utils.logger import get_logger
 from app.utils.strategy_runtime_logs import append_strategy_log
@@ -622,6 +623,16 @@ class TradingExecutor:
             leverage=leverage,
             market_type=market_type,
         )
+        market_category = str(member.get("market") or "")
+        qualified_symbol = str(intent.symbol or symbol or "")
+        if not qualified_symbol.upper().startswith("CNSTOCK:") and market_category.upper() in {"CNSTOCK", "CN"}:
+            qualified_symbol = f"CNStock:{symbol}" if symbol else qualified_symbol
+        target_amount = adjust_cn_stock_target(
+            qualified_symbol or symbol,
+            current_amount,
+            target_amount,
+            market_tag=str(member.get("board") or member.get("segment") or ""),
+        )
         if market_type == "spot" and target_amount < -1e-12:
             raise RuntimeError("strategyV2.spotShortUnsupported")
 
@@ -643,7 +654,7 @@ class TradingExecutor:
                 leverage=leverage,
                 initial_capital=initial_capital,
                 market_type=market_type,
-                market_category=str(member.get("market") or ""),
+                market_category=market_category,
                 execution_mode=execution_mode,
                 notification_config=notification_config,
                 trading_config=trading_config,

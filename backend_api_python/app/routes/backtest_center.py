@@ -316,6 +316,28 @@ def get_factor_research_run():
         return jsonify({"code": 0, "msg": str(exc), "data": None}), 500
 
 
+@backtest_center_blp.route("/factor-research/delete", methods=["POST"])
+@login_required
+def delete_factor_research_run():
+    try:
+        payload = request.get_json(silent=True) or {}
+        run_id = _positive_int(payload.get("runId") or request.args.get("runId"))
+        if not run_id:
+            raise ValueError("strategyV2.runIdRequired")
+        deleted = get_factor_research_repository().delete_run(
+            user_id=int(g.user_id),
+            run_id=run_id,
+        )
+        if not deleted:
+            return jsonify({"code": 0, "msg": "strategyV2.factorResearchRunNotFound", "data": None}), 404
+        return jsonify({"code": 1, "msg": "success", "data": {"runId": run_id}})
+    except ValueError as exc:
+        return jsonify({"code": 0, "msg": str(exc), "data": None}), 400
+    except Exception as exc:
+        logger.exception("Factor research delete failed")
+        return jsonify({"code": 0, "msg": str(exc), "data": None}), 500
+
+
 @backtest_center_blp.route("/tune", methods=["POST"])
 @login_required
 def tune_strategy():
@@ -405,6 +427,28 @@ def get_strategy_backtest():
         return jsonify({"code": 0, "msg": str(exc), "data": None}), 400
     except Exception as exc:
         logger.exception("Backtest lookup failed")
+        return jsonify({"code": 0, "msg": str(exc), "data": None}), 500
+
+
+@backtest_center_blp.route("/delete", methods=["POST"])
+@login_required
+def delete_strategy_backtest():
+    try:
+        payload = request.get_json(silent=True) or {}
+        run_id = _positive_int(payload.get("runId") or request.args.get("runId"))
+        if not run_id:
+            raise ValueError("strategyV2.runIdRequired")
+        deleted = get_strategy_backtest_repository().delete_run(
+            user_id=int(g.user_id),
+            run_id=run_id,
+        )
+        if not deleted:
+            return jsonify({"code": 0, "msg": "strategyV2.runNotFound", "data": None}), 404
+        return jsonify({"code": 1, "msg": "success", "data": {"runId": run_id}})
+    except ValueError as exc:
+        return jsonify({"code": 0, "msg": str(exc), "data": None}), 400
+    except Exception as exc:
+        logger.exception("Backtest delete failed")
         return jsonify({"code": 0, "msg": str(exc), "data": None}), 500
 
 

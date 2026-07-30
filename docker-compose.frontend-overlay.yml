@@ -1,0 +1,19 @@
+services:
+  frontend:
+    volumes:
+      - ./frontend-overlay/index.html:/usr/share/nginx/html/index.html:ro
+      - ./frontend-overlay/assets/cn-ashare-locale.css:/usr/share/nginx/html/assets/cn-ashare-locale.css:ro
+      - ./frontend-overlay/assets/index-UONy4VFT.js:/usr/share/nginx/html/assets/index-UONy4VFT.js:ro
+      - ./frontend-overlay/assets/index-UONy4VFT.js:/usr/share/nginx/html/assets/index-UONy4VFS.js:ro
+      - ./frontend-overlay/assets/KlineChart-DS_9oKWF.js:/usr/share/nginx/html/assets/KlineChart-DS_9oKWF.js:ro
+      - ./frontend-overlay/assets/charts-D3HkzDVY.js:/usr/share/nginx/html/assets/charts-D3HkzDVY.js:ro
+      - ./frontend-overlay/assets/index-voQV6Z8M.js:/usr/share/nginx/html/assets/index-voQV6Z8M.js:ro
+      - ./frontend-overlay/assets/index-voQV6Z8M.js:/usr/share/nginx/html/assets/index-voQV6Z8L.js:ro
+      - ./frontend-overlay/assets/index-BK6khKvD.css:/usr/share/nginx/html/assets/index-BK6khKvD.css:ro
+      - ./frontend-overlay/assets/index-8kIub9DK.css:/usr/share/nginx/html/assets/index-8kIub9DK.css:ro
+      - ./frontend-overlay/assets/index-C2n01AxG.css:/usr/share/nginx/html/assets/index-C2n01AxG.css:ro
+      - ./frontend-overlay/assets/index-N4cFAWPa.css:/usr/share/nginx/html/assets/index-N4cFAWPa.css:ro
+      - ./frontend-overlay/assets/index-CBqAslAV.js:/usr/share/nginx/html/assets/index-CBqAslAV.js:ro
+      - ./frontend-overlay/assets/index-D1U-6Nf4.js:/usr/share/nginx/html/assets/index-D1U-6Nf4.js:ro
+      - ./frontend-overlay/assets/index-CkeAAe5w.js:/usr/share/nginx/html/assets/index-CkeAAe5w.js:ro
+      - ./frontend-overlay/assets/QuickTradePanel-DZiLsDhn.js:/usr/share/nginx/html/assets/QuickTradePanel-DZiLsDhn.js:ro

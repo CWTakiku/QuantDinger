@@ -3,10 +3,13 @@ from __future__ import annotations
 import os
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
+from zoneinfo import ZoneInfo
 
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+_SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
 def is_tushare_configured() -> bool:
@@ -51,8 +54,25 @@ def _build_pro():
 
 
 def _trade_date_to_unix(trade_date: str) -> int:
-    dt = datetime.strptime(str(trade_date), "%Y%m%d").replace(tzinfo=timezone.utc)
+    # A-share trade_date is a Shanghai calendar day; use local midnight so charts
+    # show 2026-07-29 00:00+08 instead of UTC midnight rendered as 08:00+08.
+    dt = datetime.strptime(str(trade_date), "%Y%m%d").replace(tzinfo=_SHANGHAI)
     return int(dt.timestamp())
+
+
+def daily_bars_cover_today(rows: List[Dict[str, Any]]) -> bool:
+    """True when the newest bar is on today's Asia/Shanghai calendar date."""
+    if not rows:
+        return False
+    try:
+        last = max(int(r.get("time") or 0) for r in rows)
+    except (TypeError, ValueError):
+        return False
+    if last <= 0:
+        return False
+    last_day = datetime.fromtimestamp(last, tz=_SHANGHAI).date()
+    today = datetime.now(_SHANGHAI).date()
+    return last_day >= today
 
 
 def fetch_tushare_daily_klines(

@@ -24,7 +24,7 @@ from .models import InstrumentSpec, StrategyManifest
 from .market_data import load_strategy_frame
 from .runtime import StrategyV2BacktestRunner
 from .snapshot import MarketDataSnapshotStore, canonical_frame_bytes
-from .storage import StrategyBacktestRepository
+from .storage import StrategyBacktestRepository, _enrich_symbol_display_names
 
 
 class StrategyV2BacktestService:
@@ -275,6 +275,8 @@ class StrategyV2BacktestService:
             "fundingMode": "not_modeled",
         }
 
+        _enrich_symbol_display_names(result)
+
         run_id = None
         if persist:
             if self.data_kind != "market":
@@ -421,9 +423,22 @@ def _warmup_calendar_days(frequency: str, warmup_bars: int) -> int:
     return backtest_warmup_calendar_days(frequency, warmup_bars)
 
 
+_POOL_DEFAULT_BENCHMARKS = {
+    "csi300": InstrumentSpec(market="CNStock", symbol="000300.SH", market_type="spot"),
+    "hs300": InstrumentSpec(market="CNStock", symbol="000300.SH", market_type="spot"),
+    "csi500": InstrumentSpec(market="CNStock", symbol="000905.SH", market_type="spot"),
+    "zz500": InstrumentSpec(market="CNStock", symbol="000905.SH", market_type="spot"),
+}
+
+
 def _benchmark_for_manifest(manifest: StrategyManifest) -> InstrumentSpec | None:
     if manifest.benchmark is not None:
         return manifest.benchmark
+    # Dynamic pool universes: prefer the matching local index over US SPY.
+    reference = str(manifest.universe.reference or "").strip()
+    pool_key = reference.split(":", 1)[-1].strip().lower() if reference else ""
+    if pool_key in _POOL_DEFAULT_BENCHMARKS:
+        return _POOL_DEFAULT_BENCHMARKS[pool_key]
     if manifest.strategy_type == "portfolio" or manifest.universe.kind != "static":
         return InstrumentSpec(market="USStock", symbol="SPY", market_type="spot")
     if not manifest.universe.instruments:
