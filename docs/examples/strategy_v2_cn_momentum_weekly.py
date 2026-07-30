@@ -18,6 +18,7 @@ def initialize(context):
     context.subscribe(frequency="1d", fields=["open", "high", "low", "close", "volume"])
     context.set_warmup(80)
     context.set_benchmark("CNStock:000300.SH")
+    context.set_metadata(direction_mode="long_only")
     # weekday: 1=Monday
     run_weekly(rebalance, weekday=1, time="09:35")
 

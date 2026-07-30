@@ -28,18 +28,25 @@ def tencent_code_to_ts_code(code: str) -> str:
     return s
 
 
+_pro_cache: Dict[tuple[str, str], Any] = {}
+
+
 def _build_pro():
     import tushare as ts
 
     token = str(os.environ.get("TUSHARE_TOKEN") or "").strip()
     if not token:
         return None
-    ts.set_token(token)
-    pro = ts.pro_api()
     http_url = str(os.environ.get("TUSHARE_HTTP_URL") or "").strip()
+    cache_key = (token, http_url)
+    cached = _pro_cache.get(cache_key)
+    if cached is not None:
+        return cached
+    pro = ts.pro_api(token)
     if http_url:
         # 运营商自定义基址（与官方 pro 兼容的 DataApi）
         pro._DataApi__http_url = http_url
+    _pro_cache[cache_key] = pro
     return pro
 
 
