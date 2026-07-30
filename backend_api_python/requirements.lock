@@ -122,6 +122,7 @@ tabulate==0.10.0
 tiktoken==0.13.0
 tokenizers==0.23.1
 toolz==1.1.0
+tushare==1.4.29
 tqdm==4.68.4
 typing-inspection==0.4.2
 typing_extensions==4.16.0
