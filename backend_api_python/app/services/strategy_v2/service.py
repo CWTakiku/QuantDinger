@@ -150,6 +150,7 @@ class StrategyV2BacktestService:
             manifest=manifest,
             start_date=start_date,
             end_date=end_date,
+            params=params,
         )
         if not candidates:
             raise StrategyV2ContractError("strategyV2.universeHasNoData")
@@ -174,12 +175,17 @@ class StrategyV2BacktestService:
             frames = enricher(frames, candidates)
             self.validate_fundamental_dependencies(frames, manifest)
 
+        allowed_keys = {item["key"] for item in candidates}
+
         def resolve_universe(reference: str, timestamp: pd.Timestamp) -> list[str]:
             del reference
             if not universe_id:
-                return [item["key"] for item in candidates]
+                return [item["key"] for item in candidates if item["key"] in frames]
             members = self.universe_service.resolve_members(user_id, universe_id, as_of=timestamp.date())
-            return [_member_key(item) for item in members]
+            keys = [_member_key(item) for item in members]
+            # Keep runtime universe aligned with fetched candidates (e.g. universe_top_n).
+            filtered = [key for key in keys if key in allowed_keys and key in frames]
+            return filtered or [key for key in allowed_keys if key in frames]
 
         runner = StrategyV2BacktestRunner(
             code=code,
@@ -309,6 +315,7 @@ class StrategyV2BacktestService:
         manifest: StrategyManifest,
         start_date: datetime,
         end_date: datetime,
+        params: dict[str, Any] | None = None,
     ) -> tuple[list[dict[str, Any]], int | None]:
         if manifest.universe.kind == "static":
             return [_instrument_member(item) for item in manifest.universe.instruments], None
@@ -327,6 +334,17 @@ class StrategyV2BacktestService:
         limit = max(1, int(os.getenv("STRATEGY_V2_MAX_SYMBOLS", "600") or 600))
         if len(members) > limit:
             raise StrategyV2ContractError("strategyV2.universeTooLarge")
+        top_n = 0
+        try:
+            top_n = int((params or {}).get("universe_top_n") or 0)
+        except (TypeError, ValueError):
+            top_n = 0
+        if top_n > 0 and len(members) > top_n:
+            members = sorted(
+                members,
+                key=lambda item: float(item.get("weight") or 0.0),
+                reverse=True,
+            )[:top_n]
         return [{**item, "key": _member_key(item)} for item in members], universe_id
 
     def fetch_frames(

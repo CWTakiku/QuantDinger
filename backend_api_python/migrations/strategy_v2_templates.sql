@@ -10,6 +10,7 @@ WHERE template_key NOT IN (
     'strategy_v2_indicator_resonance',
     'strategy_v2_macd_kdj',
     'strategy_v2_supertrend',
+    'strategy_v2_csi300_enhanced',
     'strategy_v2_market_cap_barbell',
     'strategy_v2_momentum_top_n',
     'strategy_v2_low_volatility',
@@ -449,48 +450,52 @@ def rebalance(context, data):
         order_target_percent(symbol, weight, reason="market_cap_barbell")
 $marketcap$, '{"params":[{"name":"per_side","type":"integer","default":3,"min":1,"max":6,"step":1,"labelKey":"strategyV2.params.perSide"},{"name":"min_roe","type":"number","default":0,"min":-1,"max":1,"step":0.01,"labelKey":"strategyV2.params.minRoe"},{"name":"max_weight","type":"percent","default":0.2,"min":0.05,"max":1,"step":0.05,"labelKey":"strategyV2.params.maxWeight"}]}'::jsonb, '["strategy-v2","portfolio","cross-sectional","fundamental","market-cap"]'::jsonb, 'appstore', 'geekblue', 110, TRUE, '{"source":"system_seed","version":8,"apiVersion":2}'::jsonb, NOW()),
 
-('strategy_v2_momentum_top_n', 'portfolio_strategy', 'Momentum Top-N Rotation', 'A weekly U.S. stock portfolio selecting the strongest trailing momentum.', $momentum$"""
+('strategy_v2_momentum_top_n', 'portfolio_strategy', 'Momentum Top-N Rotation', 'Weekly CSI500 (中证500) long-only Top-N by trailing price momentum.', $momentum$"""
 Momentum Top-N Rotation
-Weekly cross-sectional rotation into the strongest trailing momentum names.
+Weekly CSI500 long-only rotation into the strongest trailing momentum names.
 """
 
-# @param lookback int 60 range=10:250:5
-# @param top_n int 4 range=1:10:1
-# @param max_weight float 0.25 range=0.05:1:0.05
+# @param lookback int 60 Momentum lookback days range=10:250:5
+# @param top_n int 10 Number of holdings range=1:30:1
+# @param max_weight float 0.12 Max weight per name range=0.05:1:0.05
 
 def initialize(context):
-    g.universe = [
-        "USStock:AAPL", "USStock:MSFT", "USStock:NVDA", "USStock:AMZN", "USStock:META",
-        "USStock:GOOGL", "USStock:AVGO", "USStock:COST", "USStock:JPM", "USStock:XOM",
-    ]
-    context.set_universe(g.universe)
-    context.set_benchmark("USStock:SPY")
-    context.subscribe(frequency="1d")
-    context.set_warmup(260)
+    context.set_universe(pool="csi500")
+    context.set_benchmark("CNStock:000905.SH")
+    context.subscribe(frequency="1d", fields=["open", "high", "low", "close", "volume"])
+    context.set_warmup(130)
+    context.set_metadata(direction_mode="long_only")
     run_weekly(rebalance, weekday=1, time="09:35")
 
 
 def rebalance(context, data):
     lookback = int(context.params.get("lookback", 60))
-    top_n = int(context.params.get("top_n", 4))
-    max_weight = float(context.params.get("max_weight", 0.25))
+    top_n = int(context.params.get("top_n", 10))
+    max_weight = float(context.params.get("max_weight", 0.12))
     scores = {}
-    for symbol in g.universe:
-        bars = get_history(lookback + 1, "1d", "close", symbol)
-        if len(bars) < lookback + 1:
+    for symbol in get_universe_stocks():
+        try:
+            bars = get_history(lookback + 1, "1d", "close", symbol)
+        except Exception:
+            continue
+        if bars is None or len(bars) < lookback + 1:
             continue
         first = float(bars["close"].iloc[0])
         last = float(bars["close"].iloc[-1])
         if first > 0:
             scores[symbol] = last / first - 1.0
-    selected = [symbol for symbol, score in sorted(scores.items(), key=lambda item: item[1], reverse=True)[:top_n] if score > 0]
+    selected = [
+        symbol
+        for symbol, score in sorted(scores.items(), key=lambda item: item[1], reverse=True)[:top_n]
+        if score > 0
+    ]
     for symbol in get_positions().keys():
         if symbol not in selected:
             order_target_percent(symbol, 0.0, reason="momentum_removed")
     weight = min(max_weight, 1.0 / len(selected)) if selected else 0.0
     for symbol in selected:
         order_target_percent(symbol, weight, reason="momentum_top_n")
-$momentum$, '{"params":[{"name":"lookback","type":"integer","default":60,"min":10,"max":250,"step":5,"labelKey":"strategyV2.params.lookback"},{"name":"top_n","type":"integer","default":4,"min":1,"max":10,"step":1,"labelKey":"strategyV2.params.topN"},{"name":"max_weight","type":"percent","default":0.25,"min":0.05,"max":1,"step":0.05,"labelKey":"strategyV2.params.maxWeight"}]}'::jsonb, '["strategy-v2","portfolio","cross-sectional","momentum","rotation"]'::jsonb, 'rocket', 'blue', 120, TRUE, '{"source":"system_seed","version":8,"apiVersion":2}'::jsonb, NOW()),
+$momentum$, '{"params":[{"name":"lookback","type":"integer","default":60,"min":10,"max":250,"step":5,"labelKey":"strategyV2.params.lookback"},{"name":"top_n","type":"integer","default":10,"min":1,"max":30,"step":1,"labelKey":"strategyV2.params.topN"},{"name":"max_weight","type":"percent","default":0.12,"min":0.05,"max":1,"step":0.05,"labelKey":"strategyV2.params.maxWeight"}]}'::jsonb, '["strategy-v2","portfolio","cross-sectional","momentum","rotation","csi500","cn-stock"]'::jsonb, 'rocket', 'blue', 120, TRUE, '{"source":"system_seed","version":9,"apiVersion":2}'::jsonb, NOW()),
 
 ('strategy_v2_low_volatility', 'portfolio_strategy', 'Low Volatility Rotation', 'A weekly U.S. stock portfolio selecting the lowest realized volatility names.', $lowvol$"""
 Low Volatility Rotation
@@ -580,7 +585,170 @@ def rebalance(context, data):
     weight = min(max_weight, 1.0 / len(selected)) if selected else 0.0
     for symbol in selected:
         order_target_percent(symbol, weight, reason="quality_growth")
-$quality$, '{"params":[{"name":"top_n","type":"integer","default":5,"min":1,"max":10,"step":1,"labelKey":"strategyV2.params.topN"},{"name":"min_roe","type":"number","default":0.1,"min":-1,"max":1,"step":0.01,"labelKey":"strategyV2.params.minRoe"},{"name":"min_growth","type":"number","default":0,"min":-1,"max":5,"step":0.01,"labelKey":"strategyV2.params.minGrowth"},{"name":"max_debt_to_equity","type":"number","default":2,"min":0,"max":10,"step":0.1,"labelKey":"strategyV2.params.maxDebtToEquity"},{"name":"max_weight","type":"percent","default":0.2,"min":0.05,"max":1,"step":0.05,"labelKey":"strategyV2.params.maxWeight"}]}'::jsonb, '["strategy-v2","portfolio","cross-sectional","fundamental","quality","growth"]'::jsonb, 'radar-chart', 'purple', 140, TRUE, '{"source":"system_seed","version":8,"apiVersion":2}'::jsonb, NOW())
+$quality$, '{"params":[{"name":"top_n","type":"integer","default":5,"min":1,"max":10,"step":1,"labelKey":"strategyV2.params.topN"},{"name":"min_roe","type":"number","default":0.1,"min":-1,"max":1,"step":0.01,"labelKey":"strategyV2.params.minRoe"},{"name":"min_growth","type":"number","default":0,"min":-1,"max":5,"step":0.01,"labelKey":"strategyV2.params.minGrowth"},{"name":"max_debt_to_equity","type":"number","default":2,"min":0,"max":10,"step":0.1,"labelKey":"strategyV2.params.maxDebtToEquity"},{"name":"max_weight","type":"percent","default":0.2,"min":0.05,"max":1,"step":0.05,"labelKey":"strategyV2.params.maxWeight"}]}'::jsonb, '["strategy-v2","portfolio","cross-sectional","fundamental","quality","growth"]'::jsonb, 'radar-chart', 'purple', 140, TRUE, '{"source":"system_seed","version":8,"apiVersion":2}'::jsonb, NOW()),
+
+('strategy_v2_csi300_enhanced', 'portfolio_strategy', 'CSI300 Enhanced Index QP', 'Weekly CSI300 enhanced-index portfolio: momentum/vol alpha with diagonal-risk QP rebalance.', $csehen$"""
+CSI300 Enhanced Index (Weekly QP)
+Long-only CSI300 enhanced index: daily alpha from momentum/vol, weekly QP rebalance.
+
+Institutional universe rule: names shorter than min_history_bars stay out of the
+alpha / QP set (no fabricated pre-IPO bars).
+"""
+
+# @param universe_top_n int 50 Cap CSI300 names by index weight for faster backtests range=20:300:10
+# @param active_limit float 0.025 Max active weight vs bench range=0.01:0.05:0.005
+# @param risk_aversion float 1.0 Risk aversion lambda range=0.1:5.0:0.1
+# @param turn_penalty float 0.01 Turnover soft penalty range=0.0:0.1:0.005
+# @param min_turnover float 0.02 Skip rebalance if turnover below this range=0.0:0.1:0.01
+# @param mom_fast int 60 Fast momentum lookback range=20:120:5
+# @param mom_slow int 120 Slow momentum lookback range=60:250:10
+# @param vol_period int 20 Realized vol lookback range=10:60:5
+# @param min_history_bars int 0 Min bars to enter alpha pool; 0 => mom_slow+1 range=0:260:1
+
+import pandas as pd
+
+
+def _min_history_bars(params):
+    params = params or {}
+    mom_slow = int(params.get("mom_slow", 120))
+    configured = int(params.get("min_history_bars", 0) or 0)
+    if configured > 0:
+        return configured
+    return mom_slow + 1
+
+
+def _eligible_symbols(symbols, min_bars):
+    """Keep names with enough visible history (listing / resume soft filter)."""
+    if not symbols or min_bars <= 0:
+        return list(symbols or [])
+    hist = get_history(min_bars, "1d", "close", symbols)
+    if hist is None:
+        return []
+    if isinstance(hist, dict):
+        eligible = []
+        for sym in symbols:
+            frame = hist.get(sym)
+            if frame is not None and len(frame) >= min_bars:
+                eligible.append(sym)
+        return eligible
+    if len(symbols) == 1 and len(hist) >= min_bars:
+        return [symbols[0]]
+    return []
+
+
+def initialize(context):
+    context.set_universe(pool="csi300")
+    context.subscribe(frequency="1d", fields=["open", "high", "low", "close", "volume"])
+    # Cover default mom_slow=120 (+ buffer). Raise if you use a longer lookback.
+    context.set_warmup(140)
+    context.set_benchmark("CNStock:000300.SH")
+    context.set_metadata(direction_mode="long_only")
+    g.alpha = {}
+    g.last_weights = {}
+    run_daily(update_alpha, time="15:05")
+    run_weekly(rebalance, weekday=1, time="09:35")
+
+
+def update_alpha(context, data):
+    symbols = get_universe_stocks()
+    if not symbols:
+        return
+    mom_fast = int(context.params.get("mom_fast", 60))
+    mom_slow = int(context.params.get("mom_slow", 120))
+    vol_period = int(context.params.get("vol_period", 20))
+    min_bars = _min_history_bars(context.params)
+    eligible = _eligible_symbols(symbols, min_bars)
+    excluded = len(symbols) - len(eligible)
+    if excluded > 0:
+        log("universe filter: eligible=%d excluded_short_history=%d min_bars=%d" % (
+            len(eligible), excluded, min_bars,
+        ))
+    if len(eligible) < 10:
+        return
+
+    try:
+        fast = get_factors(eligible, "momentum", period=mom_fast)
+        slow = get_factors(eligible, "momentum", period=mom_slow)
+        vol = get_factors(eligible, "realized_volatility", period=vol_period)
+    except Exception as exc:
+        log("update_alpha factors skipped: %s" % exc)
+        return
+    if fast is None or slow is None or vol is None:
+        return
+    if fast.empty or slow.empty or vol.empty:
+        return
+
+    frame = pd.DataFrame({
+        "mom_fast": fast["momentum"] if "momentum" in fast.columns else pd.Series(dtype=float),
+        "mom_slow": slow["momentum"] if "momentum" in slow.columns else pd.Series(dtype=float),
+        "vol": vol["realized_volatility"] if "realized_volatility" in vol.columns else pd.Series(dtype=float),
+    }).dropna(how="any")
+    if len(frame) < 10:
+        return
+
+    pieces = []
+    for col, sign in (("mom_fast", 1.0), ("mom_slow", 1.0), ("vol", -1.0)):
+        series = frame[col].astype(float)
+        med = float(series.median())
+        mad = float((series - med).abs().median())
+        if mad > 0:
+            radius = 5.0 * 1.4826 * mad
+            series = series.clip(med - radius, med + radius)
+        std = float(series.std(ddof=0))
+        if std <= 0:
+            continue
+        z = (series - float(series.mean())) / std
+        pieces.append(z * sign)
+    if not pieces:
+        return
+    alpha = pd.concat(pieces, axis=1).mean(axis=1)
+    std = float(alpha.std(ddof=0))
+    if std > 0:
+        alpha = (alpha - float(alpha.mean())) / std
+    g.alpha = {str(k): float(v) for k, v in alpha.items()}
+
+
+def rebalance(context, data):
+    alpha = dict(g.alpha or {})
+    if len(alpha) < 10:
+        return
+
+    symbols = list(alpha.keys())
+    n = len(symbols)
+    w_bench = {sym: 1.0 / n for sym in symbols}
+    w_prev = dict(g.last_weights) if g.last_weights else dict(w_bench)
+
+    result = optimize_enhanced_index(
+        alpha,
+        w_bench,
+        w_prev=w_prev,
+        active_limit=float(context.params.get("active_limit", 0.025)),
+        risk_aversion=float(context.params.get("risk_aversion", 1.0)),
+        turn_penalty=float(context.params.get("turn_penalty", 0.01)),
+    )
+    weights = result.get("weights") or {}
+    if not weights:
+        return
+
+    min_turn = float(context.params.get("min_turnover", 0.02))
+    if float(result.get("turnover") or 0.0) < min_turn:
+        log("skip rebalance: turnover=%.4f < %.4f" % (result.get("turnover") or 0.0, min_turn))
+        return
+
+    current = get_positions()
+    for symbol in current:
+        if symbol not in weights:
+            order_target_percent(symbol, 0.0, reason="ei_exit")
+
+    for symbol, weight in weights.items():
+        order_target_percent(symbol, float(weight), reason="ei_target")
+
+    g.last_weights = {str(k): float(v) for k, v in weights.items() if float(v) > 1e-8}
+    log(
+        "ei rebalance names=%d turnover=%.4f te_proxy=%.4f"
+        % (len(g.last_weights), result.get("turnover") or 0.0, result.get("active_risk_proxy") or 0.0)
+    )
+$csehen$, '{"params":[{"name":"universe_top_n","type":"integer","default":50,"min":20,"max":300,"step":10,"labelKey":"strategyV2.params.universeTopN"},{"name":"active_limit","type":"number","default":0.025,"min":0.01,"max":0.05,"step":0.005,"labelKey":"strategyV2.params.activeLimit"},{"name":"risk_aversion","type":"number","default":1.0,"min":0.1,"max":5.0,"step":0.1,"labelKey":"strategyV2.params.riskAversion"},{"name":"turn_penalty","type":"number","default":0.01,"min":0.0,"max":0.1,"step":0.005,"labelKey":"strategyV2.params.turnPenalty"},{"name":"min_turnover","type":"number","default":0.02,"min":0.0,"max":0.1,"step":0.01,"labelKey":"strategyV2.params.minTurnover"},{"name":"mom_fast","type":"integer","default":60,"min":20,"max":120,"step":5,"labelKey":"strategyV2.params.momFast"},{"name":"mom_slow","type":"integer","default":120,"min":60,"max":250,"step":10,"labelKey":"strategyV2.params.momSlow"},{"name":"vol_period","type":"integer","default":20,"min":10,"max":60,"step":5,"labelKey":"strategyV2.params.volPeriod"},{"name":"min_history_bars","type":"integer","default":0,"min":0,"max":260,"step":1,"labelKey":"strategyV2.params.minHistoryBars"}]}'::jsonb, '["strategy-v2","portfolio","csi300","cn-stock","enhanced-index","qp"]'::jsonb, 'fund', 'orange', 100, TRUE, '{"source":"system_seed","version":10,"apiVersion":2}'::jsonb, NOW())
 ON CONFLICT (template_key) DO UPDATE SET
     asset_type = EXCLUDED.asset_type,
     title = EXCLUDED.title,

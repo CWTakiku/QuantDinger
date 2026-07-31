@@ -19,10 +19,27 @@ from app.services.factors import (
     get_factor,
     is_talib_available,
 )
+from app.services.factors.talib_adapter import TalibFactorError
+
+_SOFT_FACTOR_ERROR_CODES = frozenset({
+    "factor.noData",
+    "factor.insufficientHistory",
+    "factor.missingFields",
+})
+
+
+def _soft_factor_error_code(exc: Exception) -> str:
+    code = str(getattr(exc, "code", "") or exc or "").strip()
+    if code in _SOFT_FACTOR_ERROR_CODES:
+        return code
+    # TA-Lib may encode missing fields as factor.missingFields:close,volume
+    root = code.split(":", 1)[0]
+    return root if root in _SOFT_FACTOR_ERROR_CODES else ""
 from .contract import CompiledStrategyV2, StrategyV2ContractError, compile_strategy_v2
 from .data import MultiAssetDataPortal
 from .protection import ProtectionDecision, ProtectionEngine, ProtectionSpec, ProtectionState
 from app.markets.cn_stock.lot_rules import cn_stock_lot_spec, cn_stock_min_open
+from app.services.csi300_enhanced import optimize_enhanced_index
 
 
 def _backtest_time_iso(value: Any) -> str:
@@ -395,22 +412,35 @@ class StrategyRuntimeContext:
             get_factor(factor_id.lower())
             return compute_factor(factor_id.lower(), frame, params)
         except FactorError as exc:
+            if _soft_factor_error_code(exc):
+                return float("nan")
             if exc.code != "factor.notFound":
                 raise
         output = str(params.pop("output", "") or "")
-        return compute_talib_factor(factor_id, frame, params, output=output)
+        try:
+            return compute_talib_factor(factor_id, frame, params, output=output)
+        except (FactorError, TalibFactorError) as exc:
+            if _soft_factor_error_code(exc):
+                return float("nan")
+            raise
 
     def get_factors(self, symbols: object, names: object, **params: Any) -> pd.DataFrame:
         requested_symbols = [symbols] if isinstance(symbols, str) else list(symbols or [])
-        requested_names = [names] if isinstance(names, str) else list(names or [])
+        requested_names = [str(name) for name in ([names] if isinstance(names, str) else list(names or []))]
         rows = {}
         for symbol in requested_symbols:
             key = self.portal.resolve_key(symbol)
             rows[key] = {
-                str(name): self.factor(name, key, **dict(params))
+                name: self.factor(name, key, **dict(params))
                 for name in requested_names
             }
-        return pd.DataFrame.from_dict(rows, orient="index")
+        frame = pd.DataFrame.from_dict(rows, orient="index")
+        # Keep a stable schema even when the universe is temporarily empty so
+        # strategy code can always do scores["momentum"] / dropna safely.
+        for name in requested_names:
+            if name not in frame.columns:
+                frame[name] = pd.Series(dtype=float)
+        return frame
 
     def get_fundamentals(self, fields: object, symbols: object = None, **_: Any) -> pd.DataFrame:
         requested_fields = [fields] if isinstance(fields, str) else list(fields or [])
@@ -1488,6 +1518,7 @@ class StrategyV2BacktestRunner:
             "get_factors": ctx.get_factors,
             "get_fundamentals": ctx.get_fundamentals,
             "is_trade": ctx.is_trade,
+            "optimize_enhanced_index": optimize_enhanced_index,
             "run_daily": lambda *args, **kwargs: None,
             "run_weekly": lambda *args, **kwargs: None,
             "run_monthly": lambda *args, **kwargs: None,
@@ -2119,6 +2150,7 @@ class StrategyV2LiveSession:
             "get_factors": ctx.get_factors,
             "get_fundamentals": ctx.get_fundamentals,
             "is_trade": ctx.is_trade,
+            "optimize_enhanced_index": optimize_enhanced_index,
             "run_daily": lambda *args, **kwargs: None,
             "run_weekly": lambda *args, **kwargs: None,
             "run_monthly": lambda *args, **kwargs: None,

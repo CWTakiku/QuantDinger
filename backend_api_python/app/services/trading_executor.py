@@ -408,12 +408,17 @@ class TradingExecutor:
             runtime_price_client: Dict[str, Any] = {}
 
             def runtime_prices() -> dict[str, float]:
+                # Prefer last bar closes from the already-loaded panel.  Portfolio
+                # universes can be hundreds of names; sequential get_ticker calls
+                # stall the risk loop past the health heartbeat window (~90s).
+                frame_prices = self._prices_from_frames(frames)
                 if execution_mode != "live":
-                    return self._live_prices(candidates)
+                    return frame_prices or self._live_prices(candidates)
                 return self._execution_account_prices(
                     candidates,
                     exchange_config,
                     runtime_price_client,
+                    seed_prices=frame_prices,
                 )
 
             if execution_mode == "live":
@@ -493,9 +498,18 @@ class TradingExecutor:
                 strategy_run_id=run_id,
             )
 
-            signal_poll = max(1.0, min(30.0, float(trading_config.get("data_poll_seconds") or 5)))
+            signal_poll = float(trading_config.get("data_poll_seconds") or 0)
+            if signal_poll <= 0:
+                # Daily/weekly panels should not re-download the full universe every few seconds.
+                freq = str(frequency or "").strip().lower()
+                signal_poll = 900.0 if freq.endswith("d") or freq.endswith("w") else 5.0
+            signal_poll = max(1.0, min(3600.0, signal_poll))
+            # Schedule checks need a livelier cadence than full-panel refresh.
+            freq = str(frequency or "").strip().lower()
+            process_poll = min(signal_poll, 60.0 if (freq.endswith("d") or freq.endswith("w")) else signal_poll)
             risk_tick = max(0.25, min(5.0, float(trading_config.get("risk_tick_seconds") or 1)))
             next_signal_poll = 0.0
+            last_panel_fetch_at = time.monotonic()
             consecutive_errors = 0
             strategy_name = str(strategy.get("strategy_name") or f"strategy_{strategy_id}")
             notification_config = _json_object(strategy.get("notification_config"))
@@ -512,6 +526,16 @@ class TradingExecutor:
             while self._is_strategy_running(strategy_id, current):
                 cycle_started = time.monotonic()
                 try:
+                    # Keep the monitor heartbeat alive before any long I/O
+                    # (panel refresh / large-universe pricing).
+                    self._heartbeat(
+                        strategy_id,
+                        run_id,
+                        primary,
+                        last_prices,
+                        0,
+                        loop_latency_ms=0,
+                    )
                     references = session.context.order_references()
                     if references:
                         session.context.update_order_statuses(
@@ -566,9 +590,19 @@ class TradingExecutor:
 
                     pending_count = len(protection_intents)
                     if cycle_started >= next_signal_poll:
-                        frames = fetch_frames()
-                        if execution_mode == "live":
-                            frames = self._align_latest_frame_prices(frames, runtime_prices())
+                        if (time.monotonic() - last_panel_fetch_at) >= signal_poll:
+                            self._heartbeat(
+                                strategy_id,
+                                run_id,
+                                primary,
+                                last_prices,
+                                pending_count,
+                                loop_latency_ms=int((time.monotonic() - cycle_started) * 1000),
+                            )
+                            frames = fetch_frames()
+                            last_panel_fetch_at = time.monotonic()
+                            if execution_mode == "live":
+                                frames = self._align_latest_frame_prices(frames, runtime_prices())
                         intents, messages, timestamp = session.process(frames)
                         intents = [
                             intent
@@ -605,7 +639,7 @@ class TradingExecutor:
                                         "status": "submitted" if submitted else "rejected",
                                     },
                                 })
-                        next_signal_poll = cycle_started + signal_poll
+                        next_signal_poll = cycle_started + process_poll
                     state_store.save(session.session_snapshot())
                     self._heartbeat(
                         strategy_id,
@@ -1464,9 +1498,35 @@ class TradingExecutor:
         return output
 
     @staticmethod
+    def _prices_from_frames(frames: dict[str, pd.DataFrame] | None) -> dict[str, float]:
+        prices: dict[str, float] = {}
+        for key, frame in (frames or {}).items():
+            if frame is None or getattr(frame, "empty", True):
+                continue
+            if "close" not in frame.columns:
+                continue
+            try:
+                price = float(frame["close"].iloc[-1])
+            except Exception:
+                continue
+            if price > 0:
+                prices[str(key)] = price
+        return prices
+
+    @staticmethod
     def _live_prices(candidates: list[dict[str, Any]]) -> dict[str, float]:
         prices: dict[str, float] = {}
-        for member in candidates:
+        # Hard cap protects the risk loop when a caller forgets to seed from frames.
+        limit = max(1, int(os.getenv("STRATEGY_LIVE_TICKER_LIMIT", "40")))
+        members = list(candidates or [])
+        if len(members) > limit:
+            logger.warning(
+                "Truncating live ticker fetch from %s to %s symbols",
+                len(members),
+                limit,
+            )
+            members = members[:limit]
+        for member in members:
             try:
                 ticker = DataSourceFactory.get_ticker(
                     str(member.get("market") or ""),
@@ -1487,8 +1547,11 @@ class TradingExecutor:
         candidates: list[dict[str, Any]],
         exchange_config: dict[str, Any],
         client_holder: dict[str, Any],
+        seed_prices: dict[str, float] | None = None,
     ) -> dict[str, float]:
-        prices = cls._live_prices(candidates)
+        prices = dict(seed_prices or {})
+        if not prices:
+            prices = cls._live_prices(candidates)
         try:
             from app.services.live_trading.factory import create_client
             from app.services.live_trading.symbols import to_okx_spot_inst_id, to_okx_swap_inst_id

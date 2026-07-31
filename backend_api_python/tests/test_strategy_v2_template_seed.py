@@ -24,13 +24,14 @@ def _seed_entries():
 
 def test_strategy_v2_seed_has_explicit_cta_and_portfolio_catalogs():
     entries = _seed_entries()
-    assert len(entries) == 12
+    assert len(entries) == 13
     assert sum(item["asset_type"] == "script" for item in entries) == 8
-    assert sum(item["asset_type"] == "portfolio_strategy" for item in entries) == 4
+    assert sum(item["asset_type"] == "portfolio_strategy" for item in entries) == 5
 
     by_key = {item["key"]: item for item in entries}
     assert by_key["strategy_v2_supertrend"]["asset_type"] == "script"
     assert by_key["strategy_v2_market_cap_barbell"]["asset_type"] == "portfolio_strategy"
+    assert by_key["strategy_v2_csi300_enhanced"]["asset_type"] == "portfolio_strategy"
 
 
 def test_strategy_v2_seed_templates_compile_and_expose_parameters():
@@ -67,6 +68,11 @@ def test_portfolio_templates_use_fixed_ten_symbol_universe():
     portfolios = [item for item in _seed_entries() if item["asset_type"] == "portfolio_strategy"]
     for item in portfolios:
         manifest = compile_strategy_v2(item["code"]).manifest
+        if item["key"] == "strategy_v2_csi300_enhanced":
+            assert manifest.universe.kind == "dynamic"
+            assert "csi300" in str(manifest.universe.reference).lower()
+            assert "get_universe_stocks()" in item["code"]
+            continue
         assert manifest.universe.kind == "static"
         assert len(manifest.universe.instruments) == 10
         assert all(instrument.market == "USStock" for instrument in manifest.universe.instruments)
@@ -99,19 +105,35 @@ def _template_frame(rank: int, periods: int = 320) -> pd.DataFrame:
 def test_every_seed_template_completes_a_synthetic_v2_backtest():
     for item in _seed_entries():
         program = compile_strategy_v2(item["code"])
-        frames = {
-            instrument.key: _template_frame(index)
-            for index, instrument in enumerate(program.manifest.universe.instruments)
-        }
-        frames.setdefault("USStock:SPY", _template_frame(11))
-
-        result = StrategyV2BacktestRunner(
-            code=item["code"],
-            frames=frames,
-            initial_capital=100_000,
-            commission=0,
-            slippage=0,
-        ).run()
+        if item["key"] == "strategy_v2_csi300_enhanced":
+            symbols = [f"CNStock:{code}" for code in (
+                "600519.SH", "000001.SZ", "601318.SH", "600036.SH", "000858.SZ",
+                "601166.SH", "600276.SH", "000333.SZ", "601888.SH", "600900.SH",
+            )]
+            frames = {symbol: _template_frame(index) for index, symbol in enumerate(symbols)}
+            frames["CNStock:000300.SH"] = _template_frame(11)
+            resolver = lambda _ref, _when, _symbols=symbols: list(_symbols)
+            result = StrategyV2BacktestRunner(
+                code=item["code"],
+                frames=frames,
+                initial_capital=100_000,
+                commission=0,
+                slippage=0,
+                universe_resolver=resolver,
+            ).run()
+        else:
+            frames = {
+                instrument.key: _template_frame(index)
+                for index, instrument in enumerate(program.manifest.universe.instruments)
+            }
+            frames.setdefault("USStock:SPY", _template_frame(11))
+            result = StrategyV2BacktestRunner(
+                code=item["code"],
+                frames=frames,
+                initial_capital=100_000,
+                commission=0,
+                slippage=0,
+            ).run()
 
         assert result["engine"]["version"] == "quantdinger-strategy-api-v2", item["key"]
         assert result["manifest"]["apiVersion"] == 2, item["key"]
