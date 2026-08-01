@@ -38,6 +38,8 @@ def persist_external_alpha_scores(rows: list[dict[str, Any]]) -> dict[str, Any]:
                 as_of = _as_date(raw.get("as_of"))
                 symbol = canonicalize_cnstock_key(str(raw.get("symbol") or ""))
                 score = float(raw.get("score"))
+                weight = raw.get("weight")
+                weight_f = float(weight) if weight is not None and weight != "" else None
             except Exception as exc:
                 skipped += 1
                 errors.append(f"row{idx}: {exc}")
@@ -49,8 +51,6 @@ def persist_external_alpha_scores(rows: list[dict[str, Any]]) -> dict[str, Any]:
             source = str(raw.get("source") or DEFAULT_SOURCE).strip() or DEFAULT_SOURCE
             version = str(raw.get("version") or DEFAULT_VERSION).strip() or DEFAULT_VERSION
             universe = str(raw.get("universe") or "").strip()
-            weight = raw.get("weight")
-            weight_f = float(weight) if weight is not None and weight != "" else None
             meta = raw.get("meta") if isinstance(raw.get("meta"), dict) else {}
             cur.execute(
                 """

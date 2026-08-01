@@ -53,6 +53,52 @@ def test_persist_normalizes_symbol_and_defaults():
     assert float(row[5]) == 1.25
 
 
+def test_persist_skips_invalid_weight_and_inserts_valid_sibling():
+    captured = []
+
+    class _Cur:
+        def execute(self, sql, params=None):
+            if "INSERT" in sql.upper():
+                captured.append(params)
+
+        def fetchone(self):
+            return None
+
+        def fetchall(self):
+            return []
+
+        def close(self):
+            pass
+
+    class _Db:
+        def cursor(self):
+            return _Cur()
+
+        def commit(self):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    rows = [
+        {"as_of": "2021-08-31", "symbol": "600519", "score": 1.0, "weight": "not-a-number"},
+        {"as_of": "2021-08-31", "symbol": "600036", "score": 2.0, "weight": 0.5},
+    ]
+    with patch("app.services.external_alpha.store.get_db_connection", return_value=_Db()):
+        out = persist_external_alpha_scores(rows)
+    assert out["inserted"] == 1
+    assert out["skipped"] == 1
+    assert len(out["errors"]) == 1
+    assert out["errors"][0].startswith("row0:")
+    assert len(captured) == 1
+    assert captured[0][4] == "CNStock:600036.SH"
+    assert float(captured[0][5]) == 2.0
+    assert captured[0][6] == 0.5
+
+
 def test_load_pit_uses_max_as_of_not_future():
     rows = [
         {"symbol": "CNStock:600519.SH", "score": 0.5, "as_of": date(2021, 8, 31)},
