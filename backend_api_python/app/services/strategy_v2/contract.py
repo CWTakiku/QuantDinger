@@ -329,6 +329,8 @@ _RUNTIME_GLOBAL_CALL_NAMES = {
     "get_ashare_size_log_mcap",
     "get_ashare_flow_panel",
     "get_ashare_consensus_panel",
+    "get_ashare_valuation_panel",
+    "get_external_alpha_scores",
     "get_csi300_bench_weights",
     "get_csi300_bench_weights_with_meta",
     "get_csi300_bench_weight_source",

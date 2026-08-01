@@ -55,6 +55,7 @@ from app.services.csi300_enhanced.layered_alpha import (
     load_consensus_panel,
     load_flow_panel,
     load_industry_and_size,
+    load_valuation_panel,
 )
 
 
@@ -74,6 +75,26 @@ def get_ashare_flow_panel(symbols: list[str], as_of: object) -> pd.Series:
 
 def get_ashare_consensus_panel(symbols: list[str], as_of: object) -> pd.Series:
     return load_consensus_panel(symbols, as_of)
+
+
+def get_ashare_valuation_panel(symbols: list[str], as_of: object) -> pd.DataFrame:
+    return load_valuation_panel(symbols, as_of)
+
+
+def get_external_alpha_scores(
+    as_of: object,
+    source: str,
+    version: object = None,
+    symbols: list[str] | None = None,
+) -> pd.Series:
+    from app.services.external_alpha.store import load_external_alpha_scores_as_of
+
+    return load_external_alpha_scores_as_of(
+        as_of,
+        source=str(source or ""),
+        version=None if version is None else str(version),
+        symbols=list(symbols) if symbols else None,
+    )
 
 
 def _backtest_time_iso(value: Any) -> str:
@@ -1572,6 +1593,8 @@ class StrategyV2BacktestRunner:
             "get_ashare_size_log_mcap": get_ashare_size_log_mcap,
             "get_ashare_flow_panel": get_ashare_flow_panel,
             "get_ashare_consensus_panel": get_ashare_consensus_panel,
+            "get_ashare_valuation_panel": get_ashare_valuation_panel,
+            "get_external_alpha_scores": get_external_alpha_scores,
             "build_enhanced_index_diagnostics": build_enhanced_index_diagnostics,
             "record_enhanced_index_diagnostics": lambda **kwargs: ctx.record_enhanced_index_diagnostics(
                 build_enhanced_index_diagnostics(**kwargs)
@@ -2222,6 +2245,8 @@ class StrategyV2LiveSession:
             "get_ashare_size_log_mcap": get_ashare_size_log_mcap,
             "get_ashare_flow_panel": get_ashare_flow_panel,
             "get_ashare_consensus_panel": get_ashare_consensus_panel,
+            "get_ashare_valuation_panel": get_ashare_valuation_panel,
+            "get_external_alpha_scores": get_external_alpha_scores,
             "build_enhanced_index_diagnostics": build_enhanced_index_diagnostics,
             "record_enhanced_index_diagnostics": lambda **kwargs: ctx.record_enhanced_index_diagnostics(
                 build_enhanced_index_diagnostics(**kwargs)
