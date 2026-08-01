@@ -44,6 +44,8 @@ from app.services.csi300_enhanced.bench import get_csi300_bench_weights
 from app.services.csi300_enhanced.layered_alpha import (
     apply_icir_weights,
     apply_regime,
+    load_consensus_panel,
+    load_flow_panel,
     load_industry_and_size,
 )
 
@@ -56,6 +58,14 @@ def get_ashare_industry_map(symbols: list[str], as_of: object) -> dict[str, str]
 def get_ashare_size_log_mcap(symbols: list[str], as_of: object) -> pd.Series:
     _, log_mcap = load_industry_and_size(symbols, as_of)
     return log_mcap
+
+
+def get_ashare_flow_panel(symbols: list[str], as_of: object) -> pd.Series:
+    return load_flow_panel(symbols, as_of)
+
+
+def get_ashare_consensus_panel(symbols: list[str], as_of: object) -> pd.Series:
+    return load_consensus_panel(symbols, as_of)
 
 
 def _backtest_time_iso(value: Any) -> str:
@@ -1540,6 +1550,8 @@ class StrategyV2BacktestRunner:
             "get_csi300_bench_weights": get_csi300_bench_weights,
             "get_ashare_industry_map": get_ashare_industry_map,
             "get_ashare_size_log_mcap": get_ashare_size_log_mcap,
+            "get_ashare_flow_panel": get_ashare_flow_panel,
+            "get_ashare_consensus_panel": get_ashare_consensus_panel,
             "run_daily": lambda *args, **kwargs: None,
             "run_weekly": lambda *args, **kwargs: None,
             "run_monthly": lambda *args, **kwargs: None,
@@ -2177,6 +2189,8 @@ class StrategyV2LiveSession:
             "get_csi300_bench_weights": get_csi300_bench_weights,
             "get_ashare_industry_map": get_ashare_industry_map,
             "get_ashare_size_log_mcap": get_ashare_size_log_mcap,
+            "get_ashare_flow_panel": get_ashare_flow_panel,
+            "get_ashare_consensus_panel": get_ashare_consensus_panel,
             "run_daily": lambda *args, **kwargs: None,
             "run_weekly": lambda *args, **kwargs: None,
             "run_monthly": lambda *args, **kwargs: None,

@@ -1,8 +1,8 @@
 """CSI300 Enhanced Index QP 2.0
-Long-only CSI300 enhanced index 2.0: layered neutralized alpha (momentum/vol/value),
+Long-only CSI300 enhanced index 2.0: layered neutralized alpha (momentum/vol/value/flow/consensus),
 PIT bench weights, industry/size/TE-constrained weekly QP.
 
-C1: momentum + realized vol + EP/BP (when fundamentals available). Industry/size
+C2: momentum + realized vol + EP/BP + local flow/consensus panels. Industry/size
 neutralization uses injected maps; missing layers are re-weighted automatically.
 """
 
@@ -18,11 +18,11 @@ neutralization uses injected maps; missing layers are re-weighted automatically.
 # @param industry_limit float 0.05 Max active industry weight vs bench range=0.01:0.15:0.005
 # @param size_limit float 0.30 Max abs size exposure (active · size_z) range=0.05:1.0:0.05
 # @param te_limit float 0.08 Soft/hard TE proxy cap (√(aᵀDa)) range=0.01:0.25:0.01
-# @param w_momentum float 0.45 Momentum layer weight range=0.0:1.0:0.05
-# @param w_risk_liq float 0.25 Low-vol / risk layer weight range=0.0:1.0:0.05
-# @param w_value_quality float 0.30 Value (EP/BP) layer weight range=0.0:1.0:0.05
-# @param w_flow float 0.0 Flow layer weight (C2; unused in C1) range=0.0:1.0:0.05
-# @param w_consensus float 0.0 Consensus layer weight (C2; unused in C1) range=0.0:1.0:0.05
+# @param w_momentum float 0.35 Momentum layer weight range=0.0:1.0:0.05
+# @param w_risk_liq float 0.20 Low-vol / risk layer weight range=0.0:1.0:0.05
+# @param w_value_quality float 0.20 Value (EP/BP) layer weight range=0.0:1.0:0.05
+# @param w_flow float 0.15 Northbound / margin flow layer weight range=0.0:1.0:0.05
+# @param w_consensus float 0.10 Analyst consensus layer weight range=0.0:1.0:0.05
 # @param use_icir bool false Enable ICIR layer weighting (needs rolling history) range=
 # @param icir_window int 20 ICIR rolling window (trading days) range=10:60:5
 # @param regime_enabled bool true Enable benchmark drawdown regime filter range=
@@ -224,11 +224,11 @@ def _forward_return_panel(symbols, as_of, lookback=80):
 def _resolve_layer_weights(context, layer_scores, as_of):
     """Base param weights with optional ICIR and regime overlays."""
     weights = {
-        "momentum": float(context.params.get("w_momentum", 0.45)),
-        "risk_liq": float(context.params.get("w_risk_liq", 0.25)),
-        "value_quality": float(context.params.get("w_value_quality", 0.30)),
-        "flow": float(context.params.get("w_flow", 0.0)),
-        "consensus": float(context.params.get("w_consensus", 0.0)),
+        "momentum": float(context.params.get("w_momentum", 0.35)),
+        "risk_liq": float(context.params.get("w_risk_liq", 0.20)),
+        "value_quality": float(context.params.get("w_value_quality", 0.20)),
+        "flow": float(context.params.get("w_flow", 0.15)),
+        "consensus": float(context.params.get("w_consensus", 0.10)),
     }
     use_icir = bool(context.params.get("use_icir", False))
     if use_icir:
@@ -341,6 +341,22 @@ def update_alpha(context, data):
         value_raw = pd.concat([ep.rename("ep"), bp.rename("bp")], axis=1).mean(axis=1, skipna=True)
         if value_raw.dropna().shape[0] >= 10:
             layer_scores["value_quality"] = _neutralize_industry_size(value_raw, industry, log_mcap)
+
+    try:
+        flow_raw = get_ashare_flow_panel(eligible, as_of)
+    except Exception as exc:
+        log("flow panel skipped: %s" % exc)
+        flow_raw = pd.Series(dtype=float)
+    if flow_raw is not None and len(pd.to_numeric(flow_raw, errors="coerce").dropna()) >= 10:
+        layer_scores["flow"] = _neutralize_industry_size(flow_raw, industry, log_mcap)
+
+    try:
+        consensus_raw = get_ashare_consensus_panel(eligible, as_of)
+    except Exception as exc:
+        log("consensus panel skipped: %s" % exc)
+        consensus_raw = pd.Series(dtype=float)
+    if consensus_raw is not None and len(pd.to_numeric(consensus_raw, errors="coerce").dropna()) >= 10:
+        layer_scores["consensus"] = _neutralize_industry_size(consensus_raw, industry, log_mcap)
 
     weights = _resolve_layer_weights(context, layer_scores, as_of)
     alpha = _combine_layers(layer_scores, weights)

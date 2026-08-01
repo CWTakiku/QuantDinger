@@ -107,6 +107,49 @@ def handle_data(context, data):
         assert callable(namespace.get(name)), name
 
 
+def test_csi300_enhanced_flow_consensus_helpers_are_allowed_api_names():
+    code = """
+def initialize(context):
+    context.set_universe(pool="csi300")
+    context.subscribe(frequency="1d")
+    context.set_benchmark("CNStock:000300.SH")
+
+def handle_data(context, data):
+    as_of = str(context.current_dt.date())
+    symbols = ["CNStock:600519.SH", "CNStock:000858.SZ"]
+    flow = get_ashare_flow_panel(symbols, as_of)
+    consensus = get_ashare_consensus_panel(symbols, as_of)
+    log(str(len(flow)) + str(len(consensus)))
+"""
+    compiled = compile_strategy_v2(code)
+    assert callable(compiled.handler("handle_data"))
+
+
+def test_csi300_enhanced_flow_consensus_helpers_are_bound_at_runtime():
+    code = """
+def initialize(context):
+    context.set_universe(pool="csi300")
+    context.subscribe(frequency="1d")
+
+def handle_data(context, data):
+    pass
+"""
+    runner = StrategyV2BacktestRunner(
+        code=code,
+        frames={"CNStock:600519.SH": __import__("pandas").DataFrame({
+            "open": [1.0],
+            "high": [1.0],
+            "low": [1.0],
+            "close": [1.0],
+            "volume": [1.0],
+        }, index=__import__("pandas").date_range("2026-07-31", periods=1))},
+        initial_capital=100000.0,
+    )
+    namespace = runner.program.namespace
+    for name in ("get_ashare_flow_panel", "get_ashare_consensus_panel"):
+        assert callable(namespace.get(name)), name
+
+
 def test_example_csi300_enhanced_weekly_compiles():
     path = Path(__file__).resolve().parents[2] / "docs" / "examples" / "strategy_v2_csi300_enhanced_weekly.py"
     code = path.read_text(encoding="utf-8")
@@ -130,6 +173,8 @@ def test_example_csi300_enhanced_v2_weekly_compiles():
     assert "get_csi300_bench_weights" in code
     assert "get_ashare_industry_map" in code
     assert "get_ashare_size_log_mcap" in code
+    assert "get_ashare_flow_panel" in code
+    assert "get_ashare_consensus_panel" in code
     assert "industry_limit" in code
     assert "te_limit" in code
     assert "use_icir" in code

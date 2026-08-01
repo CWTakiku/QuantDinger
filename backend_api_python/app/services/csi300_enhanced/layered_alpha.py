@@ -140,6 +140,126 @@ def load_industry_and_size(
     return industry, log_mcap
 
 
+def load_flow_panel(
+    symbols: list[str],
+    as_of: date | str,
+) -> pd.Series:
+    """Load northbound net-buy flow cross-section for platform symbols."""
+    as_of_d = _as_date(as_of)
+    sym_list = [str(s) for s in (symbols or []) if str(s).strip()]
+    if not sym_list:
+        return pd.Series(dtype=float)
+
+    ts_by_sym = {sym: _platform_to_ts_code(sym) for sym in sym_list}
+    ts_codes = sorted(set(ts_by_sym.values()))
+    placeholders = ",".join(["?"] * len(ts_codes))
+    flow_by_ts: dict[str, float] = {}
+
+    with get_db_connection() as db:
+        cur = db.cursor()
+        cur.execute(
+            f"""
+            SELECT ts_code, north_net_buy, margin_balance
+            FROM qd_ashare_flow_daily
+            WHERE ts_code IN ({placeholders})
+              AND source = 'tushare'
+              AND trade_date = (
+                SELECT MAX(trade_date) FROM qd_ashare_flow_daily WHERE trade_date <= ?
+              )
+            """,
+            (*ts_codes, as_of_d),
+        )
+        for row in cur.fetchall() or []:
+            north = row.get("north_net_buy")
+            margin = row.get("margin_balance")
+            value = None
+            if north is not None:
+                try:
+                    north_f = float(north)
+                    if np.isfinite(north_f):
+                        value = north_f
+                except (TypeError, ValueError):
+                    pass
+            if value is None and margin is not None:
+                try:
+                    margin_f = float(margin)
+                    if np.isfinite(margin_f):
+                        value = margin_f
+                except (TypeError, ValueError):
+                    pass
+            if value is not None:
+                flow_by_ts[str(row["ts_code"])] = value
+
+    return pd.Series(
+        {sym: flow_by_ts[ts_by_sym[sym]] for sym in sym_list if ts_by_sym[sym] in flow_by_ts},
+        dtype=float,
+    )
+
+
+def load_consensus_panel(
+    symbols: list[str],
+    as_of: date | str,
+) -> pd.Series:
+    """Load analyst consensus composite (EPS / forward E/P / rating) for platform symbols."""
+    as_of_d = _as_date(as_of)
+    sym_list = [str(s) for s in (symbols or []) if str(s).strip()]
+    if not sym_list:
+        return pd.Series(dtype=float)
+
+    ts_by_sym = {sym: _platform_to_ts_code(sym) for sym in sym_list}
+    ts_codes = sorted(set(ts_by_sym.values()))
+    placeholders = ",".join(["?"] * len(ts_codes))
+    consensus_by_ts: dict[str, float] = {}
+
+    with get_db_connection() as db:
+        cur = db.cursor()
+        cur.execute(
+            f"""
+            SELECT ts_code, eps_fy1, pe_fy1, rating_mean
+            FROM qd_ashare_consensus_daily
+            WHERE ts_code IN ({placeholders})
+              AND source = 'tushare'
+              AND trade_date = (
+                SELECT MAX(trade_date) FROM qd_ashare_consensus_daily WHERE trade_date <= ?
+              )
+            """,
+            (*ts_codes, as_of_d),
+        )
+        for row in cur.fetchall() or []:
+            pieces: list[float] = []
+            eps = row.get("eps_fy1")
+            if eps is not None:
+                try:
+                    eps_f = float(eps)
+                    if np.isfinite(eps_f):
+                        pieces.append(eps_f)
+                except (TypeError, ValueError):
+                    pass
+            pe = row.get("pe_fy1")
+            if pe is not None:
+                try:
+                    pe_f = float(pe)
+                    if np.isfinite(pe_f) and pe_f != 0:
+                        pieces.append(1.0 / pe_f)
+                except (TypeError, ValueError):
+                    pass
+            rating = row.get("rating_mean")
+            if rating is not None:
+                try:
+                    rating_f = float(rating)
+                    if np.isfinite(rating_f):
+                        pieces.append(rating_f)
+                except (TypeError, ValueError):
+                    pass
+            if pieces:
+                consensus_by_ts[str(row["ts_code"])] = float(np.mean(pieces))
+
+    return pd.Series(
+        {sym: consensus_by_ts[ts_by_sym[sym]] for sym in sym_list if ts_by_sym[sym] in consensus_by_ts},
+        dtype=float,
+    )
+
+
 def _cross_section_ic(factor: pd.Series, forward_ret: pd.Series) -> float:
     f = pd.to_numeric(factor, errors="coerce")
     r = pd.to_numeric(forward_ret, errors="coerce")

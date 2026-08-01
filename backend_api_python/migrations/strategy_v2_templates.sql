@@ -752,10 +752,10 @@ def rebalance(context, data):
 $csehen$, '{"params":[{"name":"universe_top_n","type":"integer","default":50,"min":20,"max":300,"step":10,"labelKey":"strategyV2.params.universeTopN"},{"name":"active_limit","type":"number","default":0.025,"min":0.01,"max":0.05,"step":0.005,"labelKey":"strategyV2.params.activeLimit"},{"name":"risk_aversion","type":"number","default":1.0,"min":0.1,"max":5.0,"step":0.1,"labelKey":"strategyV2.params.riskAversion"},{"name":"turn_penalty","type":"number","default":0.01,"min":0.0,"max":0.1,"step":0.005,"labelKey":"strategyV2.params.turnPenalty"},{"name":"min_turnover","type":"number","default":0.02,"min":0.0,"max":0.1,"step":0.01,"labelKey":"strategyV2.params.minTurnover"},{"name":"mom_fast","type":"integer","default":60,"min":20,"max":120,"step":5,"labelKey":"strategyV2.params.momFast"},{"name":"mom_slow","type":"integer","default":120,"min":60,"max":250,"step":10,"labelKey":"strategyV2.params.momSlow"},{"name":"vol_period","type":"integer","default":20,"min":10,"max":60,"step":5,"labelKey":"strategyV2.params.volPeriod"},{"name":"min_history_bars","type":"integer","default":0,"min":0,"max":260,"step":1,"labelKey":"strategyV2.params.minHistoryBars"}]}'::jsonb, '["strategy-v2","portfolio","csi300","cn-stock","enhanced-index","qp"]'::jsonb, 'fund', 'orange', 100, TRUE, '{"source":"system_seed","version":10,"apiVersion":2}'::jsonb, NOW()),
 
 ('strategy_v2_csi300_enhanced_v2', 'portfolio_strategy', 'CSI300 Enhanced Index QP 2.0', 'Weekly CSI300 enhanced-index 2.0: layered neutralized alpha with industry/size/TE QP.', $csehv$"""CSI300 Enhanced Index QP 2.0
-Long-only CSI300 enhanced index 2.0: layered neutralized alpha (momentum/vol/value),
+Long-only CSI300 enhanced index 2.0: layered neutralized alpha (momentum/vol/value/flow/consensus),
 PIT bench weights, industry/size/TE-constrained weekly QP.
 
-C1: momentum + realized vol + EP/BP (when fundamentals available). Industry/size
+C2: momentum + realized vol + EP/BP + local flow/consensus panels. Industry/size
 neutralization uses injected maps; missing layers are re-weighted automatically.
 """
 
@@ -771,11 +771,11 @@ neutralization uses injected maps; missing layers are re-weighted automatically.
 # @param industry_limit float 0.05 Max active industry weight vs bench range=0.01:0.15:0.005
 # @param size_limit float 0.30 Max abs size exposure (active · size_z) range=0.05:1.0:0.05
 # @param te_limit float 0.08 Soft/hard TE proxy cap (√(aᵀDa)) range=0.01:0.25:0.01
-# @param w_momentum float 0.45 Momentum layer weight range=0.0:1.0:0.05
-# @param w_risk_liq float 0.25 Low-vol / risk layer weight range=0.0:1.0:0.05
-# @param w_value_quality float 0.30 Value (EP/BP) layer weight range=0.0:1.0:0.05
-# @param w_flow float 0.0 Flow layer weight (C2; unused in C1) range=0.0:1.0:0.05
-# @param w_consensus float 0.0 Consensus layer weight (C2; unused in C1) range=0.0:1.0:0.05
+# @param w_momentum float 0.35 Momentum layer weight range=0.0:1.0:0.05
+# @param w_risk_liq float 0.20 Low-vol / risk layer weight range=0.0:1.0:0.05
+# @param w_value_quality float 0.20 Value (EP/BP) layer weight range=0.0:1.0:0.05
+# @param w_flow float 0.15 Northbound / margin flow layer weight range=0.0:1.0:0.05
+# @param w_consensus float 0.10 Analyst consensus layer weight range=0.0:1.0:0.05
 # @param use_icir bool false Enable ICIR layer weighting (needs rolling history) range=
 # @param icir_window int 20 ICIR rolling window (trading days) range=10:60:5
 # @param regime_enabled bool true Enable benchmark drawdown regime filter range=
@@ -977,11 +977,11 @@ def _forward_return_panel(symbols, as_of, lookback=80):
 def _resolve_layer_weights(context, layer_scores, as_of):
     """Base param weights with optional ICIR and regime overlays."""
     weights = {
-        "momentum": float(context.params.get("w_momentum", 0.45)),
-        "risk_liq": float(context.params.get("w_risk_liq", 0.25)),
-        "value_quality": float(context.params.get("w_value_quality", 0.30)),
-        "flow": float(context.params.get("w_flow", 0.0)),
-        "consensus": float(context.params.get("w_consensus", 0.0)),
+        "momentum": float(context.params.get("w_momentum", 0.35)),
+        "risk_liq": float(context.params.get("w_risk_liq", 0.20)),
+        "value_quality": float(context.params.get("w_value_quality", 0.20)),
+        "flow": float(context.params.get("w_flow", 0.15)),
+        "consensus": float(context.params.get("w_consensus", 0.10)),
     }
     use_icir = bool(context.params.get("use_icir", False))
     if use_icir:
@@ -1095,6 +1095,22 @@ def update_alpha(context, data):
         if value_raw.dropna().shape[0] >= 10:
             layer_scores["value_quality"] = _neutralize_industry_size(value_raw, industry, log_mcap)
 
+    try:
+        flow_raw = get_ashare_flow_panel(eligible, as_of)
+    except Exception as exc:
+        log("flow panel skipped: %s" % exc)
+        flow_raw = pd.Series(dtype=float)
+    if flow_raw is not None and len(pd.to_numeric(flow_raw, errors="coerce").dropna()) >= 10:
+        layer_scores["flow"] = _neutralize_industry_size(flow_raw, industry, log_mcap)
+
+    try:
+        consensus_raw = get_ashare_consensus_panel(eligible, as_of)
+    except Exception as exc:
+        log("consensus panel skipped: %s" % exc)
+        consensus_raw = pd.Series(dtype=float)
+    if consensus_raw is not None and len(pd.to_numeric(consensus_raw, errors="coerce").dropna()) >= 10:
+        layer_scores["consensus"] = _neutralize_industry_size(consensus_raw, industry, log_mcap)
+
     weights = _resolve_layer_weights(context, layer_scores, as_of)
     alpha = _combine_layers(layer_scores, weights)
     if len(alpha) < 10:
@@ -1196,7 +1212,7 @@ def rebalance(context, data):
             len(size_z) if size_z is not None else 0,
         )
     )
-$csehv$, '{"params":[{"name":"universe_top_n","type":"integer","default":50,"min":20,"max":300,"step":10,"labelKey":"strategyV2.params.universeTopN"},{"name":"active_limit","type":"number","default":0.025,"min":0.01,"max":0.05,"step":0.005,"labelKey":"strategyV2.params.activeLimit"},{"name":"risk_aversion","type":"number","default":1.0,"min":0.1,"max":5.0,"step":0.1,"labelKey":"strategyV2.params.riskAversion"},{"name":"turn_penalty","type":"number","default":0.01,"min":0.0,"max":0.1,"step":0.005,"labelKey":"strategyV2.params.turnPenalty"},{"name":"min_turnover","type":"number","default":0.02,"min":0.0,"max":0.1,"step":0.01,"labelKey":"strategyV2.params.minTurnover"},{"name":"mom_fast","type":"integer","default":60,"min":20,"max":120,"step":5,"labelKey":"strategyV2.params.momFast"},{"name":"mom_slow","type":"integer","default":120,"min":60,"max":250,"step":10,"labelKey":"strategyV2.params.momSlow"},{"name":"vol_period","type":"integer","default":20,"min":10,"max":60,"step":5,"labelKey":"strategyV2.params.volPeriod"},{"name":"min_history_bars","type":"integer","default":0,"min":0,"max":260,"step":1,"labelKey":"strategyV2.params.minHistoryBars"},{"name":"industry_limit","type":"number","default":0.05,"min":0.01,"max":0.15,"step":0.005,"labelKey":"strategyV2.params.industryLimit"},{"name":"size_limit","type":"number","default":0.3,"min":0.05,"max":1.0,"step":0.05,"labelKey":"strategyV2.params.sizeLimit"},{"name":"te_limit","type":"number","default":0.08,"min":0.01,"max":0.25,"step":0.01,"labelKey":"strategyV2.params.teLimit"},{"name":"w_momentum","type":"number","default":0.45,"min":0.0,"max":1.0,"step":0.05,"labelKey":"strategyV2.params.wMomentum"},{"name":"w_risk_liq","type":"number","default":0.25,"min":0.0,"max":1.0,"step":0.05,"labelKey":"strategyV2.params.wRiskLiq"},{"name":"w_value_quality","type":"number","default":0.3,"min":0.0,"max":1.0,"step":0.05,"labelKey":"strategyV2.params.wValueQuality"},{"name":"w_flow","type":"number","default":0.0,"min":0.0,"max":1.0,"step":0.05,"labelKey":"strategyV2.params.wFlow"},{"name":"w_consensus","type":"number","default":0.0,"min":0.0,"max":1.0,"step":0.05,"labelKey":"strategyV2.params.wConsensus"}]}'::jsonb, '["strategy-v2","portfolio","csi300","cn-stock","enhanced-index","qp","v2"]'::jsonb, 'fund', 'orange', 101, TRUE, '{"source":"system_seed","version":10,"apiVersion":2}'::jsonb, NOW())
+$csehv$, '{"params":[{"name":"universe_top_n","type":"integer","default":50,"min":20,"max":300,"step":10,"labelKey":"strategyV2.params.universeTopN"},{"name":"active_limit","type":"number","default":0.025,"min":0.01,"max":0.05,"step":0.005,"labelKey":"strategyV2.params.activeLimit"},{"name":"risk_aversion","type":"number","default":1.0,"min":0.1,"max":5.0,"step":0.1,"labelKey":"strategyV2.params.riskAversion"},{"name":"turn_penalty","type":"number","default":0.01,"min":0.0,"max":0.1,"step":0.005,"labelKey":"strategyV2.params.turnPenalty"},{"name":"min_turnover","type":"number","default":0.02,"min":0.0,"max":0.1,"step":0.01,"labelKey":"strategyV2.params.minTurnover"},{"name":"mom_fast","type":"integer","default":60,"min":20,"max":120,"step":5,"labelKey":"strategyV2.params.momFast"},{"name":"mom_slow","type":"integer","default":120,"min":60,"max":250,"step":10,"labelKey":"strategyV2.params.momSlow"},{"name":"vol_period","type":"integer","default":20,"min":10,"max":60,"step":5,"labelKey":"strategyV2.params.volPeriod"},{"name":"min_history_bars","type":"integer","default":0,"min":0,"max":260,"step":1,"labelKey":"strategyV2.params.minHistoryBars"},{"name":"industry_limit","type":"number","default":0.05,"min":0.01,"max":0.15,"step":0.005,"labelKey":"strategyV2.params.industryLimit"},{"name":"size_limit","type":"number","default":0.3,"min":0.05,"max":1.0,"step":0.05,"labelKey":"strategyV2.params.sizeLimit"},{"name":"te_limit","type":"number","default":0.08,"min":0.01,"max":0.25,"step":0.01,"labelKey":"strategyV2.params.teLimit"},{"name":"w_momentum","type":"number","default":0.35,"min":0.0,"max":1.0,"step":0.05,"labelKey":"strategyV2.params.wMomentum"},{"name":"w_risk_liq","type":"number","default":0.2,"min":0.0,"max":1.0,"step":0.05,"labelKey":"strategyV2.params.wRiskLiq"},{"name":"w_value_quality","type":"number","default":0.2,"min":0.0,"max":1.0,"step":0.05,"labelKey":"strategyV2.params.wValueQuality"},{"name":"w_flow","type":"number","default":0.15,"min":0.0,"max":1.0,"step":0.05,"labelKey":"strategyV2.params.wFlow"},{"name":"w_consensus","type":"number","default":0.1,"min":0.0,"max":1.0,"step":0.05,"labelKey":"strategyV2.params.wConsensus"}]}'::jsonb, '["strategy-v2","portfolio","csi300","cn-stock","enhanced-index","qp","v2"]'::jsonb, 'fund', 'orange', 101, TRUE, '{"source":"system_seed","version":10,"apiVersion":2}'::jsonb, NOW())
 ON CONFLICT (template_key) DO UPDATE SET
     asset_type = EXCLUDED.asset_type,
     title = EXCLUDED.title,

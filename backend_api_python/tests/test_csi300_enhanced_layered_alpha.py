@@ -7,6 +7,8 @@ import pandas as pd
 from app.services.csi300_enhanced.layered_alpha import (
     build_neutralized_factor,
     combine_layers,
+    load_consensus_panel,
+    load_flow_panel,
     load_industry_and_size,
 )
 
@@ -76,3 +78,67 @@ def test_load_industry_and_size_reads_db():
     assert industry["CNStock:000001.SZ"] == "银行"
     assert log_mcap["CNStock:600519.SH"] == np.log1p(1000.0)
     assert log_mcap["CNStock:000001.SZ"] == np.log1p(500.0)
+
+
+def test_load_flow_panel_reads_db():
+    rows_flow = [
+        {"ts_code": "600519.SH", "north_net_buy": 120.0, "margin_balance": None},
+        {"ts_code": "000001.SZ", "north_net_buy": None, "margin_balance": 800.0},
+    ]
+
+    class _Cursor:
+        def execute(self, sql, params=None):
+            self._sql = sql
+            self._params = params
+
+        def fetchall(self):
+            return rows_flow
+
+    class _Db:
+        def cursor(self):
+            return _Cursor()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    symbols = ["CNStock:600519.SH", "CNStock:000001.SZ"]
+    with patch("app.services.csi300_enhanced.layered_alpha.get_db_connection", lambda: _Db()):
+        flow = load_flow_panel(symbols, date(2026, 7, 31))
+
+    assert flow["CNStock:600519.SH"] == 120.0
+    assert flow["CNStock:000001.SZ"] == 800.0
+
+
+def test_load_consensus_panel_reads_db():
+    rows_consensus = [
+        {"ts_code": "600519.SH", "eps_fy1": 50.0, "pe_fy1": 25.0, "rating_mean": 4.5},
+        {"ts_code": "000001.SZ", "eps_fy1": None, "pe_fy1": 10.0, "rating_mean": 3.0},
+    ]
+
+    class _Cursor:
+        def execute(self, sql, params=None):
+            self._sql = sql
+            self._params = params
+
+        def fetchall(self):
+            return rows_consensus
+
+    class _Db:
+        def cursor(self):
+            return _Cursor()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    symbols = ["CNStock:600519.SH", "CNStock:000001.SZ"]
+    with patch("app.services.csi300_enhanced.layered_alpha.get_db_connection", lambda: _Db()):
+        consensus = load_consensus_panel(symbols, date(2026, 7, 31))
+
+    assert consensus["CNStock:600519.SH"] == (50.0 + (1.0 / 25.0) + 4.5) / 3.0
+    assert consensus["CNStock:000001.SZ"] == (1.0 / 10.0 + 3.0) / 2.0

@@ -13,6 +13,8 @@ from .layered_alpha import (
     apply_regime,
     build_neutralized_factor,
     combine_layers,
+    load_consensus_panel,
+    load_flow_panel,
     load_industry_and_size,
 )
 from .tushare_sync import fetch_index_weights, normalize_index_weight_frame, weights_to_platform_map
@@ -27,6 +29,8 @@ __all__ = [
     "build_neutralized_factor",
     "combine_layers",
     "load_industry_and_size",
+    "load_flow_panel",
+    "load_consensus_panel",
     "optimize_enhanced_index",
     "fetch_index_weights",
     "normalize_index_weight_frame",
