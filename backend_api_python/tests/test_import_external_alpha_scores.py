@@ -7,8 +7,17 @@ def test_rows_from_csv_text_minimal():
         text, default_source="external", default_version="default", default_universe=""
     )
     assert len(rows) == 2
-    assert rows[0]["symbol"] in ("600519", "CNStock:600519.SH") or True
+    assert rows[0]["symbol"] == "600519"
     assert float(rows[0]["score"]) == 1.5
+    assert rows[1]["symbol"] == "000001.SZ"
+
+
+def test_rows_from_csv_text_preserves_optional_weight():
+    text = "as_of,symbol,score,weight\n2021-08-31,600519,1.0,0.75\n"
+    rows = rows_from_csv_text(
+        text, default_source="external", default_version="default", default_universe=""
+    )
+    assert float(rows[0]["weight"]) == 0.75
 
 
 def test_rows_from_csv_text_fills_defaults():
