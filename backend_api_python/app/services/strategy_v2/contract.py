@@ -320,6 +320,8 @@ _UNSUPPORTED_STRATEGY_API_NAMES = {
 }
 
 _RUNTIME_GLOBAL_CALL_NAMES = {
+    "apply_icir_weights",
+    "apply_regime",
     "factor",
     "get_factors",
     "get_fundamentals",

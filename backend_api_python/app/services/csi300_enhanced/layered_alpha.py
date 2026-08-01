@@ -138,3 +138,106 @@ def load_industry_and_size(
         dtype=float,
     )
     return industry, log_mcap
+
+
+def _cross_section_ic(factor: pd.Series, forward_ret: pd.Series) -> float:
+    f = pd.to_numeric(factor, errors="coerce")
+    r = pd.to_numeric(forward_ret, errors="coerce")
+    aligned = pd.concat([f.rename("f"), r.rename("r")], axis=1).dropna()
+    if len(aligned) < 5:
+        return float("nan")
+    ic = aligned["f"].rank(method="average").corr(
+        aligned["r"].rank(method="average"),
+        method="pearson",
+    )
+    return float(ic) if ic is not None and np.isfinite(ic) else float("nan")
+
+
+def _equal_layer_weights(layers: list[str]) -> dict[str, float]:
+    if not layers:
+        return {}
+    weight = 1.0 / len(layers)
+    return {name: weight for name in layers}
+
+
+def apply_icir_weights(
+    factor_panel: dict[str, pd.DataFrame],
+    forward_returns: pd.DataFrame,
+    *,
+    window: int,
+) -> dict[str, float]:
+    """ICIR-based non-negative layer weights; equal-weight when samples are insufficient."""
+    layers = [name for name in factor_panel if isinstance(factor_panel.get(name), pd.DataFrame)]
+    if not layers:
+        return {}
+
+    window = max(1, int(window))
+    min_obs = max(5, window)
+    equal = _equal_layer_weights(layers)
+
+    icir_scores: dict[str, float] = {}
+    for name in layers:
+        panel = factor_panel[name].sort_index()
+        if panel.empty:
+            return equal
+        fwd = forward_returns.reindex(panel.index)
+        ic_values: list[float] = []
+        for dt in panel.index:
+            row = panel.loc[dt]
+            if isinstance(row, pd.DataFrame):
+                row = row.iloc[0]
+            fwd_row = fwd.loc[dt] if dt in fwd.index else pd.Series(dtype=float)
+            if isinstance(fwd_row, pd.DataFrame):
+                fwd_row = fwd_row.iloc[0]
+            ic = _cross_section_ic(row, fwd_row)
+            if np.isfinite(ic):
+                ic_values.append(ic)
+        tail = ic_values[-window:]
+        if len(tail) < min_obs:
+            return equal
+        ic_mean = float(np.mean(tail))
+        ic_std = float(np.std(tail, ddof=1)) if len(tail) > 1 else 0.0
+        if ic_std <= 0:
+            icir_scores[name] = max(0.0, ic_mean)
+        else:
+            icir_scores[name] = max(0.0, ic_mean / ic_std)
+
+    total = sum(icir_scores.values())
+    if total <= 0:
+        return equal
+    return {name: score / total for name, score in icir_scores.items()}
+
+
+def apply_regime(
+    layer_weights: dict[str, float],
+    *,
+    bench_ret_20: float,
+    threshold: float,
+    mom_scale: float = 0.0,
+) -> dict[str, float]:
+    """Scale momentum layer down when benchmark return breaches the regime threshold."""
+    if not layer_weights:
+        return {}
+
+    out = {str(k): float(v) for k, v in layer_weights.items()}
+    total = sum(out.values())
+    if total <= 0:
+        return out
+
+    normalized = {k: v / total for k, v in out.items()}
+    if float(bench_ret_20) >= float(threshold):
+        return normalized
+
+    if "momentum" in normalized:
+        normalized["momentum"] = float(mom_scale) * normalized["momentum"]
+
+    active = {k: v for k, v in normalized.items() if v > 0}
+    if not active:
+        others = [k for k in normalized if k != "momentum"]
+        if not others:
+            return {k: 0.0 for k in normalized}
+        eq = 1.0 / len(others)
+        return {k: (0.0 if k == "momentum" else eq) for k in normalized}
+
+    re_total = sum(active.values())
+    return {k: (v / re_total if v > 0 else 0.0) for k, v in normalized.items()}

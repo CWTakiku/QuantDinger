@@ -776,6 +776,10 @@ neutralization uses injected maps; missing layers are re-weighted automatically.
 # @param w_value_quality float 0.30 Value (EP/BP) layer weight range=0.0:1.0:0.05
 # @param w_flow float 0.0 Flow layer weight (C2; unused in C1) range=0.0:1.0:0.05
 # @param w_consensus float 0.0 Consensus layer weight (C2; unused in C1) range=0.0:1.0:0.05
+# @param use_icir bool false Enable ICIR layer weighting (needs rolling history) range=
+# @param icir_window int 20 ICIR rolling window (trading days) range=10:60:5
+# @param regime_enabled bool true Enable benchmark drawdown regime filter range=
+# @param regime_ret_threshold float -0.08 20D benchmark return trigger range=-0.20:0.0:0.01
 
 import numpy as np
 import pandas as pd
@@ -896,6 +900,111 @@ def _cap_universe(symbols, top_n, as_of):
     return ranked[:top_n]
 
 
+def _bench_ret_20(benchmark="CNStock:000300.SH"):
+    """Benchmark total return over the last 20 completed daily bars."""
+    try:
+        hist = get_history(21, "1d", "close", [benchmark])
+    except Exception:
+        return 0.0
+    if hist is None:
+        return 0.0
+    if isinstance(hist, dict):
+        frame = hist.get(benchmark)
+    else:
+        frame = hist
+    if frame is None or len(frame) < 21:
+        return 0.0
+    close = pd.to_numeric(frame["close"] if "close" in frame.columns else frame.iloc[:, 0], errors="coerce").dropna()
+    if len(close) < 21:
+        return 0.0
+    start = float(close.iloc[0])
+    end = float(close.iloc[-1])
+    if start <= 0:
+        return 0.0
+    return end / start - 1.0
+
+
+def _append_icir_panel(panel, layer_scores, as_of, max_rows=80):
+    """Rolling store of daily layer score cross-sections for ICIR."""
+    panel = dict(panel or {})
+    row = {
+        name: pd.to_numeric(series, errors="coerce")
+        for name, series in (layer_scores or {}).items()
+        if series is not None and len(pd.to_numeric(series, errors="coerce").dropna()) >= 5
+    }
+    if not row:
+        return panel
+    dt = pd.Timestamp(as_of)
+    for name, series in row.items():
+        frame = panel.get(name)
+        if frame is None or not isinstance(frame, pd.DataFrame):
+            frame = pd.DataFrame()
+        frame.loc[dt] = series
+        frame = frame.sort_index().tail(max_rows)
+        panel[name] = frame
+    return panel
+
+
+def _forward_return_panel(symbols, as_of, lookback=80):
+    """One-day forward return panel aligned to layer history dates."""
+    if not symbols:
+        return pd.DataFrame()
+    try:
+        hist = get_history(int(lookback) + 2, "1d", "close", list(symbols))
+    except Exception:
+        return pd.DataFrame()
+    if hist is None:
+        return pd.DataFrame()
+    pieces = []
+    if isinstance(hist, dict):
+        for sym in symbols:
+            frame = hist.get(sym)
+            if frame is None or len(frame) < 3:
+                continue
+            close = pd.to_numeric(frame["close"], errors="coerce")
+            pieces.append((sym, close.pct_change().shift(-1)))
+    elif len(symbols) == 1 and len(hist) >= 3:
+        close = pd.to_numeric(hist["close"], errors="coerce")
+        pieces.append((symbols[0], close.pct_change().shift(-1)))
+    if not pieces:
+        return pd.DataFrame()
+    out = pd.concat({sym: series for sym, series in pieces}, axis=1).sort_index()
+    if as_of:
+        out = out.loc[: pd.Timestamp(as_of)]
+    return out.tail(lookback)
+
+
+def _resolve_layer_weights(context, layer_scores, as_of):
+    """Base param weights with optional ICIR and regime overlays."""
+    weights = {
+        "momentum": float(context.params.get("w_momentum", 0.45)),
+        "risk_liq": float(context.params.get("w_risk_liq", 0.25)),
+        "value_quality": float(context.params.get("w_value_quality", 0.30)),
+        "flow": float(context.params.get("w_flow", 0.0)),
+        "consensus": float(context.params.get("w_consensus", 0.0)),
+    }
+    use_icir = bool(context.params.get("use_icir", False))
+    if use_icir:
+        g.icir_panel = _append_icir_panel(g.icir_panel, layer_scores, as_of)
+        fwd = _forward_return_panel(list(layer_scores.get("momentum", pd.Series(dtype=float)).index or []), as_of)
+        if g.icir_panel and not fwd.empty:
+            icir_weights = apply_icir_weights(
+                g.icir_panel,
+                fwd,
+                window=int(context.params.get("icir_window", 20)),
+            )
+            if icir_weights:
+                weights = {name: float(icir_weights.get(name, weights.get(name, 0.0))) for name in weights}
+    if bool(context.params.get("regime_enabled", True)):
+        weights = apply_regime(
+            weights,
+            bench_ret_20=_bench_ret_20(),
+            threshold=float(context.params.get("regime_ret_threshold", -0.08)),
+            mom_scale=0.0,
+        )
+    return weights
+
+
 def initialize(context):
     context.set_universe(pool="csi300")
     context.subscribe(frequency="1d", fields=["open", "high", "low", "close", "volume"])
@@ -905,6 +1014,7 @@ def initialize(context):
     g.alpha = {}
     g.idio_var = {}
     g.last_weights = {}
+    g.icir_panel = {}
     run_daily(update_alpha, time="15:05")
     run_weekly(rebalance, weekday=1, time="09:35")
 
@@ -985,13 +1095,7 @@ def update_alpha(context, data):
         if value_raw.dropna().shape[0] >= 10:
             layer_scores["value_quality"] = _neutralize_industry_size(value_raw, industry, log_mcap)
 
-    weights = {
-        "momentum": float(context.params.get("w_momentum", 0.45)),
-        "risk_liq": float(context.params.get("w_risk_liq", 0.25)),
-        "value_quality": float(context.params.get("w_value_quality", 0.30)),
-        "flow": float(context.params.get("w_flow", 0.0)),
-        "consensus": float(context.params.get("w_consensus", 0.0)),
-    }
+    weights = _resolve_layer_weights(context, layer_scores, as_of)
     alpha = _combine_layers(layer_scores, weights)
     if len(alpha) < 10:
         return

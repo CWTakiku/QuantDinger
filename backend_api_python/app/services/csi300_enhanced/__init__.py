@@ -9,6 +9,8 @@ from .preprocess import (
 )
 from .bench import get_csi300_bench_weights
 from .layered_alpha import (
+    apply_icir_weights,
+    apply_regime,
     build_neutralized_factor,
     combine_layers,
     load_industry_and_size,
@@ -20,6 +22,8 @@ __all__ = [
     "cross_section_zscore",
     "neutralize_industry_size",
     "build_equal_weight_alpha",
+    "apply_icir_weights",
+    "apply_regime",
     "build_neutralized_factor",
     "combine_layers",
     "load_industry_and_size",

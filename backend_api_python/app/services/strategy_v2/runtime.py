@@ -41,7 +41,11 @@ from .protection import ProtectionDecision, ProtectionEngine, ProtectionSpec, Pr
 from app.markets.cn_stock.lot_rules import cn_stock_lot_spec, cn_stock_min_open
 from app.services.csi300_enhanced import optimize_enhanced_index
 from app.services.csi300_enhanced.bench import get_csi300_bench_weights
-from app.services.csi300_enhanced.layered_alpha import load_industry_and_size
+from app.services.csi300_enhanced.layered_alpha import (
+    apply_icir_weights,
+    apply_regime,
+    load_industry_and_size,
+)
 
 
 def get_ashare_industry_map(symbols: list[str], as_of: object) -> dict[str, str]:
@@ -1530,6 +1534,8 @@ class StrategyV2BacktestRunner:
             "get_factors": ctx.get_factors,
             "get_fundamentals": ctx.get_fundamentals,
             "is_trade": ctx.is_trade,
+            "apply_icir_weights": apply_icir_weights,
+            "apply_regime": apply_regime,
             "optimize_enhanced_index": optimize_enhanced_index,
             "get_csi300_bench_weights": get_csi300_bench_weights,
             "get_ashare_industry_map": get_ashare_industry_map,
@@ -2165,6 +2171,8 @@ class StrategyV2LiveSession:
             "get_factors": ctx.get_factors,
             "get_fundamentals": ctx.get_fundamentals,
             "is_trade": ctx.is_trade,
+            "apply_icir_weights": apply_icir_weights,
+            "apply_regime": apply_regime,
             "optimize_enhanced_index": optimize_enhanced_index,
             "get_csi300_bench_weights": get_csi300_bench_weights,
             "get_ashare_industry_map": get_ashare_industry_map,
