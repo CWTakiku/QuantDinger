@@ -10,6 +10,7 @@ from app.services.csi300_enhanced.layered_alpha import (
     load_consensus_panel,
     load_flow_panel,
     load_industry_and_size,
+    load_valuation_panel,
 )
 
 
@@ -78,6 +79,39 @@ def test_load_industry_and_size_reads_db():
     assert industry["CNStock:000001.SZ"] == "银行"
     assert log_mcap["CNStock:600519.SH"] == np.log1p(1000.0)
     assert log_mcap["CNStock:000001.SZ"] == np.log1p(500.0)
+
+
+def test_load_valuation_panel_reads_db():
+    rows_val = [
+        {"ts_code": "600519.SH", "pe_ttm": 25.0, "pb": 8.0},
+        {"ts_code": "000001.SZ", "pe_ttm": 5.0, "pb": 0.8},
+    ]
+
+    class _Cursor:
+        def execute(self, sql, params=None):
+            self._sql = sql
+            self._params = params
+
+        def fetchall(self):
+            return rows_val
+
+    class _Db:
+        def cursor(self):
+            return _Cursor()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    symbols = ["CNStock:600519.SH", "CNStock:000001.SZ"]
+    with patch("app.services.csi300_enhanced.layered_alpha.get_db_connection", lambda: _Db()):
+        frame = load_valuation_panel(symbols, date(2026, 7, 31))
+
+    assert list(frame.columns) == ["PE", "PB"]
+    assert float(frame.loc["CNStock:600519.SH", "PE"]) == 25.0
+    assert float(frame.loc["CNStock:000001.SZ", "PB"]) == 0.8
 
 
 def test_load_flow_panel_reads_db():

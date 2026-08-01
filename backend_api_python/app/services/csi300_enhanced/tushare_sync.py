@@ -79,6 +79,8 @@ def normalize_index_weight_frame(frame: Any) -> pd.DataFrame:
 
 def weights_to_platform_map(frame: pd.DataFrame) -> dict[str, float]:
     """Map Tushare weight percent to platform CNStock symbols summing to 1."""
+    from app.markets.cn_stock.symbols import canonicalize_cnstock_key
+
     if frame is None or frame.empty:
         return {}
     rows: dict[str, float] = {}
@@ -86,11 +88,9 @@ def weights_to_platform_map(frame: pd.DataFrame) -> dict[str, float]:
         code = str(row.get("con_code") or "").strip().upper()
         if not code:
             continue
-        if code.endswith(".SH") or code.endswith(".SZ"):
-            symbol = f"CNStock:{code}"
-        else:
-            ts = tencent_code_to_ts_code(code)
-            symbol = f"CNStock:{ts}"
+        symbol = canonicalize_cnstock_key(code)
+        if not symbol:
+            continue
         try:
             w = float(row.get("weight"))
         except (TypeError, ValueError):
@@ -101,6 +101,112 @@ def weights_to_platform_map(frame: pd.DataFrame) -> dict[str, float]:
     if total <= 0:
         return {}
     return {k: v / total for k, v in rows.items()}
+
+
+def rebuild_csi300_membership_from_index_weights(
+    *,
+    universe_code: str = "csi300",
+) -> dict[str, Any]:
+    """Replace ``qd_universe_members`` with PIT intervals from index weights.
+
+    Each distinct ``trade_date`` in ``qd_csi300_index_weights`` becomes an
+    interval ``[trade_date, next_trade_date)`` (last board stays open-ended).
+    Symbols are stored as ``600519.SH`` / ``000001.SZ``.
+    """
+    from app.markets.cn_stock.symbols import canonicalize_cn_symbol
+
+    with get_db_connection() as db:
+        cur = db.cursor()
+        cur.execute("SELECT id FROM qd_universes WHERE code = ?", (universe_code,))
+        uni = cur.fetchone()
+        if not uni:
+            raise ValueError(f"universe not found: {universe_code}")
+        universe_id = int(uni["id"])
+
+        cur.execute(
+            """
+            SELECT trade_date, con_code, weight
+            FROM qd_csi300_index_weights
+            ORDER BY trade_date ASC, con_code ASC
+            """
+        )
+        raw_rows = list(cur.fetchall() or [])
+        if not raw_rows:
+            return {
+                "universe_id": universe_id,
+                "universe_code": universe_code,
+                "boards": 0,
+                "members_inserted": 0,
+            }
+
+        by_date: dict[date, list[tuple[str, float]]] = {}
+        for row in raw_rows:
+            td = row["trade_date"]
+            if isinstance(td, datetime):
+                td = td.date()
+            elif not isinstance(td, date):
+                td = date.fromisoformat(str(td)[:10])
+            code = canonicalize_cn_symbol(str(row["con_code"] or ""))
+            if not code:
+                continue
+            try:
+                weight_pct = float(row["weight"])
+            except (TypeError, ValueError):
+                continue
+            if weight_pct <= 0 or weight_pct != weight_pct:
+                continue
+            by_date.setdefault(td, []).append((code, weight_pct))
+
+        dates = sorted(by_date)
+        cur.execute("DELETE FROM qd_universe_members WHERE universe_id = ?", (universe_id,))
+        inserted = 0
+        version = f"index_weight_pit:{dates[0].isoformat()}:{dates[-1].isoformat()}"
+        for idx, td in enumerate(dates):
+            next_td = dates[idx + 1] if idx + 1 < len(dates) else None
+            board = sorted(by_date[td], key=lambda item: (-item[1], item[0]))
+            for rank, (code, weight_pct) in enumerate(board, start=1):
+                cur.execute(
+                    """
+                    INSERT INTO qd_universe_members (
+                        universe_id, market, symbol, name, market_type,
+                        valid_from, valid_to, member_weight, member_rank,
+                        source_version, metadata_json
+                    )
+                    VALUES (
+                        ?, 'CNStock', ?, '', 'spot',
+                        ?, ?, ?, ?,
+                        ?, '{}'::jsonb
+                    )
+                    """,
+                    (
+                        universe_id,
+                        code,
+                        td,
+                        next_td,
+                        float(weight_pct) / 100.0,
+                        int(rank),
+                        version,
+                    ),
+                )
+                inserted += 1
+        db.commit()
+
+    logger.info(
+        "rebuilt csi300 membership universe=%s boards=%s members=%s span=%s..%s",
+        universe_code,
+        len(dates),
+        inserted,
+        dates[0],
+        dates[-1],
+    )
+    return {
+        "universe_id": universe_id,
+        "universe_code": universe_code,
+        "boards": len(dates),
+        "members_inserted": inserted,
+        "first_trade_date": dates[0].isoformat(),
+        "last_trade_date": dates[-1].isoformat(),
+    }
 
 
 _DAILY_BASIC_COLUMNS = (
@@ -720,12 +826,21 @@ def run_csi300_enhanced_daily_sync(
     Missing Tushare / API failures return 0 for the affected panel and do not raise.
     """
     day = str(trade_date or date.today().strftime("%Y%m%d"))
+    index_n = fetch_and_persist_index_weights(trade_date=day)
+    membership: dict[str, Any] = {}
+    if index_n > 0:
+        try:
+            membership = rebuild_csi300_membership_from_index_weights()
+        except Exception as exc:
+            logger.warning("csi300 membership rebuild skipped: %s", exc)
+            membership = {"error": str(exc)[:240]}
     counts: dict[str, Any] = {
         "trade_date": day,
-        "index_weights": fetch_and_persist_index_weights(trade_date=day),
+        "index_weights": index_n,
         "daily_basic": fetch_and_persist_daily_basic(trade_date=day),
         "industry_map": 0 if skip_industry else fetch_and_persist_industry_map(),
         "flow_daily": 0 if skip_flow else fetch_and_persist_flow_daily(trade_date=day),
         "consensus_daily": 0 if skip_consensus else fetch_and_persist_consensus_daily(trade_date=day),
+        "membership": membership,
     }
     return counts

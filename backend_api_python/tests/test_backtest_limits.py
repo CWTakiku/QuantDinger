@@ -93,6 +93,29 @@ def test_policy_metadata_uses_strictest_market_and_normalizes_timeframe():
     assert policy["maxSelectedDays"] == 698
 
 
+def test_cnstock_daily_allows_five_year_research_window():
+    policy = backtest_range_policy_metadata(
+        markets=["CNStock"],
+        timeframe="1d",
+        warmup_bars=140,
+    )
+
+    assert policy["timeframe"] == "1D"
+    assert policy["market"] == "CNStock"
+    assert policy["maxDays"] == 2190
+    assert policy["maxSelectedDays"] >= 1825
+
+    err = validate_backtest_range(
+        market="CNStock",
+        symbol="600519.SH",
+        timeframe="1d",
+        start_date=datetime(2021, 8, 1),
+        end_date=datetime(2026, 8, 1),
+        warmup_bars=140,
+    )
+    assert err is None
+
+
 def test_service_rejects_one_year_of_one_minute_data_before_fetching():
     code = '''
 def initialize(context):

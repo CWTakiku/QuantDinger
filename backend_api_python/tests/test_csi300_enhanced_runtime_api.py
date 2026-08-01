@@ -141,7 +141,8 @@ def handle_data(context, data):
     symbols = ["CNStock:600519.SH", "CNStock:000858.SZ"]
     flow = get_ashare_flow_panel(symbols, as_of)
     consensus = get_ashare_consensus_panel(symbols, as_of)
-    log(str(len(flow)) + str(len(consensus)))
+    val = get_ashare_valuation_panel(symbols, as_of)
+    log(str(len(flow)) + str(len(consensus)) + str(len(val)))
 """
     compiled = compile_strategy_v2(code)
     assert callable(compiled.handler("handle_data"))
@@ -168,7 +169,7 @@ def handle_data(context, data):
         initial_capital=100000.0,
     )
     namespace = runner.program.namespace
-    for name in ("get_ashare_flow_panel", "get_ashare_consensus_panel"):
+    for name in ("get_ashare_flow_panel", "get_ashare_consensus_panel", "get_ashare_valuation_panel"):
         assert callable(namespace.get(name)), name
 
 
@@ -198,6 +199,8 @@ def test_example_csi300_enhanced_v2_weekly_compiles():
     assert "get_ashare_size_log_mcap" in code
     assert "get_ashare_flow_panel" in code
     assert "get_ashare_consensus_panel" in code
+    assert "get_ashare_valuation_panel" in code
+    assert "get_fundamentals" not in code
     assert "industry_limit" in code
     assert "te_limit" in code
     assert "(252.0 ** 0.5)" in code or "sqrt(252)" in code

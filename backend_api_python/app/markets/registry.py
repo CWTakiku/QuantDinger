@@ -107,10 +107,17 @@ MARKET_MODULES: Dict[str, MarketModule] = {
         features=["research", "backtest", "paper"],
         data_requirements=[
             DataRequirement(
+                key="tushare",
+                label="Tushare",
+                setting_keys=["TUSHARE_TOKEN"],
+                recommended=True,
+                purpose="primary A-share daily OHLCV and factor panels",
+            ),
+            DataRequirement(
                 key="akshare",
                 label="AkShare fallback",
                 built_in=True,
-                purpose="quotes and OHLCV",
+                purpose="quotes and OHLCV fallback",
             ),
             DataRequirement(
                 key="twelve_data",

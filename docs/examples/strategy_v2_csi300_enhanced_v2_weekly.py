@@ -140,16 +140,36 @@ def _combine_layers(layer_scores, weights):
     return _zscore(combined.dropna())
 
 
+def _canon_cn_key(value):
+    """Normalize CNStock keys to ``CNStock:600519.SH`` without external imports."""
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    market, symbol = (raw.split(":", 1) + [""])[:2] if ":" in raw else ("CNStock", raw)
+    if market.upper() != "CNSTOCK":
+        return raw
+    sym = str(symbol or "").strip().upper()
+    if sym.endswith(".SH") or sym.endswith(".SZ"):
+        return f"CNStock:{sym}"
+    if sym.isdigit() and len(sym) == 6:
+        return f"CNStock:{sym}.SH" if sym.startswith("6") else f"CNStock:{sym}.SZ"
+    return f"CNStock:{sym}" if sym else raw
+
+
 def _cap_universe(symbols, top_n, as_of):
     """Optional cap by PIT bench weight (largest first)."""
     if not symbols or top_n <= 0 or top_n >= len(symbols):
         return list(symbols or [])
     try:
         weights = get_csi300_bench_weights(as_of, symbols=list(symbols))
+        ranked = sorted(
+            symbols,
+            key=lambda s: float((weights or {}).get(_canon_cn_key(s), 0.0)),
+            reverse=True,
+        )
+        return ranked[:top_n]
     except Exception:
         return list(symbols)[:top_n]
-    ranked = sorted(symbols, key=lambda s: float((weights or {}).get(s, 0.0)), reverse=True)
-    return ranked[:top_n]
 
 
 def _bench_ret_20(benchmark="CNStock:000300.SH"):
@@ -188,17 +208,29 @@ def _append_icir_panel(panel, layer_scores, as_of, max_rows=80):
         return panel
     dt = pd.Timestamp(as_of)
     for name, series in row.items():
+        series = pd.to_numeric(series, errors="coerce")
+        if not isinstance(series, pd.Series) or series.empty:
+            continue
+        # Avoid ``empty.loc[dt] = series`` — pandas raises
+        # "cannot set a frame with no defined columns".
+        piece = series.to_frame().T
+        piece.index = [dt]
         frame = panel.get(name)
-        if frame is None or not isinstance(frame, pd.DataFrame):
-            frame = pd.DataFrame()
-        frame.loc[dt] = series
-        frame = frame.sort_index().tail(max_rows)
-        panel[name] = frame
+        if frame is None or not isinstance(frame, pd.DataFrame) or frame.empty:
+            frame = piece
+        else:
+            frame = pd.concat([frame, piece], axis=0)
+            frame = frame[~frame.index.duplicated(keep="last")]
+        panel[name] = frame.sort_index().tail(max_rows)
     return panel
 
 
 def _forward_return_panel(symbols, as_of, lookback=80):
-    """One-day forward return panel aligned to layer history dates."""
+    """One-day forward return panel aligned to layer history dates.
+
+    Returns are labeled on day T as the move from T to T+1. At decision time
+    ``as_of`` that path is unknown, so rows with index >= as_of are excluded.
+    """
     if not symbols:
         return pd.DataFrame()
     try:
@@ -222,7 +254,7 @@ def _forward_return_panel(symbols, as_of, lookback=80):
         return pd.DataFrame()
     out = pd.concat({sym: series for sym, series in pieces}, axis=1).sort_index()
     if as_of:
-        out = out.loc[: pd.Timestamp(as_of)]
+        out = out.loc[out.index < pd.Timestamp(as_of)]
     return out.tail(lookback)
 
 
@@ -238,7 +270,9 @@ def _resolve_layer_weights(context, layer_scores, as_of):
     use_icir = bool(context.params.get("use_icir", False))
     if use_icir:
         g.icir_panel = _append_icir_panel(g.icir_panel, layer_scores, as_of)
-        fwd = _forward_return_panel(list(layer_scores.get("momentum", pd.Series(dtype=float)).index or []), as_of)
+        mom_scores = layer_scores.get("momentum", pd.Series(dtype=float))
+        mom_symbols = list(mom_scores.index) if isinstance(mom_scores, pd.Series) else []
+        fwd = _forward_return_panel(mom_symbols, as_of)
         if g.icir_panel and not fwd.empty:
             icir_weights = apply_icir_weights(
                 g.icir_panel,
@@ -271,7 +305,8 @@ def _active_risk_proxy(weights, w_bench, idio_var):
 def _select_touch_symbols(w_prev, w_bench, idio_var, params):
     """Pick symbols to touch when deviation or TE breach thresholds."""
     dev_trigger = float(params.get("partial_active_dev_trigger", 0.015))
-    te_trigger = float(params.get("partial_te_trigger", params.get("te_limit", 0.08)))
+    te_limit = float(params.get("te_limit", 0.08))
+    te_trigger = float(params.get("partial_te_trigger", te_limit))
     max_touch = int(params.get("partial_max_touch", 10))
     active = {
         sym: float(w_prev.get(sym, 0.0)) - float(w_bench.get(sym, 0.0))
@@ -337,7 +372,8 @@ def monitor_partial_rebalance(context, data):
         idio_var = {sym: 1.0 for sym in symbols}
 
     dev_trigger = float(context.params.get("partial_active_dev_trigger", 0.015))
-    te_trigger = float(context.params.get("partial_te_trigger", context.params.get("te_limit", 0.08)))
+    te_limit = float(context.params.get("te_limit", 0.08))
+    te_trigger = float(context.params.get("partial_te_trigger", te_limit))
     touch, te, active = _select_touch_symbols(w_prev, w_bench, idio_var, context.params)
     max_dev = max((abs(v) for v in active.values()), default=0.0)
     if max_dev <= dev_trigger and te <= te_trigger:
@@ -353,7 +389,8 @@ def monitor_partial_rebalance(context, data):
         log_mcap = get_ashare_size_log_mcap(symbols, as_of)
     except Exception:
         log_mcap = pd.Series(dtype=float)
-    size_z = _zscore(log_mcap) if log_mcap is not None and len(log_mcap) > 0 else pd.Series(dtype=float)
+    size_z = _zscore(log_mcap) if isinstance(log_mcap, pd.Series) and len(log_mcap) > 0 else pd.Series(dtype=float)
+    size_z_map = {str(k): float(v) for k, v in size_z.items()} if len(size_z) else None
 
     result = optimize_enhanced_index_partial(
         alpha,
@@ -363,9 +400,9 @@ def monitor_partial_rebalance(context, data):
         active_limit=float(context.params.get("active_limit", 0.025)),
         risk_aversion=float(context.params.get("risk_aversion", 1.0)),
         turn_penalty=float(context.params.get("turn_penalty", 0.01)),
-        industry=industry or None,
+        industry=industry if industry else None,
         industry_limit=float(context.params.get("industry_limit", 0.05)),
-        size_z=size_z if len(size_z) else None,
+        size_z=size_z_map,
         size_limit=float(context.params.get("size_limit", 0.30)),
         te_limit=float(context.params.get("te_limit", 0.08)),
         idio_var=idio_var,
@@ -397,7 +434,7 @@ def monitor_partial_rebalance(context, data):
         optimize_result=result,
         bench_source=bench_source,
         industry=industry,
-        size_z=size_z if len(size_z) else None,
+        size_z=size_z_map,
         kind="partial",
     )
     log(
@@ -472,16 +509,16 @@ def update_alpha(context, data):
     }
 
     try:
-        fund = get_fundamentals(["PE", "PB"], eligible)
+        fund = get_ashare_valuation_panel(eligible, as_of)
     except Exception as exc:
-        log("fundamentals skipped: %s" % exc)
+        log("valuation panel skipped: %s" % exc)
         fund = None
     if fund is not None and not fund.empty:
-        pe = pd.to_numeric(fund.get("PE"), errors="coerce")
-        pb = pd.to_numeric(fund.get("PB"), errors="coerce")
-        if pe is None:
+        pe = pd.to_numeric(fund["PE"], errors="coerce") if "PE" in fund.columns else pd.Series(dtype=float)
+        pb = pd.to_numeric(fund["PB"], errors="coerce") if "PB" in fund.columns else pd.Series(dtype=float)
+        if not isinstance(pe, pd.Series):
             pe = pd.Series(dtype=float)
-        if pb is None:
+        if not isinstance(pb, pd.Series):
             pb = pd.Series(dtype=float)
         ep = 1.0 / pe.replace(0, np.nan)
         bp = 1.0 / pb.replace(0, np.nan)
@@ -551,7 +588,8 @@ def rebalance(context, data):
         log("size panel skipped: %s" % exc)
         log_mcap = pd.Series(dtype=float)
 
-    size_z = _zscore(log_mcap) if log_mcap is not None and len(log_mcap) > 0 else pd.Series(dtype=float)
+    size_z = _zscore(log_mcap) if isinstance(log_mcap, pd.Series) and len(log_mcap) > 0 else pd.Series(dtype=float)
+    size_z_map = {str(k): float(v) for k, v in size_z.items()} if len(size_z) else None
     w_prev = dict(g.last_weights) if g.last_weights else dict(w_bench)
     idio_var = dict(g.idio_var or {})
     if not idio_var:
@@ -568,9 +606,9 @@ def rebalance(context, data):
         active_limit=float(context.params.get("active_limit", 0.025)),
         risk_aversion=float(context.params.get("risk_aversion", 1.0)),
         turn_penalty=float(context.params.get("turn_penalty", 0.01)),
-        industry=industry or None,
+        industry=industry if industry else None,
         industry_limit=industry_limit,
-        size_z=size_z if len(size_z) else None,
+        size_z=size_z_map,
         size_limit=size_limit,
         te_limit=te_limit,
         idio_var=idio_var,
@@ -600,7 +638,7 @@ def rebalance(context, data):
         optimize_result=result,
         bench_source=bench_source,
         industry=industry,
-        size_z=size_z if len(size_z) else None,
+        size_z=size_z_map,
         kind="weekly",
     )
     log(
@@ -612,6 +650,6 @@ def rebalance(context, data):
             result.get("status") or "",
             bench_source,
             len(industry or {}),
-            len(size_z) if size_z is not None else 0,
+            len(size_z_map or {}),
         )
     )

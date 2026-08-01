@@ -20,8 +20,14 @@ from .layered_alpha import (
     load_consensus_panel,
     load_flow_panel,
     load_industry_and_size,
+    load_valuation_panel,
 )
-from .tushare_sync import fetch_index_weights, normalize_index_weight_frame, weights_to_platform_map
+from .tushare_sync import (
+    fetch_index_weights,
+    normalize_index_weight_frame,
+    rebuild_csi300_membership_from_index_weights,
+    weights_to_platform_map,
+)
 from .diagnostics import build_enhanced_index_diagnostics, summarize_enhanced_index_diagnostics
 
 __all__ = [
@@ -36,11 +42,13 @@ __all__ = [
     "load_industry_and_size",
     "load_flow_panel",
     "load_consensus_panel",
+    "load_valuation_panel",
     "optimize_enhanced_index",
     "optimize_enhanced_index_partial",
     "fetch_index_weights",
     "normalize_index_weight_frame",
     "weights_to_platform_map",
+    "rebuild_csi300_membership_from_index_weights",
     "get_csi300_bench_weights",
     "get_csi300_bench_weights_with_meta",
     "get_csi300_bench_weight_source",

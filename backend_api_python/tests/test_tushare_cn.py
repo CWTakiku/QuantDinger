@@ -10,6 +10,7 @@ from app.data_sources.tushare_cn import (
     _trade_date_to_unix,
     daily_bars_cover_today,
     fetch_tushare_daily_klines,
+    is_ashare_index_ts_code,
     tencent_code_to_ts_code,
 )
 
@@ -19,6 +20,14 @@ def test_tencent_code_to_ts_code():
     assert tencent_code_to_ts_code("SZ000001") == "000001.SZ"
     assert tencent_code_to_ts_code("600519.SH") == "600519.SH"
     assert tencent_code_to_ts_code("000001") == "000001.SZ"
+
+
+def test_is_ashare_index_ts_code():
+    assert is_ashare_index_ts_code("000300.SH") is True
+    assert is_ashare_index_ts_code("000905.SH") is True
+    assert is_ashare_index_ts_code("399006.SZ") is True
+    assert is_ashare_index_ts_code("000001.SZ") is False
+    assert is_ashare_index_ts_code("600519.SH") is False
 
 
 def test_trade_date_maps_to_shanghai_midnight():
@@ -78,3 +87,26 @@ def test_fetch_tushare_daily_klines_maps_rows(monkeypatch):
     fake_pro.daily.assert_called()
     kwargs = fake_pro.daily.call_args.kwargs
     assert kwargs["ts_code"] == "600519.SH"
+
+
+def test_fetch_tushare_daily_klines_uses_index_daily_for_csi300(monkeypatch):
+    monkeypatch.setenv("TUSHARE_TOKEN", "dummy-token")
+
+    frame = pd.DataFrame(
+        [
+            {"trade_date": "20260105", "open": 3000.0, "high": 3010.0, "low": 2990.0, "close": 3005.0, "vol": 1.0},
+            {"trade_date": "20260106", "open": 3005.0, "high": 3020.0, "low": 3000.0, "close": 3015.0, "vol": 1.0},
+        ]
+    )
+    fake_pro = MagicMock()
+    fake_pro.index_daily.return_value = frame
+    fake_pro.daily.return_value = pd.DataFrame()
+
+    with patch("app.data_sources.tushare_cn._build_pro", return_value=fake_pro):
+        rows = fetch_tushare_daily_klines(tencent_code="SH000300", limit=2)
+
+    assert len(rows) == 2
+    assert rows[-1]["close"] == 3015.0
+    fake_pro.index_daily.assert_called()
+    fake_pro.daily.assert_not_called()
+    assert fake_pro.index_daily.call_args.kwargs["ts_code"] == "000300.SH"

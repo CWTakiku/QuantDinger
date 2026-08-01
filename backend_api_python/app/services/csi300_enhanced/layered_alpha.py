@@ -140,6 +140,73 @@ def load_industry_and_size(
     return industry, log_mcap
 
 
+def load_valuation_panel(
+    symbols: list[str],
+    as_of: date | str,
+) -> pd.DataFrame:
+    """Load PE/PB (Tushare pe_ttm/pb) cross-section for platform symbols.
+
+    Returns a DataFrame indexed by platform symbol with columns ``PE`` and ``PB``,
+    matching the shape of ``get_fundamentals(["PE", "PB"], ...)``.
+    """
+    as_of_d = _as_date(as_of)
+    sym_list = [str(s) for s in (symbols or []) if str(s).strip()]
+    if not sym_list:
+        return pd.DataFrame(columns=["PE", "PB"])
+
+    ts_by_sym = {sym: _platform_to_ts_code(sym) for sym in sym_list}
+    ts_codes = sorted(set(ts_by_sym.values()))
+    placeholders = ",".join(["?"] * len(ts_codes))
+    val_by_ts: dict[str, dict[str, float]] = {}
+
+    with get_db_connection() as db:
+        cur = db.cursor()
+        cur.execute(
+            f"""
+            SELECT ts_code, pe_ttm, pb
+            FROM qd_ashare_daily_basic
+            WHERE ts_code IN ({placeholders})
+              AND trade_date = (
+                SELECT MAX(trade_date) FROM qd_ashare_daily_basic WHERE trade_date <= ?
+              )
+            """,
+            (*ts_codes, as_of_d),
+        )
+        for row in cur.fetchall() or []:
+            pe = row.get("pe_ttm")
+            pb = row.get("pb")
+            out: dict[str, float] = {}
+            if pe is not None:
+                try:
+                    pe_f = float(pe)
+                    if np.isfinite(pe_f) and pe_f != 0:
+                        out["PE"] = pe_f
+                except (TypeError, ValueError):
+                    pass
+            if pb is not None:
+                try:
+                    pb_f = float(pb)
+                    if np.isfinite(pb_f) and pb_f != 0:
+                        out["PB"] = pb_f
+                except (TypeError, ValueError):
+                    pass
+            if out:
+                val_by_ts[str(row["ts_code"])] = out
+
+    rows = {
+        sym: val_by_ts[ts_by_sym[sym]]
+        for sym in sym_list
+        if ts_by_sym[sym] in val_by_ts
+    }
+    if not rows:
+        return pd.DataFrame(columns=["PE", "PB"])
+    frame = pd.DataFrame.from_dict(rows, orient="index")
+    for col in ("PE", "PB"):
+        if col not in frame.columns:
+            frame[col] = np.nan
+    return frame[["PE", "PB"]]
+
+
 def load_flow_panel(
     symbols: list[str],
     as_of: date | str,

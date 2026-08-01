@@ -54,6 +54,21 @@ _DEFAULT_LIMITS: Dict[str, BacktestRangePolicy] = {
 
 
 _MARKET_LIMITS: Dict[str, Dict[str, BacktestRangePolicy]] = {
+    # A-share daily/weekly: Tushare can supply long history; keep a 5-year
+    # research window as the default product policy for CSI300-style work.
+    "CNStock": {
+        "1m": BacktestRangePolicy(30, "1 month", "engine workload limit"),
+        "3m": BacktestRangePolicy(30, "1 month", "engine workload limit"),
+        "5m": BacktestRangePolicy(180, "6 months", "engine workload limit"),
+        "15m": BacktestRangePolicy(365, "1 year", "engine workload limit"),
+        "30m": BacktestRangePolicy(365, "1 year", "engine workload limit"),
+        "1H": BacktestRangePolicy(1095, "3 years", "engine workload limit"),
+        "4H": BacktestRangePolicy(1095, "3 years", "engine workload limit"),
+        # 2190 ≈ 6 calendar years of fetch headroom so a full 5-year selected
+        # window still fits after typical Strategy V2 warmup (e.g. 140 bars).
+        "1D": BacktestRangePolicy(2190, "5 years", "CN stock daily research window"),
+        "1W": BacktestRangePolicy(2190, "5 years", "CN stock weekly research window"),
+    },
     # yfinance intraday endpoints are much narrower than daily/weekly history.
     # Keep the cap below the upstream hard edge so indicator warmup does not
     # push an apparently valid user window into an upstream 400.

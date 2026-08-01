@@ -31,6 +31,25 @@ def tencent_code_to_ts_code(code: str) -> str:
     return s
 
 
+def is_ashare_index_ts_code(ts_code: str) -> bool:
+    """True for SSE/SZSE index codes that need Tushare ``index_daily``.
+
+    Examples: ``000300.SH`` (CSI300), ``000905.SH`` (CSI500), ``399006.SZ``.
+    Note: ``000001.SZ`` is a stock and must keep using ``daily``.
+    """
+    s = str(ts_code or "").strip().upper()
+    if "." not in s:
+        return False
+    code, exch = s.split(".", 1)
+    if not (code.isdigit() and len(code) == 6):
+        return False
+    if exch == "SH" and code.startswith("000"):
+        return True
+    if exch == "SZ" and code.startswith("399"):
+        return True
+    return False
+
+
 _pro_cache: Dict[tuple[str, str], Any] = {}
 
 
@@ -91,12 +110,23 @@ def fetch_tushare_daily_klines(
     end_date = None
     if before_time:
         end_date = datetime.fromtimestamp(int(before_time), tz=timezone.utc).strftime("%Y%m%d")
+    use_index = is_ashare_index_ts_code(ts_code)
+    api_name = "index_daily" if use_index else "daily"
     try:
         # 多取一点再截断，兼容 end_date 过滤
-        df = pro.daily(ts_code=ts_code, end_date=end_date)
+        api = getattr(pro, api_name)
+        df = api(ts_code=ts_code, end_date=end_date)
     except Exception as exc:
-        logger.warning("Tushare daily failed ts_code=%s: %s", ts_code, exc)
+        logger.warning("Tushare %s failed ts_code=%s: %s", api_name, ts_code, exc)
         return []
+    # Index codes occasionally mis-routed: retry the other endpoint once.
+    if (df is None or getattr(df, "empty", True)) and not use_index and ts_code.endswith(".SH"):
+        try:
+            df = pro.index_daily(ts_code=ts_code, end_date=end_date)
+            api_name = "index_daily"
+        except Exception as exc:
+            logger.warning("Tushare index_daily fallback failed ts_code=%s: %s", ts_code, exc)
+            return []
     if df is None or getattr(df, "empty", True):
         return []
     df = df.sort_values("trade_date")

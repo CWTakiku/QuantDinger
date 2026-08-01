@@ -27,6 +27,20 @@ def test_build_enhanced_index_diagnostics_payload():
     assert abs(payload["industryActiveDeviation"]["byIndustry"]["IND1"] - 0.05) < 1e-9
 
 
+def test_build_enhanced_index_diagnostics_accepts_size_z_series():
+    payload = build_enhanced_index_diagnostics(
+        as_of="2026-07-31",
+        weights={"A": 0.55, "B": 0.45},
+        w_bench={"A": 0.5, "B": 0.5},
+        optimize_result={"status": "optimal", "turnover": 0.04, "active_risk_proxy": 0.03},
+        bench_source="csi300_pit",
+        industry={"A": "IND1", "B": "IND2"},
+        size_z=pd.Series({"A": 1.0, "B": -1.0}),
+        kind="weekly",
+    )
+    assert abs(payload["sizeExposure"] - 0.1) < 1e-9
+
+
 def test_build_enhanced_index_diagnostics_marks_bench_fallback():
     payload = build_enhanced_index_diagnostics(
         as_of="2026-07-31",

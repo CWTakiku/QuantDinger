@@ -75,7 +75,12 @@ def summarize_enhanced_index_diagnostics(records: list[Mapping[str, Any]]) -> di
     }
 
 
-def _weight_series(values: Mapping[str, float] | None) -> pd.Series:
+def _weight_series(values: Mapping[str, float] | pd.Series | None) -> pd.Series:
+    if values is None:
+        return pd.Series(dtype=float)
+    if isinstance(values, pd.Series):
+        series = pd.to_numeric(values, errors="coerce")
+        return series.replace([np.inf, -np.inf], np.nan).dropna().astype(float)
     if not values:
         return pd.Series(dtype=float)
     clean: dict[str, float] = {}

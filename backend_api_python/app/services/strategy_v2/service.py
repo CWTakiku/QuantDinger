@@ -184,8 +184,9 @@ class StrategyV2BacktestService:
             members = self.universe_service.resolve_members(user_id, universe_id, as_of=timestamp.date())
             keys = [_member_key(item) for item in members]
             # Keep runtime universe aligned with fetched candidates (e.g. universe_top_n).
-            filtered = [key for key in keys if key in allowed_keys and key in frames]
-            return filtered or [key for key in allowed_keys if key in frames]
+            # Fail closed: empty PIT membership must NOT expand to the full candidate set
+            # (that was membership look-ahead when snapshots were current-only).
+            return [key for key in keys if key in allowed_keys and key in frames]
 
         runner = StrategyV2BacktestRunner(
             code=code,
@@ -552,9 +553,15 @@ def _frame_provenance(
 
 
 def _member_key(member: dict[str, Any]) -> str:
+    market = str(member.get("market") or "")
+    symbol = str(member.get("symbol") or "")
+    if market.strip().upper() == "CNSTOCK":
+        from app.markets.cn_stock.symbols import canonicalize_cn_symbol
+
+        symbol = canonicalize_cn_symbol(symbol) or symbol
     item = InstrumentSpec(
-        market=str(member.get("market") or ""),
-        symbol=str(member.get("symbol") or ""),
+        market=market,
+        symbol=symbol,
         exchange_id=str(member.get("exchange_id") or ""),
         market_type=str(member.get("market_type") or ""),
         instrument_id=str(member.get("instrument_id") or ""),
