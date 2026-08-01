@@ -1075,17 +1075,15 @@ def monitor_partial_rebalance(context, data):
     as_of = str(context.current_dt.date())
     n = len(symbols)
     equal = {sym: 1.0 / n for sym in symbols}
-    bench_source = "equal_fallback"
+    bench_source = "equal_weight"
     try:
-        w_bench = get_csi300_bench_weights(as_of, symbols=symbols)
-        if w_bench and abs(sum(w_bench.values()) - 1.0) < 1e-4:
-            bench_source = "csi300_pit"
-        else:
+        w_bench, bench_source = get_csi300_bench_weights_with_meta(as_of, symbols=symbols)
+        if not w_bench:
             w_bench = dict(equal)
-            bench_source = "equal_fallback"
+            bench_source = "equal_weight"
     except Exception:
         w_bench = dict(equal)
-        bench_source = "equal_fallback"
+        bench_source = "equal_weight"
 
     idio_var = dict(g.idio_var or {})
     if not idio_var:
@@ -1270,7 +1268,8 @@ def update_alpha(context, data):
     for sym, vol_val in pd.to_numeric(vol_s, errors="coerce").dropna().items():
         key = str(sym)
         if key in g.alpha:
-            idio[key] = max(float(vol_val) ** 2, 1e-6)
+            # Annualize daily realized vol so te_limit≈0.08 is on TE scale.
+            idio[key] = max((float(vol_val) * (252.0 ** 0.5)) ** 2, 1e-6)
     g.idio_var = idio
 
 
@@ -1283,18 +1282,16 @@ def rebalance(context, data):
     as_of = str(context.current_dt.date())
     n = len(symbols)
     equal = {sym: 1.0 / n for sym in symbols}
-    bench_source = "equal_fallback"
+    bench_source = "equal_weight"
     try:
-        w_bench = get_csi300_bench_weights(as_of, symbols=symbols)
-        if w_bench and abs(sum(w_bench.values()) - 1.0) < 1e-4:
-            bench_source = "csi300_pit"
-        else:
+        w_bench, bench_source = get_csi300_bench_weights_with_meta(as_of, symbols=symbols)
+        if not w_bench:
             w_bench = dict(equal)
-            bench_source = "equal_fallback"
+            bench_source = "equal_weight"
     except Exception as exc:
         log("bench weights fallback: %s" % exc)
         w_bench = dict(equal)
-        bench_source = "equal_fallback"
+        bench_source = "equal_weight"
 
     try:
         industry = get_ashare_industry_map(symbols, as_of)
@@ -1371,7 +1368,7 @@ def rebalance(context, data):
             len(size_z) if size_z is not None else 0,
         )
     )
-$csehv$, '{"params":[{"name":"universe_top_n","type":"integer","default":50,"min":20,"max":300,"step":10,"labelKey":"strategyV2.params.universeTopN"},{"name":"active_limit","type":"number","default":0.025,"min":0.01,"max":0.05,"step":0.005,"labelKey":"strategyV2.params.activeLimit"},{"name":"risk_aversion","type":"number","default":1.0,"min":0.1,"max":5.0,"step":0.1,"labelKey":"strategyV2.params.riskAversion"},{"name":"turn_penalty","type":"number","default":0.01,"min":0.0,"max":0.1,"step":0.005,"labelKey":"strategyV2.params.turnPenalty"},{"name":"min_turnover","type":"number","default":0.02,"min":0.0,"max":0.1,"step":0.01,"labelKey":"strategyV2.params.minTurnover"},{"name":"mom_fast","type":"integer","default":60,"min":20,"max":120,"step":5,"labelKey":"strategyV2.params.momFast"},{"name":"mom_slow","type":"integer","default":120,"min":60,"max":250,"step":10,"labelKey":"strategyV2.params.momSlow"},{"name":"vol_period","type":"integer","default":20,"min":10,"max":60,"step":5,"labelKey":"strategyV2.params.volPeriod"},{"name":"min_history_bars","type":"integer","default":0,"min":0,"max":260,"step":1,"labelKey":"strategyV2.params.minHistoryBars"},{"name":"industry_limit","type":"number","default":0.05,"min":0.01,"max":0.15,"step":0.005,"labelKey":"strategyV2.params.industryLimit"},{"name":"size_limit","type":"number","default":0.3,"min":0.05,"max":1.0,"step":0.05,"labelKey":"strategyV2.params.sizeLimit"},{"name":"te_limit","type":"number","default":0.08,"min":0.01,"max":0.25,"step":0.01,"labelKey":"strategyV2.params.teLimit"},{"name":"w_momentum","type":"number","default":0.35,"min":0.0,"max":1.0,"step":0.05,"labelKey":"strategyV2.params.wMomentum"},{"name":"w_risk_liq","type":"number","default":0.2,"min":0.0,"max":1.0,"step":0.05,"labelKey":"strategyV2.params.wRiskLiq"},{"name":"w_value_quality","type":"number","default":0.2,"min":0.0,"max":1.0,"step":0.05,"labelKey":"strategyV2.params.wValueQuality"},{"name":"w_flow","type":"number","default":0.15,"min":0.0,"max":1.0,"step":0.05,"labelKey":"strategyV2.params.wFlow"},{"name":"w_consensus","type":"number","default":0.1,"min":0.0,"max":1.0,"step":0.05,"labelKey":"strategyV2.params.wConsensus"},{"name":"partial_rebalance_enabled","type":"boolean","default":true,"labelKey":"strategyV2.params.partialRebalanceEnabled"},{"name":"partial_active_dev_trigger","type":"number","default":0.015,"min":0.005,"max":0.03,"step":0.005,"labelKey":"strategyV2.params.partialActiveDevTrigger"},{"name":"partial_te_trigger","type":"number","default":0.08,"min":0.01,"max":0.25,"step":0.01,"labelKey":"strategyV2.params.partialTeTrigger"},{"name":"partial_min_turnover","type":"number","default":0.005,"min":0.0,"max":0.05,"step":0.001,"labelKey":"strategyV2.params.partialMinTurnover"},{"name":"partial_max_touch","type":"integer","default":10,"min":3,"max":30,"step":1,"labelKey":"strategyV2.params.partialMaxTouch"}]}'::jsonb, '["strategy-v2","portfolio","csi300","cn-stock","enhanced-index","qp","v2"]'::jsonb, 'fund', 'orange', 101, TRUE, '{"source":"system_seed","version":10,"apiVersion":2}'::jsonb, NOW())
+$csehv$, '{"params":[{"name":"universe_top_n","type":"integer","default":50,"min":20,"max":300,"step":10,"labelKey":"strategyV2.params.universeTopN"},{"name":"active_limit","type":"number","default":0.025,"min":0.01,"max":0.05,"step":0.005,"labelKey":"strategyV2.params.activeLimit"},{"name":"risk_aversion","type":"number","default":1.0,"min":0.1,"max":5.0,"step":0.1,"labelKey":"strategyV2.params.riskAversion"},{"name":"turn_penalty","type":"number","default":0.01,"min":0.0,"max":0.1,"step":0.005,"labelKey":"strategyV2.params.turnPenalty"},{"name":"min_turnover","type":"number","default":0.02,"min":0.0,"max":0.1,"step":0.01,"labelKey":"strategyV2.params.minTurnover"},{"name":"mom_fast","type":"integer","default":60,"min":20,"max":120,"step":5,"labelKey":"strategyV2.params.momFast"},{"name":"mom_slow","type":"integer","default":120,"min":60,"max":250,"step":10,"labelKey":"strategyV2.params.momSlow"},{"name":"vol_period","type":"integer","default":20,"min":10,"max":60,"step":5,"labelKey":"strategyV2.params.volPeriod"},{"name":"min_history_bars","type":"integer","default":0,"min":0,"max":260,"step":1,"labelKey":"strategyV2.params.minHistoryBars"},{"name":"industry_limit","type":"number","default":0.05,"min":0.01,"max":0.15,"step":0.005,"labelKey":"strategyV2.params.industryLimit"},{"name":"size_limit","type":"number","default":0.3,"min":0.05,"max":1.0,"step":0.05,"labelKey":"strategyV2.params.sizeLimit"},{"name":"te_limit","type":"number","default":0.08,"min":0.01,"max":0.25,"step":0.01,"labelKey":"strategyV2.params.teLimit"},{"name":"w_momentum","type":"number","default":0.35,"min":0.0,"max":1.0,"step":0.05,"labelKey":"strategyV2.params.wMomentum"},{"name":"w_risk_liq","type":"number","default":0.2,"min":0.0,"max":1.0,"step":0.05,"labelKey":"strategyV2.params.wRiskLiq"},{"name":"w_value_quality","type":"number","default":0.2,"min":0.0,"max":1.0,"step":0.05,"labelKey":"strategyV2.params.wValueQuality"},{"name":"w_flow","type":"number","default":0.15,"min":0.0,"max":1.0,"step":0.05,"labelKey":"strategyV2.params.wFlow"},{"name":"w_consensus","type":"number","default":0.1,"min":0.0,"max":1.0,"step":0.05,"labelKey":"strategyV2.params.wConsensus"},{"name":"use_icir","type":"boolean","default":false,"labelKey":"strategyV2.params.useIcir"},{"name":"icir_window","type":"integer","default":20,"min":10,"max":60,"step":5,"labelKey":"strategyV2.params.icirWindow"},{"name":"regime_enabled","type":"boolean","default":true,"labelKey":"strategyV2.params.regimeEnabled"},{"name":"regime_ret_threshold","type":"number","default":-0.08,"min":-0.2,"max":0.0,"step":0.01,"labelKey":"strategyV2.params.regimeRetThreshold"},{"name":"partial_rebalance_enabled","type":"boolean","default":true,"labelKey":"strategyV2.params.partialRebalanceEnabled"},{"name":"partial_active_dev_trigger","type":"number","default":0.015,"min":0.005,"max":0.03,"step":0.005,"labelKey":"strategyV2.params.partialActiveDevTrigger"},{"name":"partial_te_trigger","type":"number","default":0.08,"min":0.01,"max":0.25,"step":0.01,"labelKey":"strategyV2.params.partialTeTrigger"},{"name":"partial_min_turnover","type":"number","default":0.005,"min":0.0,"max":0.05,"step":0.001,"labelKey":"strategyV2.params.partialMinTurnover"},{"name":"partial_max_touch","type":"integer","default":10,"min":3,"max":30,"step":1,"labelKey":"strategyV2.params.partialMaxTouch"}]}'::jsonb, '["strategy-v2","portfolio","csi300","cn-stock","enhanced-index","qp","v2"]'::jsonb, 'fund', 'orange', 101, TRUE, '{"source":"system_seed","version":10,"apiVersion":2}'::jsonb, NOW())
 ON CONFLICT (template_key) DO UPDATE SET
     asset_type = EXCLUDED.asset_type,
     title = EXCLUDED.title,

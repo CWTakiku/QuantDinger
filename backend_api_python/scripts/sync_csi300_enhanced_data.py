@@ -4,6 +4,11 @@
 Usage:
     python scripts/sync_csi300_enhanced_data.py --trade-date 20260731
     python scripts/sync_csi300_enhanced_data.py --trade-date 20260731 --skip-industry
+
+Celery Beat (optional day-end automation):
+    task: quantdinger.tasks.csi300_enhanced_daily_sync
+    schedule env: CSI300_ENHANCED_SYNC_INTERVAL_SEC (default 86400)
+    enable env: ENABLE_CSI300_ENHANCED_DAILY_SYNC (default true)
 """
 
 from __future__ import annotations
@@ -45,32 +50,14 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    from app.services.csi300_enhanced.tushare_sync import (
-        fetch_and_persist_consensus_daily,
-        fetch_and_persist_daily_basic,
-        fetch_and_persist_flow_daily,
-        fetch_and_persist_index_weights,
-        fetch_and_persist_industry_map,
+    from app.services.csi300_enhanced.tushare_sync import run_csi300_enhanced_daily_sync
+
+    counts = run_csi300_enhanced_daily_sync(
+        trade_date=args.trade_date,
+        skip_industry=args.skip_industry,
+        skip_flow=args.skip_flow,
+        skip_consensus=args.skip_consensus,
     )
-
-    counts = {
-        "trade_date": args.trade_date,
-        "index_weights": fetch_and_persist_index_weights(trade_date=args.trade_date),
-        "daily_basic": fetch_and_persist_daily_basic(trade_date=args.trade_date),
-    }
-    if not args.skip_industry:
-        counts["industry_map"] = fetch_and_persist_industry_map()
-    else:
-        counts["industry_map"] = 0
-    if not args.skip_flow:
-        counts["flow_daily"] = fetch_and_persist_flow_daily(trade_date=args.trade_date)
-    else:
-        counts["flow_daily"] = 0
-    if not args.skip_consensus:
-        counts["consensus_daily"] = fetch_and_persist_consensus_daily(trade_date=args.trade_date)
-    else:
-        counts["consensus_daily"] = 0
-
     print(json.dumps(counts, ensure_ascii=False, indent=2))
 
 

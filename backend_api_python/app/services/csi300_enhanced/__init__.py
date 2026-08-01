@@ -7,7 +7,11 @@ from .preprocess import (
     neutralize_industry_size,
     winsorize_mad,
 )
-from .bench import get_csi300_bench_weights
+from .bench import (
+    get_csi300_bench_weight_source,
+    get_csi300_bench_weights,
+    get_csi300_bench_weights_with_meta,
+)
 from .layered_alpha import (
     apply_icir_weights,
     apply_regime,
@@ -38,6 +42,8 @@ __all__ = [
     "normalize_index_weight_frame",
     "weights_to_platform_map",
     "get_csi300_bench_weights",
+    "get_csi300_bench_weights_with_meta",
+    "get_csi300_bench_weight_source",
     "build_enhanced_index_diagnostics",
     "summarize_enhanced_index_diagnostics",
 ]

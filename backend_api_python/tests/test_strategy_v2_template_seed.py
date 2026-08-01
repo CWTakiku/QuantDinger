@@ -37,6 +37,15 @@ def test_strategy_v2_seed_has_explicit_cta_and_portfolio_catalogs():
     assert by_key["strategy_v2_csi300_enhanced"]  # 1.0 still present
 
 
+def test_csi300_v2_param_schema_includes_icir_regime():
+    entry = next(item for item in _seed_entries() if item["key"] == "strategy_v2_csi300_enhanced_v2")
+    schema = json.loads(entry["schema"])
+    names = {param["name"] for param in schema.get("params") or []}
+    assert {"use_icir", "icir_window", "regime_enabled", "regime_ret_threshold"} <= names
+    for name in ("use_icir", "icir_window", "regime_enabled", "regime_ret_threshold"):
+        assert f'# @param {name} ' in entry["code"]
+
+
 def test_strategy_v2_seed_templates_compile_and_expose_parameters():
     for item in _seed_entries():
         schema = json.loads(item["schema"])

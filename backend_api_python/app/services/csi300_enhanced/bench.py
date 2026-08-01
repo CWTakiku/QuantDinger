@@ -12,6 +12,10 @@ from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+SOURCE_CSI300_PIT = "csi300_pit"
+SOURCE_UNIVERSE_MEMBER_WEIGHT = "universe_member_weight"
+SOURCE_EQUAL_WEIGHT = "equal_weight"
+
 
 def _as_date(value: date | str) -> date:
     if isinstance(value, date) and not isinstance(value, datetime):
@@ -54,11 +58,28 @@ def _load_universe_member_weights() -> dict[str, float]:
         return out
 
 
-def get_csi300_bench_weights(
+def _filter_and_normalize(
+    weights: dict[str, float],
+    symbols: list[str] | None,
+) -> dict[str, float]:
+    mapped = dict(weights)
+    if symbols:
+        mapped = {k: mapped.get(k, 0.0) for k in symbols}
+    total = sum(mapped.values())
+    if total > 0:
+        return {k: v / total for k, v in mapped.items()}
+    return {}
+
+
+def get_csi300_bench_weights_with_meta(
     as_of: date | str,
     *,
     symbols: list[str] | None = None,
-) -> dict[str, float]:
+) -> tuple[dict[str, float], str]:
+    """Return (weights, source).
+
+    ``source`` is one of ``csi300_pit``, ``universe_member_weight``, ``equal_weight``.
+    """
     as_of_d = _as_date(as_of)
     rows = _load_index_weights(as_of_d)
     if rows:
@@ -66,24 +87,39 @@ def get_csi300_bench_weights(
         mapped = weights_to_platform_map(frame.assign(trade_date=as_of_d.isoformat()))
         if mapped:
             if symbols:
-                mapped = {k: mapped.get(k, 0.0) for k in symbols}
-                total = sum(mapped.values())
-                if total > 0:
-                    return {k: v / total for k, v in mapped.items()}
+                normalized = _filter_and_normalize(mapped, symbols)
+                if normalized:
+                    return normalized, SOURCE_CSI300_PIT
             else:
-                return mapped
+                return mapped, SOURCE_CSI300_PIT
     uni = _load_universe_member_weights()
     if uni:
         logger.warning("csi300 bench fallback=universe_member_weight as_of=%s", as_of_d)
-        if symbols:
-            uni = {k: uni.get(k, 0.0) for k in symbols}
-        total = sum(uni.values())
-        if total > 0:
-            return {k: v / total for k, v in uni.items()}
+        normalized = _filter_and_normalize(uni, symbols)
+        if normalized:
+            return normalized, SOURCE_UNIVERSE_MEMBER_WEIGHT
     support = list(symbols or [])
     if not support:
         logger.warning("csi300 bench fallback=empty as_of=%s", as_of_d)
-        return {}
+        return {}, SOURCE_EQUAL_WEIGHT
     logger.warning("csi300 bench fallback=equal_weight n=%s as_of=%s", len(support), as_of_d)
     w = 1.0 / len(support)
-    return {s: w for s in support}
+    return {s: w for s in support}, SOURCE_EQUAL_WEIGHT
+
+
+def get_csi300_bench_weights(
+    as_of: date | str,
+    *,
+    symbols: list[str] | None = None,
+) -> dict[str, float]:
+    weights, _source = get_csi300_bench_weights_with_meta(as_of, symbols=symbols)
+    return weights
+
+
+def get_csi300_bench_weight_source(
+    as_of: date | str,
+    *,
+    symbols: list[str] | None = None,
+) -> str:
+    _weights, source = get_csi300_bench_weights_with_meta(as_of, symbols=symbols)
+    return source

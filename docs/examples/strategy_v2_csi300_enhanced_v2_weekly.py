@@ -322,17 +322,15 @@ def monitor_partial_rebalance(context, data):
     as_of = str(context.current_dt.date())
     n = len(symbols)
     equal = {sym: 1.0 / n for sym in symbols}
-    bench_source = "equal_fallback"
+    bench_source = "equal_weight"
     try:
-        w_bench = get_csi300_bench_weights(as_of, symbols=symbols)
-        if w_bench and abs(sum(w_bench.values()) - 1.0) < 1e-4:
-            bench_source = "csi300_pit"
-        else:
+        w_bench, bench_source = get_csi300_bench_weights_with_meta(as_of, symbols=symbols)
+        if not w_bench:
             w_bench = dict(equal)
-            bench_source = "equal_fallback"
+            bench_source = "equal_weight"
     except Exception:
         w_bench = dict(equal)
-        bench_source = "equal_fallback"
+        bench_source = "equal_weight"
 
     idio_var = dict(g.idio_var or {})
     if not idio_var:
@@ -517,7 +515,8 @@ def update_alpha(context, data):
     for sym, vol_val in pd.to_numeric(vol_s, errors="coerce").dropna().items():
         key = str(sym)
         if key in g.alpha:
-            idio[key] = max(float(vol_val) ** 2, 1e-6)
+            # Annualize daily realized vol so te_limit≈0.08 is on TE scale.
+            idio[key] = max((float(vol_val) * (252.0 ** 0.5)) ** 2, 1e-6)
     g.idio_var = idio
 
 
@@ -530,18 +529,16 @@ def rebalance(context, data):
     as_of = str(context.current_dt.date())
     n = len(symbols)
     equal = {sym: 1.0 / n for sym in symbols}
-    bench_source = "equal_fallback"
+    bench_source = "equal_weight"
     try:
-        w_bench = get_csi300_bench_weights(as_of, symbols=symbols)
-        if w_bench and abs(sum(w_bench.values()) - 1.0) < 1e-4:
-            bench_source = "csi300_pit"
-        else:
+        w_bench, bench_source = get_csi300_bench_weights_with_meta(as_of, symbols=symbols)
+        if not w_bench:
             w_bench = dict(equal)
-            bench_source = "equal_fallback"
+            bench_source = "equal_weight"
     except Exception as exc:
         log("bench weights fallback: %s" % exc)
         w_bench = dict(equal)
-        bench_source = "equal_fallback"
+        bench_source = "equal_weight"
 
     try:
         industry = get_ashare_industry_map(symbols, as_of)

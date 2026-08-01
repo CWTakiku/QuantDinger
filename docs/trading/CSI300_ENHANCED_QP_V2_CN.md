@@ -31,6 +31,17 @@ python scripts/sync_csi300_enhanced_data.py --trade-date 20260731
 - `qd_ashare_industry_map` — 行业
 - `qd_ashare_flow_daily` / `qd_ashare_consensus_daily` — 资金流 / 一致预期（权限不足则跳过）
 
+### Celery Beat（可选自动化）
+
+| 项 | 值 |
+|----|----|
+| Beat key | `csi300-enhanced-daily-sync` |
+| Task | `quantdinger.tasks.csi300_enhanced_daily_sync` |
+| 间隔 | `CSI300_ENHANCED_SYNC_INTERVAL_SEC`（默认 `86400`） |
+| 开关 | `ENABLE_CSI300_ENHANCED_DAILY_SYNC`（默认开启） |
+
+未配置 `TUSHARE_TOKEN` 时各面板返回 0，不阻断 worker / beat 启动。也可手动调用同一编排函数 `run_csi300_enhanced_daily_sync`。
+
 同步后刷新 `csi300` 宇宙成员，再在回测中心选择 2.0 模板。
 
 ---
@@ -62,7 +73,7 @@ python scripts/sync_csi300_enhanced_data.py --trade-date 20260731
 | `active_limit` | 0.025 | 单票主动上限 |
 | `industry_limit` | 0.05 | 行业主动上限 |
 | `size_limit` | 0.30 | 相对基准的 size exposure 带宽（z 空间） |
-| `te_limit` | 0.08 | ex-ante TE 上限（与 `active_risk_proxy` 同尺度） |
+| `te_limit` | 0.08 | ex-ante TE 上限（与 `active_risk_proxy` 同尺度；`idio_var` 为年化方差 `(vol·√252)²`） |
 | `min_turnover` | 0.02 | 周频最低换手，低于则跳过调仓 |
 
 ### 体制 / ICIR

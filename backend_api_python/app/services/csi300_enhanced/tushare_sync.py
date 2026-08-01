@@ -706,3 +706,26 @@ def persist_consensus_daily(frame: pd.DataFrame) -> int:
 
 def fetch_and_persist_consensus_daily(*, trade_date: str) -> int:
     return persist_consensus_daily(fetch_consensus_daily(trade_date=trade_date))
+
+
+def run_csi300_enhanced_daily_sync(
+    *,
+    trade_date: str | None = None,
+    skip_industry: bool = False,
+    skip_flow: bool = False,
+    skip_consensus: bool = False,
+) -> dict[str, Any]:
+    """Orchestrate day-end CSI300 enhanced panel sync.
+
+    Missing Tushare / API failures return 0 for the affected panel and do not raise.
+    """
+    day = str(trade_date or date.today().strftime("%Y%m%d"))
+    counts: dict[str, Any] = {
+        "trade_date": day,
+        "index_weights": fetch_and_persist_index_weights(trade_date=day),
+        "daily_basic": fetch_and_persist_daily_basic(trade_date=day),
+        "industry_map": 0 if skip_industry else fetch_and_persist_industry_map(),
+        "flow_daily": 0 if skip_flow else fetch_and_persist_flow_daily(trade_date=day),
+        "consensus_daily": 0 if skip_consensus else fetch_and_persist_consensus_daily(trade_date=day),
+    }
+    return counts

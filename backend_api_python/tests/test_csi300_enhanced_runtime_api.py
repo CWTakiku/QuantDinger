@@ -50,9 +50,10 @@ def handle_data(context, data):
     as_of = str(context.current_dt.date())
     symbols = ["CNStock:600519.SH", "CNStock:000858.SZ"]
     bench = get_csi300_bench_weights(as_of, symbols=symbols)
+    bench2, source = get_csi300_bench_weights_with_meta(as_of, symbols=symbols)
     industry = get_ashare_industry_map(symbols, as_of)
     size = get_ashare_size_log_mcap(symbols, as_of)
-    log(str(len(bench)) + str(len(industry)) + str(len(size)))
+    log(str(len(bench)) + str(len(bench2)) + str(source) + str(len(industry)) + str(len(size)))
 """
     compiled = compile_strategy_v2(code)
     assert callable(compiled.handler("handle_data"))
@@ -81,6 +82,7 @@ def handle_data(context, data):
     namespace = runner.program.namespace
     for name in (
         "get_csi300_bench_weights",
+        "get_csi300_bench_weights_with_meta",
         "get_ashare_industry_map",
         "get_ashare_size_log_mcap",
     ):
@@ -191,12 +193,14 @@ def test_example_csi300_enhanced_v2_weekly_compiles():
     assert callable(compiled.handler("update_alpha"))
     assert callable(compiled.handler("rebalance"))
     assert "get_csi300_bench_weights" in code
+    assert "get_csi300_bench_weights_with_meta" in code
     assert "get_ashare_industry_map" in code
     assert "get_ashare_size_log_mcap" in code
     assert "get_ashare_flow_panel" in code
     assert "get_ashare_consensus_panel" in code
     assert "industry_limit" in code
     assert "te_limit" in code
+    assert "(252.0 ** 0.5)" in code or "sqrt(252)" in code
     assert "use_icir" in code
     assert "regime_enabled" in code
     assert "apply_regime" in code

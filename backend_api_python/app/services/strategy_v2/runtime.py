@@ -40,7 +40,11 @@ from .data import MultiAssetDataPortal
 from .protection import ProtectionDecision, ProtectionEngine, ProtectionSpec, ProtectionState
 from app.markets.cn_stock.lot_rules import cn_stock_lot_spec, cn_stock_min_open
 from app.services.csi300_enhanced import optimize_enhanced_index, optimize_enhanced_index_partial
-from app.services.csi300_enhanced.bench import get_csi300_bench_weights
+from app.services.csi300_enhanced.bench import (
+    get_csi300_bench_weight_source,
+    get_csi300_bench_weights,
+    get_csi300_bench_weights_with_meta,
+)
 from app.services.csi300_enhanced.diagnostics import (
     build_enhanced_index_diagnostics,
     summarize_enhanced_index_diagnostics,
@@ -1562,6 +1566,8 @@ class StrategyV2BacktestRunner:
             "optimize_enhanced_index": optimize_enhanced_index,
             "optimize_enhanced_index_partial": optimize_enhanced_index_partial,
             "get_csi300_bench_weights": get_csi300_bench_weights,
+            "get_csi300_bench_weights_with_meta": get_csi300_bench_weights_with_meta,
+            "get_csi300_bench_weight_source": get_csi300_bench_weight_source,
             "get_ashare_industry_map": get_ashare_industry_map,
             "get_ashare_size_log_mcap": get_ashare_size_log_mcap,
             "get_ashare_flow_panel": get_ashare_flow_panel,
@@ -2210,6 +2216,8 @@ class StrategyV2LiveSession:
             "optimize_enhanced_index": optimize_enhanced_index,
             "optimize_enhanced_index_partial": optimize_enhanced_index_partial,
             "get_csi300_bench_weights": get_csi300_bench_weights,
+            "get_csi300_bench_weights_with_meta": get_csi300_bench_weights_with_meta,
+            "get_csi300_bench_weight_source": get_csi300_bench_weight_source,
             "get_ashare_industry_map": get_ashare_industry_map,
             "get_ashare_size_log_mcap": get_ashare_size_log_mcap,
             "get_ashare_flow_panel": get_ashare_flow_panel,

@@ -20,6 +20,8 @@ def test_celery_beat_owns_periodic_maintenance():
     assert schedule["ai-calibration-cycle"]["task"] == "quantdinger.tasks.ai_calibration"
     assert schedule["market-catalog-sync"]["task"] == "quantdinger.tasks.market_catalog_sync"
     assert schedule["market-catalog-sync"]["schedule"] == 86400
+    assert schedule["csi300-enhanced-daily-sync"]["task"] == "quantdinger.tasks.csi300_enhanced_daily_sync"
+    assert schedule["csi300-enhanced-daily-sync"]["schedule"] == 86400
 
 
 def test_fast_analysis_dispatches_to_celery(monkeypatch):
@@ -33,3 +35,17 @@ def test_fast_analysis_dispatches_to_celery(monkeypatch):
     fast_analysis_tasks.start_async_analysis_task(1, "Crypto", "BTC/USDT")
 
     assert calls == [((1, "Crypto", "BTC/USDT"), {})]
+
+
+def test_csi300_enhanced_daily_sync_task_returns_zero_without_tushare(monkeypatch):
+    from app.tasks.csi300_enhanced import run_csi300_enhanced_daily_sync_task
+
+    monkeypatch.setenv("ENABLE_CSI300_ENHANCED_DAILY_SYNC", "true")
+    monkeypatch.setattr(
+        "app.services.csi300_enhanced.tushare_sync.is_tushare_configured",
+        lambda: False,
+    )
+    result = run_csi300_enhanced_daily_sync_task.run(trade_date="20260731")
+    assert result["trade_date"] == "20260731"
+    assert result["index_weights"] == 0
+    assert result["daily_basic"] == 0
