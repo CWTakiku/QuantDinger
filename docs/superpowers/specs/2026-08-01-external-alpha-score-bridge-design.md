@@ -1,7 +1,7 @@
 # 外部 Alpha 分数桥接设计（QuantaAlpha / LightGBM → QuantDinger）
 
 > 日期：2026-08-01  
-> 状态：已确认（待实现计划）  
+> 状态：已确认；实现计划见 `docs/superpowers/plans/2026-08-01-external-alpha-score-bridge.md`  
 > 范围：方案一 + 信号形态 C（分数）  
 > 相关：CSI300 指增 2.0、Strategy API V2、离线研究栈（QuantaAlpha / Qlib / LightGBM）
 
