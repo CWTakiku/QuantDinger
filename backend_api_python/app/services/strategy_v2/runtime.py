@@ -40,6 +40,18 @@ from .data import MultiAssetDataPortal
 from .protection import ProtectionDecision, ProtectionEngine, ProtectionSpec, ProtectionState
 from app.markets.cn_stock.lot_rules import cn_stock_lot_spec, cn_stock_min_open
 from app.services.csi300_enhanced import optimize_enhanced_index
+from app.services.csi300_enhanced.bench import get_csi300_bench_weights
+from app.services.csi300_enhanced.layered_alpha import load_industry_and_size
+
+
+def get_ashare_industry_map(symbols: list[str], as_of: object) -> dict[str, str]:
+    industry, _ = load_industry_and_size(symbols, as_of)
+    return industry
+
+
+def get_ashare_size_log_mcap(symbols: list[str], as_of: object) -> pd.Series:
+    _, log_mcap = load_industry_and_size(symbols, as_of)
+    return log_mcap
 
 
 def _backtest_time_iso(value: Any) -> str:
@@ -1519,6 +1531,9 @@ class StrategyV2BacktestRunner:
             "get_fundamentals": ctx.get_fundamentals,
             "is_trade": ctx.is_trade,
             "optimize_enhanced_index": optimize_enhanced_index,
+            "get_csi300_bench_weights": get_csi300_bench_weights,
+            "get_ashare_industry_map": get_ashare_industry_map,
+            "get_ashare_size_log_mcap": get_ashare_size_log_mcap,
             "run_daily": lambda *args, **kwargs: None,
             "run_weekly": lambda *args, **kwargs: None,
             "run_monthly": lambda *args, **kwargs: None,
@@ -2151,6 +2166,9 @@ class StrategyV2LiveSession:
             "get_fundamentals": ctx.get_fundamentals,
             "is_trade": ctx.is_trade,
             "optimize_enhanced_index": optimize_enhanced_index,
+            "get_csi300_bench_weights": get_csi300_bench_weights,
+            "get_ashare_industry_map": get_ashare_industry_map,
+            "get_ashare_size_log_mcap": get_ashare_size_log_mcap,
             "run_daily": lambda *args, **kwargs: None,
             "run_weekly": lambda *args, **kwargs: None,
             "run_monthly": lambda *args, **kwargs: None,

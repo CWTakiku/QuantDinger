@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from app.services.strategy_v2.contract import compile_strategy_v2
+from app.services.strategy_v2.runtime import StrategyV2BacktestRunner
 
 
 def test_optimize_enhanced_index_is_allowed_api_name():
@@ -16,6 +17,54 @@ def handle_data(context, data):
 """
     compiled = compile_strategy_v2(code)
     assert callable(compiled.handler("handle_data"))
+
+
+def test_csi300_enhanced_readonly_helpers_are_allowed_api_names():
+    code = """
+def initialize(context):
+    context.set_universe(pool="csi300")
+    context.subscribe(frequency="1d")
+    context.set_benchmark("CNStock:000300.SH")
+
+def handle_data(context, data):
+    as_of = str(context.current_dt.date())
+    symbols = ["CNStock:600519.SH", "CNStock:000858.SZ"]
+    bench = get_csi300_bench_weights(as_of, symbols=symbols)
+    industry = get_ashare_industry_map(symbols, as_of)
+    size = get_ashare_size_log_mcap(symbols, as_of)
+    log(str(len(bench)) + str(len(industry)) + str(len(size)))
+"""
+    compiled = compile_strategy_v2(code)
+    assert callable(compiled.handler("handle_data"))
+
+
+def test_csi300_enhanced_readonly_helpers_are_bound_at_runtime():
+    code = """
+def initialize(context):
+    context.set_universe(pool="csi300")
+    context.subscribe(frequency="1d")
+
+def handle_data(context, data):
+    pass
+"""
+    runner = StrategyV2BacktestRunner(
+        code=code,
+        frames={"CNStock:600519.SH": __import__("pandas").DataFrame({
+            "open": [1.0],
+            "high": [1.0],
+            "low": [1.0],
+            "close": [1.0],
+            "volume": [1.0],
+        }, index=__import__("pandas").date_range("2026-07-31", periods=1))},
+        initial_capital=100000.0,
+    )
+    namespace = runner.program.namespace
+    for name in (
+        "get_csi300_bench_weights",
+        "get_ashare_industry_map",
+        "get_ashare_size_log_mcap",
+    ):
+        assert callable(namespace.get(name)), name
 
 
 def test_example_csi300_enhanced_weekly_compiles():
