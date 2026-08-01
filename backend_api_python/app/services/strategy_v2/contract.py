@@ -343,6 +343,7 @@ _RUNTIME_GLOBAL_CALL_NAMES = {
     "is_trade",
     "log",
     "optimize_enhanced_index",
+    "optimize_enhanced_index_partial",
     "order",
     "order_target",
     "order_target_percent",

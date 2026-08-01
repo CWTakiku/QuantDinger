@@ -1,6 +1,6 @@
 """CSI300 enhanced-index helpers: preprocess, optimize, sync stubs."""
 
-from .optimizer import optimize_enhanced_index
+from .optimizer import optimize_enhanced_index, optimize_enhanced_index_partial
 from .preprocess import (
     build_equal_weight_alpha,
     cross_section_zscore,
@@ -32,6 +32,7 @@ __all__ = [
     "load_flow_panel",
     "load_consensus_panel",
     "optimize_enhanced_index",
+    "optimize_enhanced_index_partial",
     "fetch_index_weights",
     "normalize_index_weight_frame",
     "weights_to_platform_map",

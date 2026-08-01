@@ -4,6 +4,26 @@ from app.services.strategy_v2.contract import compile_strategy_v2
 from app.services.strategy_v2.runtime import StrategyV2BacktestRunner
 
 
+def test_optimize_enhanced_index_partial_is_allowed_api_name():
+    code = """
+def initialize(context):
+    context.set_universe(pool="csi300")
+    context.subscribe(frequency="1d")
+    context.set_benchmark("CNStock:000300.SH")
+
+def handle_data(context, data):
+    result = optimize_enhanced_index_partial(
+        {"CNStock:600519.SH": 1.0},
+        {"CNStock:600519.SH": 1.0},
+        {"CNStock:600519.SH": 1.0},
+        ["CNStock:600519.SH"],
+    )
+    log(str(result.get("status")))
+"""
+    compiled = compile_strategy_v2(code)
+    assert callable(compiled.handler("handle_data"))
+
+
 def test_optimize_enhanced_index_is_allowed_api_name():
     code = """
 def initialize(context):
@@ -181,4 +201,7 @@ def test_example_csi300_enhanced_v2_weekly_compiles():
     assert "regime_enabled" in code
     assert "apply_regime" in code
     assert "optimize_enhanced_index" in code
+    assert "optimize_enhanced_index_partial" in code
+    assert "monitor_partial_rebalance" in code
+    assert "partial_rebalance_enabled" in code
     assert int(compiled.manifest.warmup_bars or 0) >= 140

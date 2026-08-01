@@ -27,6 +27,11 @@ neutralization uses injected maps; missing layers are re-weighted automatically.
 # @param icir_window int 20 ICIR rolling window (trading days) range=10:60:5
 # @param regime_enabled bool true Enable benchmark drawdown regime filter range=
 # @param regime_ret_threshold float -0.08 20D benchmark return trigger range=-0.20:0.0:0.01
+# @param partial_rebalance_enabled bool true Enable daily partial rebalance monitor range=
+# @param partial_active_dev_trigger float 0.015 Trigger partial when |active| exceeds this range=0.005:0.03:0.005
+# @param partial_te_trigger float 0.08 Trigger partial when ex-ante TE exceeds this range=0.01:0.25:0.01
+# @param partial_min_turnover float 0.005 Min turnover for partial rebalance range=0.0:0.05:0.001
+# @param partial_max_touch int 10 Max symbols in partial touch set range=3:30:1
 
 import numpy as np
 import pandas as pd
@@ -252,6 +257,40 @@ def _resolve_layer_weights(context, layer_scores, as_of):
     return weights
 
 
+def _active_risk_proxy(weights, w_bench, idio_var):
+    """Ex-ante TE proxy sqrt(a' D a) on shared support."""
+    symbols = set(weights or {}) | set(w_bench or {})
+    var = 0.0
+    for sym in symbols:
+        active = float((weights or {}).get(sym, 0.0)) - float((w_bench or {}).get(sym, 0.0))
+        d = float((idio_var or {}).get(sym, 1.0))
+        var += active * active * d
+    return float(var ** 0.5)
+
+
+def _select_touch_symbols(w_prev, w_bench, idio_var, params):
+    """Pick symbols to touch when deviation or TE breach thresholds."""
+    dev_trigger = float(params.get("partial_active_dev_trigger", 0.015))
+    te_trigger = float(params.get("partial_te_trigger", params.get("te_limit", 0.08)))
+    max_touch = int(params.get("partial_max_touch", 10))
+    active = {
+        sym: float(w_prev.get(sym, 0.0)) - float(w_bench.get(sym, 0.0))
+        for sym in set(w_prev or {}) | set(w_bench or {})
+    }
+    te = _active_risk_proxy(w_prev, w_bench, idio_var)
+    touch = {sym for sym, val in active.items() if abs(val) > dev_trigger}
+    if te > te_trigger:
+        ranked = sorted(active.items(), key=lambda item: abs(item[1]), reverse=True)
+        for sym, _ in ranked:
+            touch.add(sym)
+            if len(touch) >= max_touch:
+                break
+    if len(touch) > max_touch:
+        ranked = sorted(touch, key=lambda sym: abs(active.get(sym, 0.0)), reverse=True)
+        touch = set(ranked[:max_touch])
+    return list(touch), te, active
+
+
 def initialize(context):
     context.set_universe(pool="csi300")
     context.subscribe(frequency="1d", fields=["open", "high", "low", "close", "volume"])
@@ -262,8 +301,103 @@ def initialize(context):
     g.idio_var = {}
     g.last_weights = {}
     g.icir_panel = {}
-    run_daily(update_alpha, time="15:05")
+    run_daily(update_alpha_and_monitor, time="15:05")
     run_weekly(rebalance, weekday=1, time="09:35")
+
+
+def update_alpha_and_monitor(context, data):
+    update_alpha(context, data)
+    monitor_partial_rebalance(context, data)
+
+
+def monitor_partial_rebalance(context, data):
+    if not bool(context.params.get("partial_rebalance_enabled", True)):
+        return
+    alpha = dict(g.alpha or {})
+    w_prev = dict(g.last_weights or {})
+    if len(alpha) < 10 or len(w_prev) < 10:
+        return
+
+    symbols = list(alpha.keys())
+    as_of = str(context.current_dt.date())
+    n = len(symbols)
+    equal = {sym: 1.0 / n for sym in symbols}
+    try:
+        w_bench = get_csi300_bench_weights(as_of, symbols=symbols)
+        if not w_bench or abs(sum(w_bench.values()) - 1.0) >= 1e-4:
+            w_bench = dict(equal)
+    except Exception:
+        w_bench = dict(equal)
+
+    idio_var = dict(g.idio_var or {})
+    if not idio_var:
+        idio_var = {sym: 1.0 for sym in symbols}
+
+    dev_trigger = float(context.params.get("partial_active_dev_trigger", 0.015))
+    te_trigger = float(context.params.get("partial_te_trigger", context.params.get("te_limit", 0.08)))
+    touch, te, active = _select_touch_symbols(w_prev, w_bench, idio_var, context.params)
+    max_dev = max((abs(v) for v in active.values()), default=0.0)
+    if max_dev <= dev_trigger and te <= te_trigger:
+        return
+    if not touch:
+        return
+
+    try:
+        industry = get_ashare_industry_map(symbols, as_of)
+    except Exception:
+        industry = {}
+    try:
+        log_mcap = get_ashare_size_log_mcap(symbols, as_of)
+    except Exception:
+        log_mcap = pd.Series(dtype=float)
+    size_z = _zscore(log_mcap) if log_mcap is not None and len(log_mcap) > 0 else pd.Series(dtype=float)
+
+    result = optimize_enhanced_index_partial(
+        alpha,
+        w_bench,
+        w_prev,
+        touch,
+        active_limit=float(context.params.get("active_limit", 0.025)),
+        risk_aversion=float(context.params.get("risk_aversion", 1.0)),
+        turn_penalty=float(context.params.get("turn_penalty", 0.01)),
+        industry=industry or None,
+        industry_limit=float(context.params.get("industry_limit", 0.05)),
+        size_z=size_z if len(size_z) else None,
+        size_limit=float(context.params.get("size_limit", 0.30)),
+        te_limit=float(context.params.get("te_limit", 0.08)),
+        idio_var=idio_var,
+    )
+    weights = result.get("weights") or {}
+    if not weights:
+        return
+
+    min_turn = float(context.params.get("partial_min_turnover", 0.005))
+    if float(result.get("turnover") or 0.0) < min_turn:
+        log(
+            "skip partial: turnover=%.4f < %.4f touch=%d"
+            % (result.get("turnover") or 0.0, min_turn, len(touch))
+        )
+        return
+
+    current = get_positions()
+    for symbol in current:
+        if symbol not in weights:
+            order_target_percent(symbol, 0.0, reason="ei_partial_exit")
+    for symbol, weight in weights.items():
+        order_target_percent(symbol, float(weight), reason="ei_partial_target")
+
+    g.last_weights = {str(k): float(v) for k, v in weights.items() if float(v) > 1e-8}
+    log(
+        "ei2 partial names=%d touch=%d turnover=%.4f te=%.4f max_dev=%.4f status=%s"
+        % (
+            len(g.last_weights),
+            len(touch),
+            result.get("turnover") or 0.0,
+            result.get("active_risk_proxy") or 0.0,
+            max_dev,
+            result.get("status") or "",
+        )
+    )
 
 
 def update_alpha(context, data):

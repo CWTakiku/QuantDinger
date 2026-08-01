@@ -39,7 +39,7 @@ from .contract import CompiledStrategyV2, StrategyV2ContractError, compile_strat
 from .data import MultiAssetDataPortal
 from .protection import ProtectionDecision, ProtectionEngine, ProtectionSpec, ProtectionState
 from app.markets.cn_stock.lot_rules import cn_stock_lot_spec, cn_stock_min_open
-from app.services.csi300_enhanced import optimize_enhanced_index
+from app.services.csi300_enhanced import optimize_enhanced_index, optimize_enhanced_index_partial
 from app.services.csi300_enhanced.bench import get_csi300_bench_weights
 from app.services.csi300_enhanced.layered_alpha import (
     apply_icir_weights,
@@ -1547,6 +1547,7 @@ class StrategyV2BacktestRunner:
             "apply_icir_weights": apply_icir_weights,
             "apply_regime": apply_regime,
             "optimize_enhanced_index": optimize_enhanced_index,
+            "optimize_enhanced_index_partial": optimize_enhanced_index_partial,
             "get_csi300_bench_weights": get_csi300_bench_weights,
             "get_ashare_industry_map": get_ashare_industry_map,
             "get_ashare_size_log_mcap": get_ashare_size_log_mcap,
@@ -2186,6 +2187,7 @@ class StrategyV2LiveSession:
             "apply_icir_weights": apply_icir_weights,
             "apply_regime": apply_regime,
             "optimize_enhanced_index": optimize_enhanced_index,
+            "optimize_enhanced_index_partial": optimize_enhanced_index_partial,
             "get_csi300_bench_weights": get_csi300_bench_weights,
             "get_ashare_industry_map": get_ashare_industry_map,
             "get_ashare_size_log_mcap": get_ashare_size_log_mcap,

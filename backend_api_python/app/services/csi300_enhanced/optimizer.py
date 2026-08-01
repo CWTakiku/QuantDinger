@@ -34,6 +34,81 @@ def optimize_enhanced_index(
     ``te_limit`` uses the same scale as ``active_risk_proxy`` (√(aᵀ D a)); pass
     annualized idio variance in ``idio_var`` for annualized TE interpretation.
     """
+    return _optimize_enhanced_index_impl(
+        alpha,
+        w_bench,
+        w_prev=w_prev,
+        touch_symbols=None,
+        active_limit=active_limit,
+        industry=industry,
+        industry_limit=industry_limit,
+        idio_var=idio_var,
+        risk_aversion=risk_aversion,
+        turn_penalty=turn_penalty,
+        max_iter=max_iter,
+        size_z=size_z,
+        size_limit=size_limit,
+        te_limit=te_limit,
+    )
+
+
+def optimize_enhanced_index_partial(
+    alpha: Mapping[str, float] | pd.Series,
+    w_bench: Mapping[str, float] | pd.Series,
+    w_prev: Mapping[str, float] | pd.Series,
+    touch_symbols: Mapping[str, float] | pd.Series | list | set | None,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """
+    Partial rebalance: freeze weights outside ``touch_symbols`` at ``w_prev`` (±1e-6),
+    optimize the touch subset under the same constraints as ``optimize_enhanced_index``.
+    """
+    touch = {str(s) for s in (touch_symbols or [])}
+    prev = _series(w_prev)
+    if prev.empty:
+        return {"weights": {}, "status": "empty", "turnover": 0.0, "active_risk_proxy": 0.0}
+    if not touch:
+        wb = _series(w_bench).reindex(prev.index).fillna(0.0)
+        if float(wb.sum()) > 0:
+            wb = wb / float(wb.sum())
+        d = _series(kwargs.get("idio_var")).reindex(prev.index).fillna(1.0).clip(lower=1e-6)
+        prev_v = prev.to_numpy(dtype=float)
+        wb_v = wb.reindex(prev.index).fillna(0.0).to_numpy(dtype=float)
+        active_v = prev_v - wb_v
+        proxy = float(np.sqrt(max(0.0, float(np.dot(active_v * active_v, d.to_numpy(dtype=float))))))
+        weights = {str(k): float(v) for k, v in prev.items()}
+        return {
+            "weights": weights,
+            "status": "no_touch",
+            "turnover": 0.0,
+            "active_risk_proxy": proxy,
+        }
+    return _optimize_enhanced_index_impl(
+        alpha,
+        w_bench,
+        w_prev=w_prev,
+        touch_symbols=touch,
+        **kwargs,
+    )
+
+
+def _optimize_enhanced_index_impl(
+    alpha: Mapping[str, float] | pd.Series,
+    w_bench: Mapping[str, float] | pd.Series,
+    *,
+    w_prev: Mapping[str, float] | pd.Series | None = None,
+    touch_symbols: set[str] | None = None,
+    active_limit: float = 0.025,
+    industry: Mapping[str, str] | pd.Series | None = None,
+    industry_limit: float = 0.05,
+    idio_var: Mapping[str, float] | pd.Series | None = None,
+    risk_aversion: float = 1.0,
+    turn_penalty: float = 0.01,
+    max_iter: int = 80,
+    size_z: Mapping[str, float] | pd.Series | None = None,
+    size_limit: float | None = None,
+    te_limit: float | None = None,
+) -> dict[str, Any]:
     a = _series(alpha)
     if a.empty:
         return {"weights": {}, "status": "empty", "turnover": 0.0, "active_risk_proxy": 0.0}
@@ -50,10 +125,8 @@ def optimize_enhanced_index(
     d = d.clip(lower=1e-6)
 
     lam = max(float(risk_aversion), 1e-8)
-    # Active portfolio requires zero-sum alpha in practice; demean for stability.
     a = a - float(a.mean())
     active = a / (2.0 * lam * d)
-    # Soft turnover blend: shrink active toward (prev - wb)
     gam = max(float(turn_penalty), 0.0)
     if gam > 0:
         shrink = 1.0 / (1.0 + gam)
@@ -61,6 +134,13 @@ def optimize_enhanced_index(
 
     lo = (wb - float(active_limit)).clip(lower=0.0)
     hi = (wb + float(active_limit)).clip(upper=1.0)
+    if touch_symbols is not None:
+        prev_v_series = prev.reindex(support).fillna(0.0)
+        for sym in support:
+            if str(sym) not in touch_symbols:
+                lo.loc[sym] = float(prev_v_series.loc[sym])
+                hi.loc[sym] = float(prev_v_series.loc[sym])
+
     w = (wb + active).clip(lower=lo, upper=hi).to_numpy(dtype=float)
     lo_v = lo.to_numpy(dtype=float)
     hi_v = hi.to_numpy(dtype=float)
@@ -74,7 +154,7 @@ def optimize_enhanced_index(
 
     w = _project_all(w, lo_v, hi_v, wb_v, ind_codes, float(industry_limit), int(max_iter))
 
-    status = "optimal"
+    status = "optimal" if touch_symbols is None else "partial"
     sz_v = None
     if size_z is not None:
         sz_v = _series(size_z).reindex(support).fillna(0.0).to_numpy(dtype=float)
@@ -84,12 +164,25 @@ def optimize_enhanced_index(
         if te_degraded:
             status = "degraded_te"
             w = _project_all(w, lo_v, hi_v, wb_v, ind_codes, float(industry_limit), int(max_iter))
+            if touch_symbols is not None:
+                w = _enforce_frozen_weights(
+                    w, support, prev, touch_symbols, lo_v, hi_v, wb_v, ind_codes, float(industry_limit), int(max_iter)
+                )
 
     if sz_v is not None and size_limit is not None:
         w, size_degraded = _project_size(w, wb_v, sz_v, float(size_limit))
         if size_degraded:
             status = "degraded_size"
             w = _project_all(w, lo_v, hi_v, wb_v, ind_codes, float(industry_limit), int(max_iter))
+            if touch_symbols is not None:
+                w = _enforce_frozen_weights(
+                    w, support, prev, touch_symbols, lo_v, hi_v, wb_v, ind_codes, float(industry_limit), int(max_iter)
+                )
+
+    if touch_symbols is not None:
+        w = _enforce_frozen_weights(
+            w, support, prev, touch_symbols, lo_v, hi_v, wb_v, ind_codes, float(industry_limit), int(max_iter)
+        )
 
     weights = {str(sym): float(val) for sym, val in zip(support, w)}
     prev_v = prev.to_numpy(dtype=float)
@@ -102,6 +195,27 @@ def optimize_enhanced_index(
         "turnover": turnover,
         "active_risk_proxy": active_risk_proxy,
     }
+
+
+def _enforce_frozen_weights(
+    w: np.ndarray,
+    support: pd.Index,
+    prev: pd.Series,
+    touch_symbols: set[str],
+    lo: np.ndarray,
+    hi: np.ndarray,
+    wb: np.ndarray,
+    ind_codes: np.ndarray | None,
+    industry_limit: float,
+    max_iter: int,
+) -> np.ndarray:
+    """Re-pin non-touch weights to w_prev, then re-project the full simplex."""
+    out = w.copy()
+    prev_v = prev.reindex(support).fillna(0.0).to_numpy(dtype=float)
+    for i, sym in enumerate(support):
+        if str(sym) not in touch_symbols:
+            out[i] = prev_v[i]
+    return _project_all(out, lo, hi, wb, ind_codes, industry_limit, max_iter)
 
 
 def _project_all(
