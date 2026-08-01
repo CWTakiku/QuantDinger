@@ -23,11 +23,15 @@
 
 ```bash
 export MAMBA_ROOT_PREFIX=$HOME/miniforge3
+export PATH="$HOME/quant/rdagent-workspace/bin:$PATH"   # conda→micromamba shim
 cd ~/quant/rdagent-workspace
-micromamba run -n rdagent dotenv run -- rdagent fin_quant
+set -a; source .env; set +a
+micromamba run -n rdagent rdagent fin_factor --step-n 1   # 或 fin_quant
 
 # 导出 → 导入 → 回测模板 strategy_v2_external_alpha_score
 # source/version 与导入一致
 ```
 
-依赖钉扎：工作区 `requirements-pin.txt`（`rdagent==0.8.0` + `pydantic-ai==1.107.1`）。
+Colima 已配 Docker Hub 镜像加速（daoCloud / 1ms / xuanyuan）。挖因子默认 `MODEL_CoSTEER_env_type=conda`（环境 `rdagent4qlib`），避免拉 CUDA 镜像。
+
+依赖钉扎：工作区 `requirements-pin.txt`（`rdagent==0.8.0` + `pydantic-ai==1.107.1` + `pyqlib`）。
