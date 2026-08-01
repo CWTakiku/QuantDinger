@@ -20,6 +20,9 @@ def optimize_enhanced_index(
     risk_aversion: float = 1.0,
     turn_penalty: float = 0.01,
     max_iter: int = 80,
+    size_z: Mapping[str, float] | pd.Series | None = None,
+    size_limit: float | None = None,
+    te_limit: float | None = None,
 ) -> dict[str, Any]:
     """
     Solve approximate mean-variance active portfolio with box + simplex (+ industry).
@@ -27,6 +30,9 @@ def optimize_enhanced_index(
     Unconstrained active weight for diagonal D:
         active_i = alpha_i / (2 * λ * d_i)
     then blend toward previous weights by turn_penalty and project.
+
+    ``te_limit`` uses the same scale as ``active_risk_proxy`` (√(aᵀ D a)); pass
+    annualized idio variance in ``idio_var`` for annualized TE interpretation.
     """
     a = _series(alpha)
     if a.empty:
@@ -59,36 +65,124 @@ def optimize_enhanced_index(
     lo_v = lo.to_numpy(dtype=float)
     hi_v = hi.to_numpy(dtype=float)
     wb_v = wb.to_numpy(dtype=float)
+    d_v = d.to_numpy(dtype=float)
 
     ind_codes = None
     if industry is not None:
         ind_series = pd.Series({str(k): str(v) for k, v in dict(industry).items()})
         ind_codes = ind_series.reindex(support).fillna("UNKNOWN").to_numpy()
 
-    for _ in range(int(max_iter)):
-        w = _project_simplex_box(w, lo_v, hi_v)
+    w = _project_all(w, lo_v, hi_v, wb_v, ind_codes, float(industry_limit), int(max_iter))
+
+    status = "optimal"
+    sz_v = None
+    if size_z is not None:
+        sz_v = _series(size_z).reindex(support).fillna(0.0).to_numpy(dtype=float)
+
+    if te_limit is not None:
+        w, te_degraded = _apply_te_limit(w, wb_v, d_v, float(te_limit))
+        if te_degraded:
+            status = "degraded_te"
+            w = _project_all(w, lo_v, hi_v, wb_v, ind_codes, float(industry_limit), int(max_iter))
+
+    if sz_v is not None and size_limit is not None:
+        w, size_degraded = _project_size(w, wb_v, sz_v, float(size_limit))
+        if size_degraded:
+            status = "degraded_size"
+            w = _project_all(w, lo_v, hi_v, wb_v, ind_codes, float(industry_limit), int(max_iter))
+
+    weights = {str(sym): float(val) for sym, val in zip(support, w)}
+    prev_v = prev.to_numpy(dtype=float)
+    turnover = 0.5 * float(np.abs(w - prev_v).sum())
+    active_v = w - wb_v
+    active_risk_proxy = float(np.sqrt(max(0.0, float(np.dot(active_v * active_v, d_v)))))
+    return {
+        "weights": weights,
+        "status": status,
+        "turnover": turnover,
+        "active_risk_proxy": active_risk_proxy,
+    }
+
+
+def _project_all(
+    w: np.ndarray,
+    lo: np.ndarray,
+    hi: np.ndarray,
+    wb: np.ndarray,
+    ind_codes: np.ndarray | None,
+    industry_limit: float,
+    max_iter: int,
+) -> np.ndarray:
+    for _ in range(max_iter):
+        w = _project_simplex_box(w, lo, hi)
         if ind_codes is not None:
-            w2 = _project_industry(w, wb_v, ind_codes, float(industry_limit))
+            w2 = _project_industry(w, wb, ind_codes, industry_limit)
             if float(np.linalg.norm(w2 - w, ord=1)) < 1e-10:
                 w = w2
                 break
             w = w2
         else:
             break
+    return _project_simplex_box(w, lo, hi)
 
-    w = _project_simplex_box(w, lo_v, hi_v)
-    weights = {str(sym): float(val) for sym, val in zip(support, w)}
-    prev_v = prev.to_numpy(dtype=float)
-    turnover = 0.5 * float(np.abs(w - prev_v).sum())
-    active_v = w - wb_v
-    d_v = d.to_numpy(dtype=float)
-    active_risk_proxy = float(np.sqrt(max(0.0, float(np.dot(active_v * active_v, d_v)))))
-    return {
-        "weights": weights,
-        "status": "optimal",
-        "turnover": turnover,
-        "active_risk_proxy": active_risk_proxy,
-    }
+
+def _active_risk_proxy(active: np.ndarray, d: np.ndarray) -> float:
+    var = float(np.dot(active * active, d))
+    return float(np.sqrt(max(0.0, var)))
+
+
+def _apply_te_limit(
+    w: np.ndarray,
+    wb: np.ndarray,
+    d: np.ndarray,
+    te_limit: float,
+) -> tuple[np.ndarray, bool]:
+    active = w - wb
+    proxy = _active_risk_proxy(active, d)
+    if proxy <= te_limit + 1e-12:
+        return w, False
+    scale = te_limit / proxy if proxy > 1e-12 else 0.0
+    return wb + scale * active, True
+
+
+def _project_size(
+    w: np.ndarray,
+    wb: np.ndarray,
+    size_z: np.ndarray,
+    limit: float,
+) -> tuple[np.ndarray, bool]:
+    out = w.copy()
+    exposure = float(np.dot(out - wb, size_z))
+    if abs(exposure) <= limit + 1e-12:
+        return out, False
+
+    degraded = True
+    if exposure > limit:
+        for side in ("high", "low"):
+            mask = size_z > 0 if side == "high" else size_z < 0
+            if not np.any(mask):
+                continue
+            group_exp = float(np.dot(out[mask] - wb[mask], size_z[mask]))
+            if group_exp <= 1e-12:
+                continue
+            excess = exposure - limit
+            scale = max(0.0, 1.0 - excess / group_exp)
+            out[mask] = wb[mask] + scale * (out[mask] - wb[mask])
+            break
+    else:
+        for side in ("low", "high"):
+            mask = size_z < 0 if side == "low" else size_z > 0
+            if not np.any(mask):
+                continue
+            group_exp = float(np.dot(out[mask] - wb[mask], size_z[mask]))
+            if group_exp >= -1e-12:
+                continue
+            deficit = exposure + limit
+            scale = max(0.0, 1.0 + deficit / group_exp)
+            out[mask] = wb[mask] + scale * (out[mask] - wb[mask])
+            break
+
+    return out, degraded
 
 
 def _series(values: Mapping[str, float] | pd.Series | None) -> pd.Series:
