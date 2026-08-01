@@ -10,9 +10,6 @@ import pandas as pd
 
 from app.markets.cn_stock.symbols import canonicalize_cnstock_key
 from app.utils.db import get_db_connection
-from app.utils.logger import get_logger
-
-logger = get_logger(__name__)
 
 DEFAULT_SOURCE = "external"
 DEFAULT_VERSION = "default"
@@ -92,6 +89,12 @@ def persist_external_alpha_scores(rows: list[dict[str, Any]]) -> dict[str, Any]:
             if not symbol or score != score or score == float("inf") or score == float("-inf"):
                 skipped += 1
                 errors.append(f"row{idx}: invalid symbol/score")
+                continue
+            if weight_f is not None and (
+                weight_f != weight_f or weight_f == float("inf") or weight_f == float("-inf")
+            ):
+                skipped += 1
+                errors.append(f"row{idx}: invalid weight")
                 continue
             source = str(raw.get("source") or DEFAULT_SOURCE).strip() or DEFAULT_SOURCE
             version = str(raw.get("version") or DEFAULT_VERSION).strip() or DEFAULT_VERSION
