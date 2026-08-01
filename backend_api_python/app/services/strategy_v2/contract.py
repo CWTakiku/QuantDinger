@@ -342,6 +342,8 @@ _RUNTIME_GLOBAL_CALL_NAMES = {
     "indicator",
     "is_trade",
     "log",
+    "build_enhanced_index_diagnostics",
+    "record_enhanced_index_diagnostics",
     "optimize_enhanced_index",
     "optimize_enhanced_index_partial",
     "order",

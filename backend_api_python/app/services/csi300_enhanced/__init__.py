@@ -18,6 +18,7 @@ from .layered_alpha import (
     load_industry_and_size,
 )
 from .tushare_sync import fetch_index_weights, normalize_index_weight_frame, weights_to_platform_map
+from .diagnostics import build_enhanced_index_diagnostics, summarize_enhanced_index_diagnostics
 
 __all__ = [
     "winsorize_mad",
@@ -37,4 +38,6 @@ __all__ = [
     "normalize_index_weight_frame",
     "weights_to_platform_map",
     "get_csi300_bench_weights",
+    "build_enhanced_index_diagnostics",
+    "summarize_enhanced_index_diagnostics",
 ]

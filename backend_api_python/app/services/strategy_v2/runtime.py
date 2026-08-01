@@ -41,6 +41,10 @@ from .protection import ProtectionDecision, ProtectionEngine, ProtectionSpec, Pr
 from app.markets.cn_stock.lot_rules import cn_stock_lot_spec, cn_stock_min_open
 from app.services.csi300_enhanced import optimize_enhanced_index, optimize_enhanced_index_partial
 from app.services.csi300_enhanced.bench import get_csi300_bench_weights
+from app.services.csi300_enhanced.diagnostics import (
+    build_enhanced_index_diagnostics,
+    summarize_enhanced_index_diagnostics,
+)
 from app.services.csi300_enhanced.layered_alpha import (
     apply_icir_weights,
     apply_regime,
@@ -218,6 +222,7 @@ class StrategyRuntimeContext:
         self._order_statuses: dict[str, dict[str, Any]] = {}
         self._cancelled_order_ids: set[str] = set()
         self._last_exit_reasons: dict[str, str] = {}
+        self._enhanced_index_records: list[dict[str, Any]] = []
         self.logger = StrategyRuntimeLogger(self.log)
 
     def set_default_protection(self, **values: Any) -> None:
@@ -486,6 +491,14 @@ class StrategyRuntimeContext:
 
     def log(self, message: object) -> None:
         self._logs.append(str(message))
+
+    def record_enhanced_index_diagnostics(self, payload: Mapping[str, Any]) -> None:
+        if not payload:
+            return
+        self._enhanced_index_records.append(dict(payload))
+
+    def enhanced_index_diagnostics_snapshot(self) -> dict[str, Any]:
+        return summarize_enhanced_index_diagnostics(self._enhanced_index_records)
 
     def flush_orders(self) -> list[OrderIntent]:
         orders = list(self._orders)
@@ -1553,6 +1566,10 @@ class StrategyV2BacktestRunner:
             "get_ashare_size_log_mcap": get_ashare_size_log_mcap,
             "get_ashare_flow_panel": get_ashare_flow_panel,
             "get_ashare_consensus_panel": get_ashare_consensus_panel,
+            "build_enhanced_index_diagnostics": build_enhanced_index_diagnostics,
+            "record_enhanced_index_diagnostics": lambda **kwargs: ctx.record_enhanced_index_diagnostics(
+                build_enhanced_index_diagnostics(**kwargs)
+            ),
             "run_daily": lambda *args, **kwargs: None,
             "run_weekly": lambda *args, **kwargs: None,
             "run_monthly": lambda *args, **kwargs: None,
@@ -1684,7 +1701,7 @@ class StrategyV2BacktestRunner:
         profit_factor = gross_profit / gross_loss if gross_loss > 0 else (gross_profit if gross_profit > 0 else 0.0)
         average_profit = sum(profits) / len(profits) if profits else 0.0
         attribution = self._attribution(initial)
-        return {
+        result = {
             "initialCapital": initial,
             "totalReturn": total_return,
             "total_return": total_return,
@@ -1745,6 +1762,10 @@ class StrategyV2BacktestRunner:
             "engine": {"version": self.VERSION},
             "audit": self._reconcile(),
         }
+        enhanced = self.context.enhanced_index_diagnostics_snapshot()
+        if enhanced:
+            result["diagnostics"] = {"enhancedIndex": enhanced}
+        return result
 
     def _attribution(self, initial: float) -> dict[str, Any]:
         commission_by_symbol: dict[str, float] = {}
@@ -2193,6 +2214,10 @@ class StrategyV2LiveSession:
             "get_ashare_size_log_mcap": get_ashare_size_log_mcap,
             "get_ashare_flow_panel": get_ashare_flow_panel,
             "get_ashare_consensus_panel": get_ashare_consensus_panel,
+            "build_enhanced_index_diagnostics": build_enhanced_index_diagnostics,
+            "record_enhanced_index_diagnostics": lambda **kwargs: ctx.record_enhanced_index_diagnostics(
+                build_enhanced_index_diagnostics(**kwargs)
+            ),
             "run_daily": lambda *args, **kwargs: None,
             "run_weekly": lambda *args, **kwargs: None,
             "run_monthly": lambda *args, **kwargs: None,

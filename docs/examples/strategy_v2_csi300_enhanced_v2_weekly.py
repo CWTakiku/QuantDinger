@@ -322,12 +322,17 @@ def monitor_partial_rebalance(context, data):
     as_of = str(context.current_dt.date())
     n = len(symbols)
     equal = {sym: 1.0 / n for sym in symbols}
+    bench_source = "equal_fallback"
     try:
         w_bench = get_csi300_bench_weights(as_of, symbols=symbols)
-        if not w_bench or abs(sum(w_bench.values()) - 1.0) >= 1e-4:
+        if w_bench and abs(sum(w_bench.values()) - 1.0) < 1e-4:
+            bench_source = "csi300_pit"
+        else:
             w_bench = dict(equal)
+            bench_source = "equal_fallback"
     except Exception:
         w_bench = dict(equal)
+        bench_source = "equal_fallback"
 
     idio_var = dict(g.idio_var or {})
     if not idio_var:
@@ -387,6 +392,16 @@ def monitor_partial_rebalance(context, data):
         order_target_percent(symbol, float(weight), reason="ei_partial_target")
 
     g.last_weights = {str(k): float(v) for k, v in weights.items() if float(v) > 1e-8}
+    record_enhanced_index_diagnostics(
+        as_of=as_of,
+        weights=g.last_weights,
+        w_bench=w_bench,
+        optimize_result=result,
+        bench_source=bench_source,
+        industry=industry,
+        size_z=size_z if len(size_z) else None,
+        kind="partial",
+    )
     log(
         "ei2 partial names=%d touch=%d turnover=%.4f te=%.4f max_dev=%.4f status=%s"
         % (
@@ -581,6 +596,16 @@ def rebalance(context, data):
         order_target_percent(symbol, float(weight), reason="ei_target")
 
     g.last_weights = {str(k): float(v) for k, v in weights.items() if float(v) > 1e-8}
+    record_enhanced_index_diagnostics(
+        as_of=as_of,
+        weights=g.last_weights,
+        w_bench=w_bench,
+        optimize_result=result,
+        bench_source=bench_source,
+        industry=industry,
+        size_z=size_z if len(size_z) else None,
+        kind="weekly",
+    )
     log(
         "ei2 rebalance names=%d turnover=%.4f te=%.4f status=%s bench_source=%s industry=%d size=%d"
         % (

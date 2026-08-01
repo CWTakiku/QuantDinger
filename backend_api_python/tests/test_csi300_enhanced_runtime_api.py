@@ -203,5 +203,6 @@ def test_example_csi300_enhanced_v2_weekly_compiles():
     assert "optimize_enhanced_index" in code
     assert "optimize_enhanced_index_partial" in code
     assert "monitor_partial_rebalance" in code
+    assert "record_enhanced_index_diagnostics" in code
     assert "partial_rebalance_enabled" in code
     assert int(compiled.manifest.warmup_bars or 0) >= 140
