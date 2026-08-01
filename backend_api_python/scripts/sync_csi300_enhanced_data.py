@@ -33,10 +33,22 @@ def main() -> None:
         action="store_true",
         help="Skip stock_basic industry map sync",
     )
+    parser.add_argument(
+        "--skip-flow",
+        action="store_true",
+        help="Skip northbound/margin flow daily sync",
+    )
+    parser.add_argument(
+        "--skip-consensus",
+        action="store_true",
+        help="Skip analyst consensus daily sync",
+    )
     args = parser.parse_args()
 
     from app.services.csi300_enhanced.tushare_sync import (
+        fetch_and_persist_consensus_daily,
         fetch_and_persist_daily_basic,
+        fetch_and_persist_flow_daily,
         fetch_and_persist_index_weights,
         fetch_and_persist_industry_map,
     )
@@ -50,6 +62,14 @@ def main() -> None:
         counts["industry_map"] = fetch_and_persist_industry_map()
     else:
         counts["industry_map"] = 0
+    if not args.skip_flow:
+        counts["flow_daily"] = fetch_and_persist_flow_daily(trade_date=args.trade_date)
+    else:
+        counts["flow_daily"] = 0
+    if not args.skip_consensus:
+        counts["consensus_daily"] = fetch_and_persist_consensus_daily(trade_date=args.trade_date)
+    else:
+        counts["consensus_daily"] = 0
 
     print(json.dumps(counts, ensure_ascii=False, indent=2))
 

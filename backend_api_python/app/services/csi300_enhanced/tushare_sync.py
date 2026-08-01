@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from datetime import date
+import json
+from datetime import date, datetime, timedelta
 from typing import Any, Mapping
 
 import pandas as pd
@@ -287,3 +288,421 @@ def persist_industry_map(frame: pd.DataFrame, *, as_of: date | None = None) -> i
 
 def fetch_and_persist_industry_map() -> int:
     return persist_industry_map(fetch_industry_map())
+
+
+_FLOW_COLUMNS = (
+    "trade_date",
+    "ts_code",
+    "north_net_buy",
+    "margin_balance",
+    "metadata_json",
+)
+
+_CONSENSUS_COLUMNS = (
+    "trade_date",
+    "ts_code",
+    "eps_fy1",
+    "pe_fy1",
+    "rating_mean",
+    "metadata_json",
+)
+
+_RATING_MAP: dict[str, float] = {
+    "买入": 5.0,
+    "增持": 4.0,
+    "中性": 3.0,
+    "减持": 2.0,
+    "卖出": 1.0,
+    "强烈推荐": 5.0,
+    "推荐": 4.0,
+    "观望": 3.0,
+}
+
+
+def _safe_tushare_api(pro: Any, api_name: str, **kwargs: Any) -> pd.DataFrame:
+    """Call a Tushare pro API; return empty DataFrame on any failure."""
+    try:
+        fn = getattr(pro, api_name)
+        frame = fn(**kwargs)
+    except Exception as exc:
+        logger.warning("Tushare %s failed kwargs=%s: %s", api_name, kwargs, exc)
+        return pd.DataFrame()
+    if frame is None or getattr(frame, "empty", True):
+        return pd.DataFrame()
+    return frame.copy()
+
+
+def _shift_trade_date(trade_date: str, days: int) -> str:
+    dt = datetime.strptime(str(trade_date), "%Y%m%d")
+    return (dt + timedelta(days=days)).strftime("%Y%m%d")
+
+
+def _rating_to_numeric(value: Any) -> float | None:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    mapped = _RATING_MAP.get(text)
+    if mapped is not None:
+        return mapped
+    try:
+        num = float(text)
+    except (TypeError, ValueError):
+        return None
+    return num if num > 0 else None
+
+
+def _normalize_hk_hold_frame(frame: Any, *, trade_date: str) -> pd.DataFrame:
+    if frame is None or getattr(frame, "empty", True):
+        return pd.DataFrame(columns=["trade_date", "ts_code", "vol", "ratio"])
+    df = frame.copy()
+    if "ts_code" not in df.columns and "code" in df.columns:
+        df = df.rename(columns={"code": "ts_code"})
+    if "ts_code" not in df.columns:
+        return pd.DataFrame(columns=["trade_date", "ts_code", "vol", "ratio"])
+    out = df.copy()
+    out["trade_date"] = str(trade_date)
+    out["ts_code"] = out["ts_code"].astype(str)
+    if "vol" in out.columns:
+        out["vol"] = pd.to_numeric(out["vol"], errors="coerce")
+    else:
+        out["vol"] = pd.NA
+    if "ratio" in out.columns:
+        out["ratio"] = pd.to_numeric(out["ratio"], errors="coerce")
+    else:
+        out["ratio"] = pd.NA
+    return out.dropna(subset=["ts_code"]).reset_index(drop=True)
+
+
+def _normalize_margin_detail_frame(frame: Any, *, trade_date: str) -> pd.DataFrame:
+    if frame is None or getattr(frame, "empty", True):
+        return pd.DataFrame(columns=["trade_date", "ts_code", "margin_balance"])
+    df = frame.copy()
+    if "ts_code" not in df.columns:
+        return pd.DataFrame(columns=["trade_date", "ts_code", "margin_balance"])
+    balance_col = "rzye" if "rzye" in df.columns else None
+    if balance_col is None:
+        for candidate in ("margin_balance", "fin_balance"):
+            if candidate in df.columns:
+                balance_col = candidate
+                break
+    if balance_col is None:
+        return pd.DataFrame(columns=["trade_date", "ts_code", "margin_balance"])
+    out = df[["ts_code"]].copy()
+    out["trade_date"] = str(trade_date)
+    out["ts_code"] = out["ts_code"].astype(str)
+    out["margin_balance"] = pd.to_numeric(df[balance_col], errors="coerce")
+    return out.dropna(subset=["ts_code"]).reset_index(drop=True)
+
+
+def _merge_flow_frames(
+    *,
+    trade_date: str,
+    hk_today: pd.DataFrame,
+    hk_prev: pd.DataFrame,
+    margin: pd.DataFrame,
+) -> pd.DataFrame:
+    hk_today = _normalize_hk_hold_frame(hk_today, trade_date=trade_date)
+    hk_prev = _normalize_hk_hold_frame(hk_prev, trade_date=_shift_trade_date(trade_date, -1))
+    margin = _normalize_margin_detail_frame(margin, trade_date=trade_date)
+
+    prev_vol = {}
+    if not hk_prev.empty and "vol" in hk_prev.columns:
+        for _, row in hk_prev.iterrows():
+            code = str(row["ts_code"])
+            if pd.notna(row.get("vol")):
+                prev_vol[code] = float(row["vol"])
+
+    rows: dict[str, dict[str, Any]] = {}
+
+    if not hk_today.empty:
+        for _, row in hk_today.iterrows():
+            code = str(row["ts_code"])
+            vol = float(row["vol"]) if pd.notna(row.get("vol")) else None
+            ratio = float(row["ratio"]) if pd.notna(row.get("ratio")) else None
+            north = None
+            if vol is not None and code in prev_vol:
+                north = vol - prev_vol[code]
+            meta: dict[str, Any] = {"hk_vol": vol, "hk_ratio": ratio}
+            if north is not None:
+                meta["north_vol_delta"] = north
+            rows[code] = {
+                "trade_date": str(trade_date),
+                "ts_code": code,
+                "north_net_buy": north,
+                "margin_balance": None,
+                "metadata_json": meta,
+            }
+
+    if not margin.empty:
+        for _, row in margin.iterrows():
+            code = str(row["ts_code"])
+            bal = float(row["margin_balance"]) if pd.notna(row.get("margin_balance")) else None
+            if code not in rows:
+                rows[code] = {
+                    "trade_date": str(trade_date),
+                    "ts_code": code,
+                    "north_net_buy": None,
+                    "margin_balance": bal,
+                    "metadata_json": {"margin_src": "margin_detail"},
+                }
+            else:
+                rows[code]["margin_balance"] = bal
+                rows[code]["metadata_json"]["margin_src"] = "margin_detail"
+
+    if not rows:
+        return pd.DataFrame(columns=list(_FLOW_COLUMNS))
+    return pd.DataFrame(list(rows.values()))
+
+
+def normalize_flow_daily_frame(frame: Any) -> pd.DataFrame:
+    if frame is None or getattr(frame, "empty", True):
+        return pd.DataFrame(columns=list(_FLOW_COLUMNS))
+    df = frame.copy()
+    if "trade_date" not in df.columns or "ts_code" not in df.columns:
+        return pd.DataFrame(columns=list(_FLOW_COLUMNS))
+    out = df.copy()
+    out["trade_date"] = out["trade_date"].astype(str)
+    out["ts_code"] = out["ts_code"].astype(str)
+    for col in ("north_net_buy", "margin_balance"):
+        if col not in out.columns:
+            out[col] = pd.NA
+        else:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+    if "metadata_json" not in out.columns:
+        out["metadata_json"] = [{} for _ in range(len(out))]
+    return out[(out["ts_code"] != "")].reset_index(drop=True)
+
+
+def fetch_flow_daily(*, trade_date: str) -> pd.DataFrame:
+    """Pull northbound holdings + margin detail for one trade date."""
+    if not is_tushare_configured():
+        logger.info("Tushare not configured; skip flow_daily fetch")
+        return pd.DataFrame(columns=list(_FLOW_COLUMNS))
+    pro = _build_pro()
+    if pro is None:
+        return pd.DataFrame(columns=list(_FLOW_COLUMNS))
+
+    hk_today = _safe_tushare_api(pro, "hk_hold", trade_date=str(trade_date))
+    hk_prev = pd.DataFrame()
+    for offset in (-1, -2, -3, -4, -5):
+        prev_date = _shift_trade_date(trade_date, offset)
+        candidate = _safe_tushare_api(pro, "hk_hold", trade_date=prev_date)
+        if not candidate.empty:
+            hk_prev = candidate
+            break
+    margin = _safe_tushare_api(pro, "margin_detail", trade_date=str(trade_date))
+    return normalize_flow_daily_frame(
+        _merge_flow_frames(
+            trade_date=str(trade_date),
+            hk_today=hk_today,
+            hk_prev=hk_prev,
+            margin=margin,
+        )
+    )
+
+
+def persist_flow_daily(frame: pd.DataFrame) -> int:
+    df = normalize_flow_daily_frame(frame)
+    if df.empty:
+        return 0
+    with get_db_connection() as db:
+        cur = db.cursor()
+        for _, row in df.iterrows():
+            meta = row.get("metadata_json")
+            if isinstance(meta, str):
+                meta_json = meta
+            else:
+                meta_json = json.dumps(meta or {}, ensure_ascii=False)
+            north = float(row["north_net_buy"]) if pd.notna(row.get("north_net_buy")) else None
+            margin = float(row["margin_balance"]) if pd.notna(row.get("margin_balance")) else None
+            cur.execute(
+                """
+                INSERT INTO qd_ashare_flow_daily (
+                    trade_date, ts_code, north_net_buy, margin_balance, source, metadata_json
+                )
+                VALUES (%s::date, %s, %s, %s, 'tushare', %s::jsonb)
+                ON CONFLICT (trade_date, ts_code, source)
+                DO UPDATE SET
+                    north_net_buy = EXCLUDED.north_net_buy,
+                    margin_balance = EXCLUDED.margin_balance,
+                    metadata_json = EXCLUDED.metadata_json,
+                    ingested_at = NOW()
+                """,
+                (str(row["trade_date"]), str(row["ts_code"]), north, margin, meta_json),
+            )
+        db.commit()
+    return int(len(df))
+
+
+def fetch_and_persist_flow_daily(*, trade_date: str) -> int:
+    return persist_flow_daily(fetch_flow_daily(trade_date=trade_date))
+
+
+def _normalize_report_rc_frame(frame: Any, *, trade_date: str) -> pd.DataFrame:
+    if frame is None or getattr(frame, "empty", True):
+        return pd.DataFrame(columns=list(_CONSENSUS_COLUMNS))
+    df = frame.copy()
+    if "ts_code" not in df.columns:
+        return pd.DataFrame(columns=list(_CONSENSUS_COLUMNS))
+    df["ts_code"] = df["ts_code"].astype(str)
+    if "report_date" in df.columns:
+        df["report_date"] = df["report_date"].astype(str)
+        df = df[df["report_date"] <= str(trade_date)]
+    if df.empty:
+        return pd.DataFrame(columns=list(_CONSENSUS_COLUMNS))
+
+    eps_col = "eps" if "eps" in df.columns else None
+    pe_col = "pe" if "pe" in df.columns else None
+    rating_col = "rating" if "rating" in df.columns else None
+
+    rows: list[dict[str, Any]] = []
+    for ts_code, group in df.groupby("ts_code"):
+        eps_vals = pd.to_numeric(group[eps_col], errors="coerce") if eps_col else pd.Series(dtype=float)
+        pe_vals = pd.to_numeric(group[pe_col], errors="coerce") if pe_col else pd.Series(dtype=float)
+        rating_vals = (
+            group[rating_col].map(_rating_to_numeric)
+            if rating_col
+            else pd.Series(dtype=float)
+        )
+        eps_mean = float(eps_vals.mean()) if eps_col and eps_vals.notna().any() else None
+        pe_mean = float(pe_vals.mean()) if pe_col and pe_vals.notna().any() else None
+        rating_mean = float(rating_vals.mean()) if rating_col and rating_vals.notna().any() else None
+        if eps_mean is None and pe_mean is None and rating_mean is None:
+            continue
+        rows.append(
+            {
+                "trade_date": str(trade_date),
+                "ts_code": str(ts_code),
+                "eps_fy1": eps_mean,
+                "pe_fy1": pe_mean,
+                "rating_mean": rating_mean,
+                "metadata_json": {
+                    "consensus_src": "report_rc",
+                    "report_count": int(len(group)),
+                },
+            }
+        )
+    if not rows:
+        return pd.DataFrame(columns=list(_CONSENSUS_COLUMNS))
+    return pd.DataFrame(rows)
+
+
+def _normalize_forecast_vip_frame(frame: Any, *, trade_date: str) -> pd.DataFrame:
+    if frame is None or getattr(frame, "empty", True):
+        return pd.DataFrame(columns=list(_CONSENSUS_COLUMNS))
+    df = frame.copy()
+    if "ts_code" not in df.columns:
+        return pd.DataFrame(columns=list(_CONSENSUS_COLUMNS))
+    df["ts_code"] = df["ts_code"].astype(str)
+    eps_col = None
+    for candidate in ("eps", "p_eps", "net_profit_max"):
+        if candidate in df.columns:
+            eps_col = candidate
+            break
+    rows: list[dict[str, Any]] = []
+    for ts_code, group in df.groupby("ts_code"):
+        eps_vals = pd.to_numeric(group[eps_col], errors="coerce") if eps_col else pd.Series(dtype=float)
+        eps_mean = float(eps_vals.mean()) if eps_col and eps_vals.notna().any() else None
+        if eps_mean is None:
+            continue
+        rows.append(
+            {
+                "trade_date": str(trade_date),
+                "ts_code": str(ts_code),
+                "eps_fy1": eps_mean,
+                "pe_fy1": None,
+                "rating_mean": None,
+                "metadata_json": {"consensus_src": "forecast_vip", "forecast_count": int(len(group))},
+            }
+        )
+    if not rows:
+        return pd.DataFrame(columns=list(_CONSENSUS_COLUMNS))
+    return pd.DataFrame(rows)
+
+
+def normalize_consensus_daily_frame(frame: Any) -> pd.DataFrame:
+    if frame is None or getattr(frame, "empty", True):
+        return pd.DataFrame(columns=list(_CONSENSUS_COLUMNS))
+    df = frame.copy()
+    if "trade_date" not in df.columns or "ts_code" not in df.columns:
+        return pd.DataFrame(columns=list(_CONSENSUS_COLUMNS))
+    out = df.copy()
+    out["trade_date"] = out["trade_date"].astype(str)
+    out["ts_code"] = out["ts_code"].astype(str)
+    for col in ("eps_fy1", "pe_fy1", "rating_mean"):
+        if col not in out.columns:
+            out[col] = pd.NA
+        else:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+    if "metadata_json" not in out.columns:
+        out["metadata_json"] = [{} for _ in range(len(out))]
+    return out[(out["ts_code"] != "")].reset_index(drop=True)
+
+
+def fetch_consensus_daily(*, trade_date: str) -> pd.DataFrame:
+    """Pull analyst consensus cross-section; tries report_rc then forecast_vip."""
+    if not is_tushare_configured():
+        logger.info("Tushare not configured; skip consensus_daily fetch")
+        return pd.DataFrame(columns=list(_CONSENSUS_COLUMNS))
+    pro = _build_pro()
+    if pro is None:
+        return pd.DataFrame(columns=list(_CONSENSUS_COLUMNS))
+
+    start_date = _shift_trade_date(trade_date, -30)
+    report_rc = _safe_tushare_api(
+        pro,
+        "report_rc",
+        start_date=start_date,
+        end_date=str(trade_date),
+    )
+    normalized = normalize_consensus_daily_frame(
+        _normalize_report_rc_frame(report_rc, trade_date=str(trade_date))
+    )
+    if not normalized.empty:
+        return normalized
+
+    forecast_vip = _safe_tushare_api(pro, "forecast_vip", trade_date=str(trade_date))
+    return normalize_consensus_daily_frame(
+        _normalize_forecast_vip_frame(forecast_vip, trade_date=str(trade_date))
+    )
+
+
+def persist_consensus_daily(frame: pd.DataFrame) -> int:
+    df = normalize_consensus_daily_frame(frame)
+    if df.empty:
+        return 0
+    with get_db_connection() as db:
+        cur = db.cursor()
+        for _, row in df.iterrows():
+            meta = row.get("metadata_json")
+            if isinstance(meta, str):
+                meta_json = meta
+            else:
+                meta_json = json.dumps(meta or {}, ensure_ascii=False)
+            eps = float(row["eps_fy1"]) if pd.notna(row.get("eps_fy1")) else None
+            pe = float(row["pe_fy1"]) if pd.notna(row.get("pe_fy1")) else None
+            rating = float(row["rating_mean"]) if pd.notna(row.get("rating_mean")) else None
+            cur.execute(
+                """
+                INSERT INTO qd_ashare_consensus_daily (
+                    trade_date, ts_code, eps_fy1, pe_fy1, rating_mean, source, metadata_json
+                )
+                VALUES (%s::date, %s, %s, %s, %s, 'tushare', %s::jsonb)
+                ON CONFLICT (trade_date, ts_code, source)
+                DO UPDATE SET
+                    eps_fy1 = EXCLUDED.eps_fy1,
+                    pe_fy1 = EXCLUDED.pe_fy1,
+                    rating_mean = EXCLUDED.rating_mean,
+                    metadata_json = EXCLUDED.metadata_json,
+                    ingested_at = NOW()
+                """,
+                (str(row["trade_date"]), str(row["ts_code"]), eps, pe, rating, meta_json),
+            )
+        db.commit()
+    return int(len(df))
+
+
+def fetch_and_persist_consensus_daily(*, trade_date: str) -> int:
+    return persist_consensus_daily(fetch_consensus_daily(trade_date=trade_date))
