@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import csv
+import io
 import json
 from datetime import date, datetime
 from typing import Any
@@ -25,6 +27,49 @@ def _as_date(value: date | str | datetime) -> date:
     if len(text) == 8 and text.isdigit():
         return date(int(text[:4]), int(text[4:6]), int(text[6:8]))
     return date.fromisoformat(text[:10])
+
+
+_REQUIRED_CSV_FIELDS = ("as_of", "symbol", "score")
+
+
+def rows_from_csv_text(
+    text: str,
+    *,
+    default_source: str = DEFAULT_SOURCE,
+    default_version: str = DEFAULT_VERSION,
+    default_universe: str = "",
+) -> list[dict[str, Any]]:
+    reader = csv.DictReader(io.StringIO(text))
+    if not reader.fieldnames:
+        raise ValueError("CSV must include header row with as_of,symbol,score")
+    headers = {h.strip().lower() for h in reader.fieldnames if h}
+    missing = [f for f in _REQUIRED_CSV_FIELDS if f not in headers]
+    if missing:
+        raise ValueError(f"CSV missing required columns: {', '.join(missing)}")
+
+    def _col(row: dict[str, str], name: str) -> str:
+        for key, val in row.items():
+            if key and key.strip().lower() == name:
+                return str(val or "").strip()
+        return ""
+
+    rows: list[dict[str, Any]] = []
+    for raw in reader:
+        if not any(str(v or "").strip() for v in raw.values()):
+            continue
+        row: dict[str, Any] = {
+            "as_of": _col(raw, "as_of"),
+            "symbol": _col(raw, "symbol"),
+            "score": _col(raw, "score"),
+            "source": _col(raw, "source") or default_source,
+            "version": _col(raw, "version") or default_version,
+            "universe": _col(raw, "universe") or default_universe,
+        }
+        weight = _col(raw, "weight")
+        if weight:
+            row["weight"] = weight
+        rows.append(row)
+    return rows
 
 
 def persist_external_alpha_scores(rows: list[dict[str, Any]]) -> dict[str, Any]:
