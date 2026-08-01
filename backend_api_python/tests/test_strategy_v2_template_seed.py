@@ -24,9 +24,9 @@ def _seed_entries():
 
 def test_strategy_v2_seed_has_explicit_cta_and_portfolio_catalogs():
     entries = _seed_entries()
-    assert len(entries) == 14
+    assert len(entries) == 15
     assert sum(item["asset_type"] == "script" for item in entries) == 8
-    assert sum(item["asset_type"] == "portfolio_strategy" for item in entries) == 6
+    assert sum(item["asset_type"] == "portfolio_strategy" for item in entries) == 7
 
     by_key = {item["key"]: item for item in entries}
     assert by_key["strategy_v2_supertrend"]["asset_type"] == "script"
@@ -89,6 +89,7 @@ def test_portfolio_templates_use_fixed_ten_symbol_universe():
         "strategy_v2_csi300_enhanced",
         "strategy_v2_csi300_enhanced_v2",
         "strategy_v2_momentum_top_n",
+        "strategy_v2_external_alpha_score",
     }
     for item in portfolios:
         manifest = compile_strategy_v2(item["code"]).manifest
@@ -127,10 +128,19 @@ def _template_frame(rank: int, periods: int = 320) -> pd.DataFrame:
     )
 
 
-def test_every_seed_template_completes_a_synthetic_v2_backtest():
-    csi300_keys = {"strategy_v2_csi300_enhanced", "strategy_v2_csi300_enhanced_v2"}
+def test_every_seed_template_completes_a_synthetic_v2_backtest(monkeypatch):
+    csi300_keys = {
+        "strategy_v2_csi300_enhanced",
+        "strategy_v2_csi300_enhanced_v2",
+        "strategy_v2_external_alpha_score",
+    }
     for item in _seed_entries():
         program = compile_strategy_v2(item["code"])
+        if item["key"] == "strategy_v2_external_alpha_score":
+            monkeypatch.setattr(
+                "app.services.strategy_v2.runtime.get_external_alpha_scores",
+                lambda *_args, **_kwargs: pd.Series(dtype=float),
+            )
         if item["key"] in csi300_keys:
             symbols = [f"CNStock:{code}" for code in (
                 "600519.SH", "000001.SZ", "601318.SH", "600036.SH", "000858.SZ",
