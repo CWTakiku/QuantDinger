@@ -6,13 +6,13 @@
 
 | 环境 | 职责 | 不负责 |
 |------|------|--------|
-| **离线研究**（QuantaAlpha、Qlib、LightGBM 等） | 挖因子、训练模型、截面打分、导出 CSV | 撮合、持仓账本、产品净值 |
+| **离线研究**（**RD-Agent**、QuantaAlpha、Qlib、LightGBM 等） | 挖因子、训练模型、截面打分、导出 CSV | 撮合、持仓账本、产品净值 |
 | **QuantDinger** | CSV 校验入库、PIT 读分、组合调仓、回测/模拟/实盘执行 | 模型训练、因子挖掘 |
 
 数据流：
 
 ```text
-[离线] QuantaAlpha / LightGBM / 手工导出
+[离线] RD-Agent / QuantaAlpha / LightGBM / 手工导出
         │  CSV
         ▼
 import_external_alpha_scores.py  →  qd_external_alpha_scores
@@ -24,7 +24,9 @@ Strategy V2 模板 strategy_v2_external_alpha_score
 组合成交 / 净值
 ```
 
-**重要：** QuantDinger **不在 Docker 镜像内安装 QuantaAlpha、Qlib 训练依赖或 LLM 运行时**。研究栈与 QD 生产环境隔离；研究侧 API 密钥不得写入仓库。每日打分可由外部 cron 调用导入脚本完成。
+**重要：** QuantDinger **不在 Docker 镜像内安装 RD-Agent、QuantaAlpha、Qlib 训练依赖或 LLM 运行时**。研究栈与 QD 生产环境隔离；研究侧 API 密钥不得写入仓库。每日打分可由外部 cron 调用导入脚本完成。
+
+主研究栈推荐：**RD-Agent**（旁路目录 `~/quant/rdagent-workspace`，说明见 `docs/RDAGENT_EXTERNAL_ALPHA_CN.md`）。
 
 ## 2. CSV 格式
 
