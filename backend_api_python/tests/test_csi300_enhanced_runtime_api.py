@@ -77,3 +77,20 @@ def test_example_csi300_enhanced_weekly_compiles():
     assert "_eligible_symbols" in code
     assert "min_history_bars" in code
     assert int(compiled.manifest.warmup_bars or 0) >= 140
+
+
+def test_example_csi300_enhanced_v2_weekly_compiles():
+    path = Path(__file__).resolve().parents[2] / "docs" / "examples" / "strategy_v2_csi300_enhanced_v2_weekly.py"
+    code = path.read_text(encoding="utf-8")
+    assert code.lstrip().startswith('"""CSI300 Enhanced Index QP 2.0')
+    compiled = compile_strategy_v2(code)
+    assert "csi300" in str(compiled.manifest.universe.reference).lower()
+    assert callable(compiled.handler("update_alpha"))
+    assert callable(compiled.handler("rebalance"))
+    assert "get_csi300_bench_weights" in code
+    assert "get_ashare_industry_map" in code
+    assert "get_ashare_size_log_mcap" in code
+    assert "industry_limit" in code
+    assert "te_limit" in code
+    assert "optimize_enhanced_index" in code
+    assert int(compiled.manifest.warmup_bars or 0) >= 140

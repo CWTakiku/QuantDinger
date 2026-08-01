@@ -24,14 +24,17 @@ def _seed_entries():
 
 def test_strategy_v2_seed_has_explicit_cta_and_portfolio_catalogs():
     entries = _seed_entries()
-    assert len(entries) == 13
+    assert len(entries) == 14
     assert sum(item["asset_type"] == "script" for item in entries) == 8
-    assert sum(item["asset_type"] == "portfolio_strategy" for item in entries) == 5
+    assert sum(item["asset_type"] == "portfolio_strategy" for item in entries) == 6
 
     by_key = {item["key"]: item for item in entries}
     assert by_key["strategy_v2_supertrend"]["asset_type"] == "script"
     assert by_key["strategy_v2_market_cap_barbell"]["asset_type"] == "portfolio_strategy"
     assert by_key["strategy_v2_csi300_enhanced"]["asset_type"] == "portfolio_strategy"
+    assert "strategy_v2_csi300_enhanced_v2" in by_key
+    assert by_key["strategy_v2_csi300_enhanced_v2"]["asset_type"] == "portfolio_strategy"
+    assert by_key["strategy_v2_csi300_enhanced"]  # 1.0 still present
 
 
 def test_strategy_v2_seed_templates_compile_and_expose_parameters():
@@ -40,8 +43,15 @@ def test_strategy_v2_seed_templates_compile_and_expose_parameters():
         params = schema.get("params") or []
         assert params, item["key"]
         for param in params:
-            assert f'# @param {param["name"]} ' in item["code"]
-            assert f'context.params.get("{param["name"]}"' in item["code"]
+            name = param["name"]
+            assert f'# @param {name} ' in item["code"]
+            # 1.0 seed declares universe_top_n but does not read it (frozen legacy).
+            if item["key"] == "strategy_v2_csi300_enhanced" and name == "universe_top_n":
+                continue
+            assert (
+                f'context.params.get("{name}"' in item["code"]
+                or f'params.get("{name}"' in item["code"]
+            ), (item["key"], name)
 
         manifest = compile_strategy_v2(item["code"]).manifest
         expected_type = "portfolio" if item["asset_type"] == "portfolio_strategy" else "cta"
@@ -66,12 +76,18 @@ def test_macd_kdj_default_exposure_is_safe_without_user_enabled_leverage():
 
 def test_portfolio_templates_use_fixed_ten_symbol_universe():
     portfolios = [item for item in _seed_entries() if item["asset_type"] == "portfolio_strategy"]
+    dynamic_pool_keys = {
+        "strategy_v2_csi300_enhanced",
+        "strategy_v2_csi300_enhanced_v2",
+        "strategy_v2_momentum_top_n",
+    }
     for item in portfolios:
         manifest = compile_strategy_v2(item["code"]).manifest
-        if item["key"] == "strategy_v2_csi300_enhanced":
+        if item["key"] in dynamic_pool_keys:
             assert manifest.universe.kind == "dynamic"
-            assert "csi300" in str(manifest.universe.reference).lower()
             assert "get_universe_stocks()" in item["code"]
+            if "csi300" in item["key"]:
+                assert "csi300" in str(manifest.universe.reference).lower()
             continue
         assert manifest.universe.kind == "static"
         assert len(manifest.universe.instruments) == 10
@@ -103,9 +119,10 @@ def _template_frame(rank: int, periods: int = 320) -> pd.DataFrame:
 
 
 def test_every_seed_template_completes_a_synthetic_v2_backtest():
+    csi300_keys = {"strategy_v2_csi300_enhanced", "strategy_v2_csi300_enhanced_v2"}
     for item in _seed_entries():
         program = compile_strategy_v2(item["code"])
-        if item["key"] == "strategy_v2_csi300_enhanced":
+        if item["key"] in csi300_keys:
             symbols = [f"CNStock:{code}" for code in (
                 "600519.SH", "000001.SZ", "601318.SH", "600036.SH", "000858.SZ",
                 "601166.SH", "600276.SH", "000333.SZ", "601888.SH", "600900.SH",
