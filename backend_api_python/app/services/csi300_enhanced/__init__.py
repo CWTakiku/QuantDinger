@@ -7,6 +7,7 @@ from .preprocess import (
     neutralize_industry_size,
     winsorize_mad,
 )
+from .bench import get_csi300_bench_weights
 from .tushare_sync import fetch_index_weights, normalize_index_weight_frame, weights_to_platform_map
 
 __all__ = [
@@ -18,4 +19,5 @@ __all__ = [
     "fetch_index_weights",
     "normalize_index_weight_frame",
     "weights_to_platform_map",
+    "get_csi300_bench_weights",
 ]
