@@ -1,12 +1,14 @@
-"""Tushare sync stubs for CSI300 enhanced-index factor store."""
+"""Tushare sync for CSI300 enhanced-index factor store."""
 
 from __future__ import annotations
 
+from datetime import date
 from typing import Any, Mapping
 
 import pandas as pd
 
 from app.data_sources.tushare_cn import _build_pro, is_tushare_configured, tencent_code_to_ts_code
+from app.utils.db import get_db_connection
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -100,24 +102,188 @@ def weights_to_platform_map(frame: pd.DataFrame) -> dict[str, float]:
     return {k: v / total for k, v in rows.items()}
 
 
+_DAILY_BASIC_COLUMNS = (
+    "trade_date",
+    "ts_code",
+    "close",
+    "pe_ttm",
+    "pb",
+    "ps_ttm",
+    "dv_ttm",
+    "total_mv",
+    "circ_mv",
+    "turnover_rate",
+    "volume_ratio",
+)
+
+
+def fetch_daily_basic(
+    *,
+    trade_date: str,
+    fields: Mapping[str, str] | None = None,
+) -> pd.DataFrame:
+    """Pull valuation / turnover fields from Tushare `daily_basic`."""
+    _ = fields
+    if not is_tushare_configured():
+        logger.info("Tushare not configured; skip daily_basic fetch")
+        return pd.DataFrame(columns=list(_DAILY_BASIC_COLUMNS))
+    pro = _build_pro()
+    if pro is None:
+        return pd.DataFrame(columns=list(_DAILY_BASIC_COLUMNS))
+    try:
+        frame = pro.daily_basic(trade_date=str(trade_date))
+    except Exception as exc:
+        logger.warning("Tushare daily_basic failed trade_date=%s: %s", trade_date, exc)
+        return pd.DataFrame(columns=list(_DAILY_BASIC_COLUMNS))
+    return normalize_daily_basic_frame(frame)
+
+
 def fetch_daily_basic_stub(
     *,
     trade_date: str,
     fields: Mapping[str, str] | None = None,
 ) -> pd.DataFrame:
-    """
-    Skeleton for valuation / turnover fields from Tushare `daily_basic`.
+    """Backward-compatible alias for fetch_daily_basic."""
+    return fetch_daily_basic(trade_date=trade_date, fields=fields)
 
-    Not persisted yet; returns empty when unconfigured.
-    """
-    _ = fields
+
+def normalize_daily_basic_frame(frame: Any) -> pd.DataFrame:
+    """Normalize raw Tushare daily_basic rows into a stable schema."""
+    if frame is None or getattr(frame, "empty", True):
+        return pd.DataFrame(columns=list(_DAILY_BASIC_COLUMNS))
+    df = frame.copy()
+    keep = [c for c in _DAILY_BASIC_COLUMNS if c in df.columns]
+    if "trade_date" not in keep or "ts_code" not in keep:
+        return pd.DataFrame(columns=list(_DAILY_BASIC_COLUMNS))
+    out = df[keep].copy()
+    out["trade_date"] = out["trade_date"].astype(str)
+    out["ts_code"] = out["ts_code"].astype(str)
+    for col in keep:
+        if col in ("trade_date", "ts_code"):
+            continue
+        out[col] = pd.to_numeric(out[col], errors="coerce")
+    return out.dropna(subset=["ts_code"]).reset_index(drop=True)
+
+
+def persist_index_weights(frame: pd.DataFrame) -> int:
+    df = normalize_index_weight_frame(frame)
+    if df.empty:
+        return 0
+    with get_db_connection() as db:
+        cur = db.cursor()
+        for _, row in df.iterrows():
+            cur.execute(
+                """
+                INSERT INTO qd_csi300_index_weights (trade_date, con_code, weight, source)
+                VALUES (%s::date, %s, %s, 'tushare')
+                ON CONFLICT (trade_date, con_code, source)
+                DO UPDATE SET weight = EXCLUDED.weight, ingested_at = NOW()
+                """,
+                (str(row["trade_date"]), str(row["con_code"]), float(row["weight"])),
+            )
+        db.commit()
+    return int(len(df))
+
+
+def fetch_and_persist_index_weights(*, trade_date: str | None = None) -> int:
+    return persist_index_weights(fetch_index_weights(trade_date=trade_date))
+
+
+def persist_daily_basic(frame: pd.DataFrame) -> int:
+    df = normalize_daily_basic_frame(frame)
+    if df.empty:
+        return 0
+    numeric_cols = [c for c in _DAILY_BASIC_COLUMNS if c not in ("trade_date", "ts_code")]
+    with get_db_connection() as db:
+        cur = db.cursor()
+        for _, row in df.iterrows():
+            params: list[Any] = [str(row["trade_date"]), str(row["ts_code"])]
+            params.extend(
+                float(row[col]) if pd.notna(row.get(col)) else None for col in numeric_cols
+            )
+            cur.execute(
+                """
+                INSERT INTO qd_ashare_daily_basic (
+                    trade_date, ts_code, close, pe_ttm, pb, ps_ttm, dv_ttm,
+                    total_mv, circ_mv, turnover_rate, volume_ratio, source
+                )
+                VALUES (
+                    %s::date, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'tushare'
+                )
+                ON CONFLICT (trade_date, ts_code, source)
+                DO UPDATE SET
+                    close = EXCLUDED.close,
+                    pe_ttm = EXCLUDED.pe_ttm,
+                    pb = EXCLUDED.pb,
+                    ps_ttm = EXCLUDED.ps_ttm,
+                    dv_ttm = EXCLUDED.dv_ttm,
+                    total_mv = EXCLUDED.total_mv,
+                    circ_mv = EXCLUDED.circ_mv,
+                    turnover_rate = EXCLUDED.turnover_rate,
+                    volume_ratio = EXCLUDED.volume_ratio,
+                    ingested_at = NOW()
+                """,
+                tuple(params),
+            )
+        db.commit()
+    return int(len(df))
+
+
+def fetch_and_persist_daily_basic(*, trade_date: str) -> int:
+    return persist_daily_basic(fetch_daily_basic(trade_date=trade_date))
+
+
+def fetch_industry_map() -> pd.DataFrame:
+    """Pull listed-stock industry tags from Tushare `stock_basic`."""
+    columns = ["ts_code", "industry"]
     if not is_tushare_configured():
-        return pd.DataFrame()
+        logger.info("Tushare not configured; skip stock_basic fetch")
+        return pd.DataFrame(columns=columns)
     pro = _build_pro()
     if pro is None:
-        return pd.DataFrame()
+        return pd.DataFrame(columns=columns)
     try:
-        return pro.daily_basic(trade_date=str(trade_date))
+        frame = pro.stock_basic(list_status="L", fields="ts_code,industry")
     except Exception as exc:
-        logger.warning("Tushare daily_basic failed trade_date=%s: %s", trade_date, exc)
-        return pd.DataFrame()
+        logger.warning("Tushare stock_basic failed: %s", exc)
+        return pd.DataFrame(columns=columns)
+    return normalize_industry_map_frame(frame)
+
+
+def normalize_industry_map_frame(frame: Any) -> pd.DataFrame:
+    if frame is None or getattr(frame, "empty", True):
+        return pd.DataFrame(columns=["ts_code", "industry"])
+    df = frame.copy()
+    if "ts_code" not in df.columns or "industry" not in df.columns:
+        return pd.DataFrame(columns=["ts_code", "industry"])
+    out = df[["ts_code", "industry"]].copy()
+    out["ts_code"] = out["ts_code"].astype(str)
+    out["industry"] = out["industry"].astype(str).str.strip()
+    return out[(out["ts_code"] != "") & (out["industry"] != "")].reset_index(drop=True)
+
+
+def persist_industry_map(frame: pd.DataFrame, *, as_of: date | None = None) -> int:
+    df = normalize_industry_map_frame(frame)
+    if df.empty:
+        return 0
+    as_of_date = as_of or date.today()
+    with get_db_connection() as db:
+        cur = db.cursor()
+        for _, row in df.iterrows():
+            cur.execute(
+                """
+                INSERT INTO qd_ashare_industry_map (
+                    ts_code, industry, industry_src, as_of, source
+                )
+                VALUES (%s, %s, 'tushare_stock_basic', %s::date, 'tushare')
+                ON CONFLICT (ts_code, industry_src, as_of, source)
+                DO UPDATE SET industry = EXCLUDED.industry, ingested_at = NOW()
+                """,
+                (str(row["ts_code"]), str(row["industry"]), as_of_date.isoformat()),
+            )
+        db.commit()
+    return int(len(df))
+
+
+def fetch_and_persist_industry_map() -> int:
+    return persist_industry_map(fetch_industry_map())
