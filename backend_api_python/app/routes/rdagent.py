@@ -25,12 +25,30 @@ def _failure(exc: RdAgentBridgeError):
     return jsonify({"code": 0, "msg": exc.code, "data": None}), exc.status_code
 
 
-def _running_jobs(client: RdAgentBridgeClient) -> list[dict]:
-    jobs = client.list_jobs()
+def _running_jobs(jobs: list) -> list[dict]:
     return [
         job for job in jobs
         if isinstance(job, dict) and str(job.get("status") or "").lower() == "running"
     ]
+
+
+def _last_job(jobs: list):
+    finished = [
+        job for job in jobs
+        if isinstance(job, dict) and str(job.get("status") or "").lower() != "running"
+    ]
+    if not finished:
+        # Prefer newest overall job if only running / empty
+        candidates = [j for j in jobs if isinstance(j, dict)]
+    else:
+        candidates = finished
+    if not candidates:
+        return None
+
+    def _sort_key(job: dict):
+        return str(job.get("finished_at") or job.get("started_at") or "")
+
+    return max(candidates, key=_sort_key)
 
 
 @rdagent_blp.route("/status", methods=["GET"])
@@ -41,7 +59,10 @@ def rdagent_status():
         client = get_bridge_client()
         health = client.health()
         data = dict(health) if isinstance(health, dict) else {"health": health}
-        data["running_jobs"] = _running_jobs(client)
+        jobs = client.list_jobs()
+        data["running_jobs"] = _running_jobs(jobs)
+        data["last_job"] = _last_job(jobs)
+        data["jobs"] = jobs
         try:
             data["llm_sync"] = client.llm_sync_status()
         except RdAgentBridgeError:

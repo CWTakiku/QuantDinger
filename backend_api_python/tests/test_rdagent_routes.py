@@ -54,7 +54,19 @@ def test_status_ok(client, monkeypatch):
             return {"ok": True, "workspace": "/tmp"}
 
         def list_jobs(self):
-            return [{"id": "j1", "status": "running"}, {"id": "j2", "status": "stopped"}]
+            return [
+                {"id": "j1", "status": "running", "started_at": "2026-08-02T10:00:00+00:00"},
+                {
+                    "id": "j2",
+                    "status": "succeeded",
+                    "started_at": "2026-08-02T09:00:00+00:00",
+                    "finished_at": "2026-08-02T09:30:00+00:00",
+                    "exit_code": 0,
+                },
+            ]
+
+        def llm_sync_status(self):
+            return {"enabled": True, "applied": True, "chat_model": "openai/glm-5.2"}
 
     monkeypatch.setattr("app.routes.rdagent.get_bridge_client", lambda: Fake())
     resp = client.get("/api/rdagent/status", headers=_admin_auth_headers(monkeypatch))
@@ -62,7 +74,11 @@ def test_status_ok(client, monkeypatch):
     body = resp.get_json()
     assert body["code"] == 1
     assert body["data"]["ok"] is True
-    assert body["data"]["running_jobs"] == [{"id": "j1", "status": "running"}]
+    assert body["data"]["running_jobs"] == [
+        {"id": "j1", "status": "running", "started_at": "2026-08-02T10:00:00+00:00"}
+    ]
+    assert body["data"]["last_job"]["id"] == "j2"
+    assert body["data"]["last_job"]["status"] == "succeeded"
 
 
 def test_list_jobs_ok(client, monkeypatch):
