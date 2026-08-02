@@ -1,0 +1,109 @@
+"""RDAgent human API route tests (mock bridge client)."""
+
+
+def _user_auth_headers(monkeypatch):
+    from app.utils import auth
+
+    monkeypatch.setattr(
+        auth,
+        "verify_token",
+        lambda token: {
+            "sub": "tester",
+            "user_id": 1,
+            "role": "user",
+            "token_version": 1,
+            "_verified_username": "tester",
+            "_verified_user_role": "user",
+        },
+    )
+    return {"Authorization": "Bearer test-token"}
+
+
+def _admin_auth_headers(monkeypatch):
+    from app.utils import auth
+
+    monkeypatch.setattr(
+        auth,
+        "verify_token",
+        lambda token: {
+            "sub": "admin",
+            "user_id": 1,
+            "role": "admin",
+            "token_version": 1,
+            "_verified_username": "admin",
+            "_verified_user_role": "admin",
+        },
+    )
+    return {"Authorization": "Bearer admin-token"}
+
+
+def test_status_requires_admin(client, monkeypatch):
+    resp = client.get("/api/rdagent/status", headers=_user_auth_headers(monkeypatch))
+    assert resp.status_code == 403
+    assert resp.get_json()["code"] == 403
+
+
+def test_status_requires_login(client):
+    resp = client.get("/api/rdagent/status")
+    assert resp.status_code == 401
+
+
+def test_status_ok(client, monkeypatch):
+    class Fake:
+        def health(self):
+            return {"ok": True, "workspace": "/tmp"}
+
+        def list_jobs(self):
+            return [{"id": "j1", "status": "running"}, {"id": "j2", "status": "stopped"}]
+
+    monkeypatch.setattr("app.routes.rdagent.get_bridge_client", lambda: Fake())
+    resp = client.get("/api/rdagent/status", headers=_admin_auth_headers(monkeypatch))
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["code"] == 1
+    assert body["data"]["ok"] is True
+    assert body["data"]["running_jobs"] == [{"id": "j1", "status": "running"}]
+
+
+def test_list_jobs_ok(client, monkeypatch):
+    class Fake:
+        def list_jobs(self):
+            return [{"id": "j1", "status": "queued"}]
+
+    monkeypatch.setattr("app.routes.rdagent.get_bridge_client", lambda: Fake())
+    resp = client.get("/api/rdagent/jobs", headers=_admin_auth_headers(monkeypatch))
+    assert resp.status_code == 200
+    assert resp.get_json()["data"] == [{"id": "j1", "status": "queued"}]
+
+
+def test_start_job_ok(client, monkeypatch):
+    calls = []
+
+    class Fake:
+        def start_job(self, scenario, step_n, timeout_h=None):
+            calls.append({"scenario": scenario, "step_n": step_n, "timeout_h": timeout_h})
+            return {"id": "j-new", "status": "queued"}
+
+    monkeypatch.setattr("app.routes.rdagent.get_bridge_client", lambda: Fake())
+    resp = client.post(
+        "/api/rdagent/jobs",
+        json={"scenario": "fin_factor", "step_n": 2, "timeout_h": 1.5},
+        headers=_admin_auth_headers(monkeypatch),
+    )
+    assert resp.status_code == 201
+    assert resp.get_json()["data"]["id"] == "j-new"
+    assert calls == [{"scenario": "fin_factor", "step_n": 2, "timeout_h": 1.5}]
+
+
+def test_bridge_error_maps_status_code(client, monkeypatch):
+    from app.services.rdagent_bridge import RdAgentBridgeError
+
+    def raise_unreachable():
+        raise RdAgentBridgeError(503, "rdagent_bridge_unreachable", "bridge down")
+
+    monkeypatch.setattr("app.routes.rdagent.get_bridge_client", raise_unreachable)
+    resp = client.get("/api/rdagent/jobs", headers=_admin_auth_headers(monkeypatch))
+    assert resp.status_code == 503
+    body = resp.get_json()
+    assert body["code"] == 0
+    assert body["msg"] == "rdagent_bridge_unreachable"
