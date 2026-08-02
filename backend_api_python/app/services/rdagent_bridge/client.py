@@ -63,6 +63,9 @@ class RdAgentBridgeClient:
         items = payload.get("data_sources")
         return list(items) if isinstance(items, list) else []
 
+    def llm_sync_status(self) -> dict[str, Any]:
+        return self._request("GET", "/v1/llm-sync")
+
     def get_job(self, job_id: str) -> dict[str, Any]:
         return self._request("GET", f"/v1/jobs/{job_id}")
 

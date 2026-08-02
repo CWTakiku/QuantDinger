@@ -42,6 +42,10 @@ def rdagent_status():
         health = client.health()
         data = dict(health) if isinstance(health, dict) else {"health": health}
         data["running_jobs"] = _running_jobs(client)
+        try:
+            data["llm_sync"] = client.llm_sync_status()
+        except RdAgentBridgeError:
+            data["llm_sync"] = {"enabled": False, "applied": False, "error": "bridge_llm_sync_unavailable"}
         return _success(data)
     except RdAgentBridgeError as exc:
         return _failure(exc)
@@ -189,6 +193,19 @@ def list_rdagent_data_sources():
     except Exception:
         logger.exception("list rdagent data sources failed")
         return jsonify({"code": 0, "msg": "rdagent.dataSourcesListFailed", "data": None}), 500
+
+
+@rdagent_blp.route("/llm-sync", methods=["GET"])
+@login_required
+@admin_required
+def rdagent_llm_sync_status():
+    try:
+        return _success(get_bridge_client().llm_sync_status())
+    except RdAgentBridgeError as exc:
+        return _failure(exc)
+    except Exception:
+        logger.exception("rdagent llm-sync status failed")
+        return jsonify({"code": 0, "msg": "rdagent.llmSyncFailed", "data": None}), 500
 
 
 @rdagent_blp.route("/import-from-session", methods=["POST"])
