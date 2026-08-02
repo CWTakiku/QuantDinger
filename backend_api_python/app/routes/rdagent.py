@@ -77,8 +77,14 @@ def start_rdagent_job():
             return jsonify({"code": 0, "msg": "rdagent.stepNRequired", "data": None}), 400
         timeout_h = payload.get("timeout_h", payload.get("timeoutH"))
         timeout = float(timeout_h) if timeout_h is not None else None
+        data_source = str(payload.get("data_source") or payload.get("dataSource") or "default").strip()
         return _success(
-            get_bridge_client().start_job(scenario, int(step_n), timeout_h=timeout),
+            get_bridge_client().start_job(
+                scenario,
+                int(step_n),
+                timeout_h=timeout,
+                data_source=data_source or "default",
+            ),
             status=201,
         )
     except RdAgentBridgeError as exc:
@@ -170,6 +176,19 @@ def rdagent_ui_start():
     except Exception:
         logger.exception("rdagent ui start failed")
         return jsonify({"code": 0, "msg": "rdagent.uiStartFailed", "data": None}), 500
+
+
+@rdagent_blp.route("/data-sources", methods=["GET"])
+@login_required
+@admin_required
+def list_rdagent_data_sources():
+    try:
+        return _success(get_bridge_client().list_data_sources())
+    except RdAgentBridgeError as exc:
+        return _failure(exc)
+    except Exception:
+        logger.exception("list rdagent data sources failed")
+        return jsonify({"code": 0, "msg": "rdagent.dataSourcesListFailed", "data": None}), 500
 
 
 @rdagent_blp.route("/import-from-session", methods=["POST"])

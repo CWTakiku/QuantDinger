@@ -47,11 +47,21 @@ class RdAgentBridgeClient:
         scenario: str,
         step_n: int,
         timeout_h: float | None = None,
+        data_source: str = "default",
     ) -> dict[str, Any]:
-        body: dict[str, Any] = {"scenario": scenario, "step_n": int(step_n)}
+        body: dict[str, Any] = {
+            "scenario": scenario,
+            "step_n": int(step_n),
+            "data_source": (data_source or "default").strip() or "default",
+        }
         if timeout_h is not None:
             body["timeout_h"] = float(timeout_h)
         return self._request("POST", "/v1/jobs", json_body=body)
+
+    def list_data_sources(self) -> list[dict[str, Any]]:
+        payload = self._request("GET", "/v1/data-sources")
+        items = payload.get("data_sources")
+        return list(items) if isinstance(items, list) else []
 
     def get_job(self, job_id: str) -> dict[str, Any]:
         return self._request("GET", f"/v1/jobs/{job_id}")

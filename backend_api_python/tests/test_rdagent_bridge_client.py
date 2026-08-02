@@ -80,6 +80,7 @@ def test_start_job_posts_payload(monkeypatch):
     assert captured["kwargs"]["json"] == {
         "scenario": "fin_factor",
         "step_n": 3,
+        "data_source": "default",
         "timeout_h": 1.5,
     }
     assert captured["kwargs"]["headers"]["X-RDAgent-Bridge-Token"] == "token"

@@ -80,19 +80,28 @@ def test_start_job_ok(client, monkeypatch):
     calls = []
 
     class Fake:
-        def start_job(self, scenario, step_n, timeout_h=None):
-            calls.append({"scenario": scenario, "step_n": step_n, "timeout_h": timeout_h})
+        def start_job(self, scenario, step_n, timeout_h=None, data_source="default"):
+            calls.append(
+                {
+                    "scenario": scenario,
+                    "step_n": step_n,
+                    "timeout_h": timeout_h,
+                    "data_source": data_source,
+                }
+            )
             return {"id": "j-new", "status": "queued"}
 
     monkeypatch.setattr("app.routes.rdagent.get_bridge_client", lambda: Fake())
     resp = client.post(
         "/api/rdagent/jobs",
-        json={"scenario": "fin_factor", "step_n": 2, "timeout_h": 1.5},
+        json={"scenario": "fin_factor", "step_n": 2, "timeout_h": 1.5, "data_source": "quantmind"},
         headers=_admin_auth_headers(monkeypatch),
     )
     assert resp.status_code == 201
     assert resp.get_json()["data"]["id"] == "j-new"
-    assert calls == [{"scenario": "fin_factor", "step_n": 2, "timeout_h": 1.5}]
+    assert calls == [
+        {"scenario": "fin_factor", "step_n": 2, "timeout_h": 1.5, "data_source": "quantmind"}
+    ]
 
 
 def test_bridge_error_maps_status_code(client, monkeypatch):
