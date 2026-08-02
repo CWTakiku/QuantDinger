@@ -8,7 +8,7 @@ from typing import Any
 
 import pandas as pd
 
-from app.markets.cn_stock.symbols import canonicalize_cnstock_key
+from app.services.external_alpha.symbols import canonicalize_cnstock_key
 from app.utils.db import get_db_connection
 
 DEFAULT_SOURCE = "external"
