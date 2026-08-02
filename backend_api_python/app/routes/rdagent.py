@@ -4,6 +4,7 @@ from flask import jsonify, request
 
 from app.openapi.blueprint import HumanBlueprint as Blueprint
 from app.services.rdagent_bridge import RdAgentBridgeClient, RdAgentBridgeError
+from app.services.rdagent_bridge.import_session import default_session_version, import_session_scores
 from app.utils.auth import admin_required, login_required
 from app.utils.logger import get_logger
 
@@ -169,3 +170,45 @@ def rdagent_ui_start():
     except Exception:
         logger.exception("rdagent ui start failed")
         return jsonify({"code": 0, "msg": "rdagent.uiStartFailed", "data": None}), 500
+
+
+@rdagent_blp.route("/import-from-session", methods=["POST"])
+@login_required
+@admin_required
+def rdagent_import_from_session():
+    try:
+        payload = request.get_json(silent=True) or {}
+        session_id = str(payload.get("session_id") or payload.get("sessionId") or "").strip()
+        if not session_id:
+            return jsonify({"code": 0, "msg": "rdagent.sessionIdRequired", "data": None}), 400
+
+        source = str(payload.get("source") or "rdagent").strip() or "rdagent"
+        version_raw = payload.get("version")
+        if version_raw is not None and str(version_raw).strip():
+            version = str(version_raw).strip()[:120]
+        else:
+            version = default_session_version(session_id)
+        universe = str(payload.get("universe") or "csi300").strip() or "csi300"
+
+        result = import_session_scores(
+            session_id,
+            source=source,
+            version=version,
+            universe=universe,
+        )
+        logger.info(
+            "rdagent import-from-session user=%s session=%s source=%s version=%s inserted=%s",
+            getattr(request, "user_id", None),
+            session_id,
+            source,
+            version,
+            result.get("inserted"),
+        )
+        return _success(result)
+    except RdAgentBridgeError as exc:
+        return _failure(exc)
+    except ValueError as exc:
+        return jsonify({"code": 0, "msg": str(exc), "data": None}), 400
+    except Exception:
+        logger.exception("rdagent import-from-session failed")
+        return jsonify({"code": 0, "msg": "rdagent.importFromSessionFailed", "data": None}), 500

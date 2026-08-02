@@ -73,6 +73,57 @@ class RdAgentBridgeClient:
     def ui_start(self) -> dict[str, Any]:
         return self._request("POST", "/v1/ui/start")
 
+    def export_session(
+        self,
+        session_id: str,
+        source: str = "rdagent",
+        version: str = "default",
+        universe: str = "csi300",
+    ) -> dict[str, Any]:
+        body = {
+            "session": session_id,
+            "source": source,
+            "version": version,
+            "universe": universe,
+        }
+        return self._request("POST", "/v1/export", json_body=body)
+
+    def download_export(self, export_id: str) -> str:
+        export_id = str(export_id or "").strip()
+        if not export_id:
+            raise RdAgentBridgeError(400, "rdagent_bridge_bad_request", "export_id is required")
+        headers = self._headers()
+        try:
+            response = requests.get(
+                self._url(f"/v1/export/{export_id}/download"),
+                headers=headers,
+                timeout=self.timeout_s,
+            )
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
+            raise RdAgentBridgeError(
+                503,
+                "rdagent_bridge_unreachable",
+                "无法连接 rdagent bridge，请先在本机启动 rdagent-bridge",
+            ) from exc
+
+        status = int(response.status_code)
+        if status == 401:
+            payload = self._decode_json(response)
+            message = self._error_message(payload, "rdagent bridge unauthorized")
+            raise RdAgentBridgeError(401, "rdagent_bridge_unauthorized", message)
+
+        if status >= 500:
+            payload = self._decode_json(response)
+            message = self._error_message(payload, f"rdagent bridge error ({status})")
+            raise RdAgentBridgeError(status, "rdagent_bridge_error", message)
+
+        if status >= 400:
+            payload = self._decode_json(response)
+            message = self._error_message(payload, f"rdagent bridge request failed ({status})")
+            raise RdAgentBridgeError(status, "rdagent_bridge_bad_request", message)
+
+        return response.text
+
     def _headers(self) -> dict[str, str]:
         return {_TOKEN_HEADER: self.token}
 
