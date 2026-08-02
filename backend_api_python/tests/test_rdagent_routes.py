@@ -107,3 +107,48 @@ def test_bridge_error_maps_status_code(client, monkeypatch):
     body = resp.get_json()
     assert body["code"] == 0
     assert body["msg"] == "rdagent_bridge_unreachable"
+
+
+def test_import_from_session_ok(client, monkeypatch):
+    calls = []
+
+    def fake_import(session_id, *, source, version, universe):
+        calls.append(
+            {"session_id": session_id, "source": source, "version": version, "universe": universe}
+        )
+        return {
+            "export_id": "e1",
+            "inserted": 2,
+            "source": source,
+            "version": version,
+            "parsed_rows": 2,
+        }
+
+    monkeypatch.setattr("app.routes.rdagent.import_session_scores", fake_import)
+    resp = client.post(
+        "/api/rdagent/import-from-session",
+        json={"session_id": "sess-1", "source": "rdagent", "version": "v1"},
+        headers=_admin_auth_headers(monkeypatch),
+    )
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["code"] == 1
+    assert body["data"]["inserted"] == 2
+    assert calls == [
+        {
+            "session_id": "sess-1",
+            "source": "rdagent",
+            "version": "v1",
+            "universe": "csi300",
+        }
+    ]
+
+
+def test_import_from_session_requires_session_id(client, monkeypatch):
+    resp = client.post(
+        "/api/rdagent/import-from-session",
+        json={},
+        headers=_admin_auth_headers(monkeypatch),
+    )
+    assert resp.status_code == 400
+    assert resp.get_json()["msg"] == "rdagent.sessionIdRequired"
