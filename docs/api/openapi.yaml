@@ -7306,4 +7306,24 @@ paths:
       operationId: postApiRdagentUiStart
       summary: Post Api Rdagent Ui Start
       x-visibility: internal
+  /api/rdagent/import-from-session:
+    post:
+      responses:
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanErrorEnvelope'
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanSuccessEnvelope'
+      tags:
+      - RDAgent
+      operationId: postApiRdagentImportFromSession
+      summary: Post Api Rdagent Import From Session
+      x-visibility: internal
 openapi: 3.0.3
