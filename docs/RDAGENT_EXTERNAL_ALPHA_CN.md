@@ -4,7 +4,7 @@
 
 ## 研究工厂模块（QD 产品入口）
 
-管理员在 Vue **研究工厂** 页（`/rdagent-factory`）通过 QD 后端代理管理本机 RD-Agent，无需把 RD 装进 Docker 镜像。
+管理员在 Vue **研究工厂** 页（`/rdagent`）通过 QD 后端代理管理本机 RD-Agent，无需把 RD 装进 Docker 镜像。
 
 | 能力 | QD API（admin） | 说明 |
 |------|-----------------|------|
