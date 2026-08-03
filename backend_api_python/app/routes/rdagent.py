@@ -105,12 +105,18 @@ def start_rdagent_job():
         timeout_h = payload.get("timeout_h", payload.get("timeoutH"))
         timeout = float(timeout_h) if timeout_h is not None else None
         data_source = str(payload.get("data_source") or payload.get("dataSource") or "default").strip()
+        start_date_raw = payload.get("start_date", payload.get("startDate"))
+        end_date_raw = payload.get("end_date", payload.get("endDate"))
+        start_date = str(start_date_raw).strip() if start_date_raw is not None and str(start_date_raw).strip() else None
+        end_date = str(end_date_raw).strip() if end_date_raw is not None and str(end_date_raw).strip() else None
         return _success(
             get_bridge_client().start_job(
                 scenario,
                 int(step_n),
                 timeout_h=timeout,
                 data_source=data_source or "default",
+                start_date=start_date,
+                end_date=end_date,
             ),
             status=201,
         )

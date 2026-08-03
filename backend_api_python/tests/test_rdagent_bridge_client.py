@@ -73,7 +73,13 @@ def test_start_job_posts_payload(monkeypatch):
 
     monkeypatch.setattr("app.services.rdagent_bridge.client.requests.request", fake_request)
     client = RdAgentBridgeClient("http://127.0.0.1:19901", "token")
-    out = client.start_job("fin_factor", step_n=3, timeout_h=1.5)
+    out = client.start_job(
+        "fin_factor",
+        step_n=3,
+        timeout_h=1.5,
+        start_date="2018-01-01",
+        end_date="2024-12-31",
+    )
     assert out["id"] == "j2"
     assert captured["method"] == "POST"
     assert captured["url"] == "http://127.0.0.1:19901/v1/jobs"
@@ -82,6 +88,8 @@ def test_start_job_posts_payload(monkeypatch):
         "step_n": 3,
         "data_source": "default",
         "timeout_h": 1.5,
+        "start_date": "2018-01-01",
+        "end_date": "2024-12-31",
     }
     assert captured["kwargs"]["headers"]["X-RDAgent-Bridge-Token"] == "token"
 

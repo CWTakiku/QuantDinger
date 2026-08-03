@@ -48,6 +48,8 @@ class RdAgentBridgeClient:
         step_n: int,
         timeout_h: float | None = None,
         data_source: str = "default",
+        start_date: str | None = None,
+        end_date: str | None = None,
     ) -> dict[str, Any]:
         body: dict[str, Any] = {
             "scenario": scenario,
@@ -56,6 +58,12 @@ class RdAgentBridgeClient:
         }
         if timeout_h is not None:
             body["timeout_h"] = float(timeout_h)
+        start_s = (start_date or "").strip()
+        end_s = (end_date or "").strip()
+        if start_s:
+            body["start_date"] = start_s
+        if end_s:
+            body["end_date"] = end_s
         return self._request("POST", "/v1/jobs", json_body=body)
 
     def list_data_sources(self) -> list[dict[str, Any]]:
