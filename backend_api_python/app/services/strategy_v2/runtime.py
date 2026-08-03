@@ -24,6 +24,23 @@ from .data import MultiAssetDataPortal
 from .protection import ProtectionDecision, ProtectionEngine, ProtectionSpec, ProtectionState
 
 
+def get_external_alpha_scores(
+    as_of: object,
+    source: str,
+    version: object = None,
+    symbols: list[str] | None = None,
+) -> pd.Series:
+    """Load PIT external alpha scores for strategy scripts (imported RD-Agent panels)."""
+    from app.services.external_alpha.store import load_external_alpha_scores_as_of
+
+    return load_external_alpha_scores_as_of(
+        as_of,
+        source=str(source or ""),
+        version=None if version is None else str(version),
+        symbols=list(symbols) if symbols else None,
+    )
+
+
 def _backtest_time_iso(value: Any) -> str:
     """Serialize the UTC-naive market index as an unambiguous UTC instant."""
     timestamp = pd.Timestamp(value)
@@ -801,7 +818,15 @@ class MultiAssetSimulationBroker:
         explicit = float((bar or {}).get("lot_size") or 0.0)
         if explicit > 0:
             return explicit
-        return 1e-8 if str(symbol).startswith("Crypto:") else 1.0
+        raw = str(symbol or "")
+        if raw.startswith("Crypto:"):
+            return 1e-8
+        from app.markets.cn_stock.board_lot import cn_stock_board_lot
+
+        board_lot = cn_stock_board_lot(raw)
+        if board_lot is not None:
+            return float(board_lot)
+        return 1.0
 
     @staticmethod
     def _round_to_lot(value: float, lot_size: float) -> float:
@@ -1184,6 +1209,7 @@ class StrategyV2BacktestRunner:
             "factor": ctx.factor,
             "get_factors": ctx.get_factors,
             "get_fundamentals": ctx.get_fundamentals,
+            "get_external_alpha_scores": get_external_alpha_scores,
             "is_trade": ctx.is_trade,
             "run_daily": lambda *args, **kwargs: None,
             "run_weekly": lambda *args, **kwargs: None,
@@ -1697,6 +1723,7 @@ class StrategyV2LiveSession:
             "factor": ctx.factor,
             "get_factors": ctx.get_factors,
             "get_fundamentals": ctx.get_fundamentals,
+            "get_external_alpha_scores": get_external_alpha_scores,
             "is_trade": ctx.is_trade,
             "run_daily": lambda *args, **kwargs: None,
             "run_weekly": lambda *args, **kwargs: None,

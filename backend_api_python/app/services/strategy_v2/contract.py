@@ -315,6 +315,7 @@ _RUNTIME_GLOBAL_CALL_NAMES = {
     "factor",
     "get_factors",
     "get_fundamentals",
+    "get_external_alpha_scores",
     "get_history",
     "get_index_stocks",
     "get_position",

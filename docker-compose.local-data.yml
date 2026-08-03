@@ -1,0 +1,13 @@
+# Optional local A-share daily bars for historical Strategy V2 backtests.
+# Usage:
+#   export CNSTOCK_LOCAL_DAILY_HOST_PATH="/path/to/后复权"
+#   docker compose -f docker-compose.yml -f docker-compose.local-data.yml up -d backend
+#
+# Inside the container, bars are read from CNSTOCK_LOCAL_DAILY_DIR=/data/cnstock_daily.
+
+services:
+  backend:
+    volumes:
+      - ${CNSTOCK_LOCAL_DAILY_HOST_PATH}:/data/cnstock_daily:ro
+    environment:
+      - CNSTOCK_LOCAL_DAILY_DIR=/data/cnstock_daily

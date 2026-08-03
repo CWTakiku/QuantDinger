@@ -651,6 +651,8 @@ tags:
   description: Interactive Brokers adapter (Internal)
 - name: Alpaca
   description: Alpaca adapter (Internal)
+- name: RDAgent
+  description: RD-Agent research factory proxy (Internal)
 servers:
 - url: http://localhost:5000
   description: Backend direct (python run.py)
@@ -2111,6 +2113,26 @@ paths:
       operationId: getApiBacktestFactorResearchGet
       summary: Get Api Backtest Factor Research Get
       x-visibility: internal
+  /api/backtest/factor-research/delete:
+    post:
+      responses:
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanErrorEnvelope'
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanSuccessEnvelope'
+      tags:
+      - Strategy
+      operationId: postApiBacktestFactorResearchDelete
+      summary: Post Api Backtest Factor Research Delete
+      x-visibility: internal
   /api/backtest/tune:
     post:
       responses:
@@ -2170,6 +2192,26 @@ paths:
       - Strategy
       operationId: getApiBacktestGet
       summary: Get Api Backtest Get
+      x-visibility: internal
+  /api/backtest/delete:
+    post:
+      responses:
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanErrorEnvelope'
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanSuccessEnvelope'
+      tags:
+      - Strategy
+      operationId: postApiBacktestDelete
+      summary: Post Api Backtest Delete
       x-visibility: internal
   /api/market/config:
     get:
@@ -7046,4 +7088,242 @@ paths:
       - QuickTrade
       operationId: getApiQuickTradeHistory
       x-visibility: private
+  /api/rdagent/status:
+    get:
+      responses:
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanErrorEnvelope'
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanSuccessEnvelope'
+      tags:
+      - RDAgent
+      operationId: getApiRdagentStatus
+      summary: Get Api Rdagent Status
+      x-visibility: internal
+  /api/rdagent/jobs:
+    get:
+      responses:
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanErrorEnvelope'
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanSuccessEnvelope'
+      tags:
+      - RDAgent
+      operationId: getApiRdagentJobs
+      summary: Get Api Rdagent Jobs
+      x-visibility: internal
+    post:
+      responses:
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanErrorEnvelope'
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanSuccessEnvelope'
+      tags:
+      - RDAgent
+      operationId: postApiRdagentJobs
+      summary: Post Api Rdagent Jobs
+      x-visibility: internal
+  /api/rdagent/jobs/{job_id}:
+    get:
+      responses:
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanErrorEnvelope'
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanSuccessEnvelope'
+      tags:
+      - RDAgent
+      operationId: getApiRdagentJobsJobId
+      summary: Get Api Rdagent Jobs Job Id
+      parameters:
+      - name: job_id
+        in: path
+        required: true
+        schema:
+          type: integer
+      x-visibility: internal
+    parameters:
+    - in: path
+      name: job_id
+      required: true
+      schema:
+        type: string
+        minLength: 1
+  /api/rdagent/jobs/{job_id}/stop:
+    post:
+      responses:
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanErrorEnvelope'
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanSuccessEnvelope'
+      tags:
+      - RDAgent
+      operationId: postApiRdagentJobsJobIdStop
+      summary: Post Api Rdagent Jobs Job Id Stop
+      parameters:
+      - name: job_id
+        in: path
+        required: true
+        schema:
+          type: integer
+      x-visibility: internal
+    parameters:
+    - in: path
+      name: job_id
+      required: true
+      schema:
+        type: string
+        minLength: 1
+  /api/rdagent/jobs/{job_id}/logs:
+    get:
+      responses:
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanErrorEnvelope'
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanSuccessEnvelope'
+      tags:
+      - RDAgent
+      operationId: getApiRdagentJobsJobIdLogs
+      summary: Get Api Rdagent Jobs Job Id Logs
+      parameters:
+      - name: job_id
+        in: path
+        required: true
+        schema:
+          type: integer
+      x-visibility: internal
+    parameters:
+    - in: path
+      name: job_id
+      required: true
+      schema:
+        type: string
+        minLength: 1
+  /api/rdagent/sessions:
+    get:
+      responses:
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanErrorEnvelope'
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanSuccessEnvelope'
+      tags:
+      - RDAgent
+      operationId: getApiRdagentSessions
+      summary: Get Api Rdagent Sessions
+      x-visibility: internal
+  /api/rdagent/ui:
+    get:
+      responses:
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanErrorEnvelope'
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanSuccessEnvelope'
+      tags:
+      - RDAgent
+      operationId: getApiRdagentUi
+      summary: Get Api Rdagent Ui
+      x-visibility: internal
+  /api/rdagent/ui/start:
+    post:
+      responses:
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanErrorEnvelope'
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanSuccessEnvelope'
+      tags:
+      - RDAgent
+      operationId: postApiRdagentUiStart
+      summary: Post Api Rdagent Ui Start
+      x-visibility: internal
+  /api/rdagent/import-from-session:
+    post:
+      responses:
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanErrorEnvelope'
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanSuccessEnvelope'
+      tags:
+      - RDAgent
+      operationId: postApiRdagentImportFromSession
+      summary: Post Api Rdagent Import From Session
+      x-visibility: internal
 openapi: 3.0.3
