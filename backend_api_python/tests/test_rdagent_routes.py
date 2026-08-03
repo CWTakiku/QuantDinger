@@ -131,7 +131,8 @@ def test_bridge_error_maps_status_code(client, monkeypatch):
     assert resp.status_code == 503
     body = resp.get_json()
     assert body["code"] == 0
-    assert body["msg"] == "rdagent_bridge_unreachable"
+    assert body["msg"] == "rdagent_bridge_unreachable: bridge down"
+    assert body["data"]["error_code"] == "rdagent_bridge_unreachable"
 
 
 def test_import_from_session_ok(client, monkeypatch):
