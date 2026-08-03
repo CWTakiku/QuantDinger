@@ -140,6 +140,28 @@ class StrategyBacktestRepository:
             cur.close()
         return self._hydrate(row, include_result=True) if row else None
 
+    def delete_run(self, *, user_id: int, run_id: int) -> bool:
+        with get_db_connection() as db:
+            cur = db.cursor()
+            cur.execute(
+                "SELECT id FROM qd_backtest_runs WHERE id = ? AND user_id = ?",
+                (int(run_id), int(user_id)),
+            )
+            row = cur.fetchone()
+            if not row:
+                cur.close()
+                return False
+            cur.execute("DELETE FROM qd_backtest_trades WHERE run_id = ?", (int(run_id),))
+            cur.execute("DELETE FROM qd_backtest_equity_points WHERE run_id = ?", (int(run_id),))
+            cur.execute(
+                "DELETE FROM qd_backtest_runs WHERE id = ? AND user_id = ?",
+                (int(run_id), int(user_id)),
+            )
+            deleted = int(cur.rowcount or 0) > 0
+            db.commit()
+            cur.close()
+        return deleted
+
     @staticmethod
     def _persist_details(cur, run_id: int, user_id: int, strategy_id: int | None, result: dict[str, Any]) -> None:
         for index, trade in enumerate(result.get("closedTrades") or [], start=1):
@@ -298,7 +320,205 @@ def _normalize_backtest_result(
         compatibility["legacyBackfill"] = True
         compatibility["backfilledFields"] = backfilled_fields
 
+    _enrich_symbol_display_names(result)
     return result
+
+
+def _split_market_symbol(raw: object) -> tuple[str, str]:
+    text = str(raw or "").strip()
+    if not text:
+        return "", ""
+    # Position keys may look like "CNStock:300408" or "CNStock:300408::long".
+    base = text.split("::", 1)[0]
+    if ":" in base:
+        market, symbol = base.split(":", 1)
+        return market.strip(), symbol.strip()
+    return "", base
+
+
+def _batch_lookup_symbol_names(pairs: list[tuple[str, str]]) -> dict[tuple[str, str], str]:
+    """Resolve display names from local symbol tables / seed (best-effort)."""
+    out: dict[tuple[str, str], str] = {}
+    if not pairs:
+        return out
+
+    by_market: dict[str, set[str]] = {}
+    for market, symbol in pairs:
+        m = (market or "").strip()
+        s = (symbol or "").strip()
+        if not s:
+            continue
+        by_market.setdefault(m or "", set()).add(s)
+
+    try:
+        with get_db_connection() as db:
+            cur = db.cursor()
+            for market, symbols in by_market.items():
+                sym_list = sorted(symbols)
+                if not sym_list:
+                    continue
+                placeholders = ",".join(["?"] * len(sym_list))
+                if market:
+                    cur.execute(
+                        f"""
+                        SELECT symbol, name FROM qd_market_symbols
+                        WHERE market = ? AND symbol IN ({placeholders})
+                          AND name IS NOT NULL AND name <> ''
+                        """,
+                        (market, *sym_list),
+                    )
+                else:
+                    cur.execute(
+                        f"""
+                        SELECT market, symbol, name FROM qd_market_symbols
+                        WHERE symbol IN ({placeholders})
+                          AND name IS NOT NULL AND name <> ''
+                        """,
+                        tuple(sym_list),
+                    )
+                for row in cur.fetchall() or []:
+                    if market:
+                        sym = str(row.get("symbol") or "")
+                        name = str(row.get("name") or "").strip()
+                        if sym and name:
+                            out[(market, sym)] = name
+                    else:
+                        mkt = str(row.get("market") or "")
+                        sym = str(row.get("symbol") or "")
+                        name = str(row.get("name") or "").strip()
+                        if sym and name:
+                            out[(mkt, sym)] = name
+                            out[("", sym)] = name
+            cur.close()
+    except Exception:
+        pass
+
+    missing = [
+        (market, symbol)
+        for market, symbol in pairs
+        if symbol and (market, symbol) not in out and (("", symbol) not in out)
+    ]
+    if missing:
+        try:
+            from app.services.symbol_name import resolve_symbol_name
+        except Exception:
+            resolve_symbol_name = None  # type: ignore
+        if resolve_symbol_name is not None:
+            for market, symbol in missing:
+                try:
+                    name = resolve_symbol_name(market or "CNStock", symbol)
+                except Exception:
+                    name = None
+                if name and str(name).strip() and str(name).strip().upper() != symbol.upper():
+                    out[(market, symbol)] = str(name).strip()
+    return out
+
+
+def _display_symbol(raw: object, name: str) -> str:
+    market, symbol = _split_market_symbol(raw)
+    code = symbol or str(raw or "").strip()
+    nm = (name or "").strip()
+    if nm and code and nm.upper() != code.upper():
+        return f"{nm} ({code})"
+    if nm:
+        return nm
+    if market and code:
+        return f"{market}:{code}"
+    return code
+
+
+def _enrich_symbol_display_names(result: dict[str, Any]) -> None:
+    """Attach human-readable names for CN/US/HK symbols in backtest detail tables."""
+    keys: list[str] = []
+
+    def _collect(value: object) -> None:
+        text = str(value or "").strip()
+        if text:
+            keys.append(text)
+
+    for snap in result.get("holdingSnapshots") or []:
+        if not isinstance(snap, dict):
+            continue
+        positions = snap.get("positions") or {}
+        if isinstance(positions, dict):
+            for key in positions.keys():
+                _collect(key)
+    for item in result.get("closedTrades") or result.get("trades") or []:
+        if isinstance(item, dict):
+            _collect(item.get("symbol") or item.get("position_key"))
+    for item in result.get("executions") or result.get("rawTrades") or []:
+        if isinstance(item, dict):
+            _collect(item.get("symbol") or item.get("position_key"))
+    for item in result.get("rebalanceRecords") or []:
+        if not isinstance(item, dict):
+            continue
+        for bucket in ("targetWeights", "actualWeights", "target_weights", "actual_weights"):
+            weights = item.get(bucket) or {}
+            if isinstance(weights, dict):
+                for key in weights.keys():
+                    _collect(key)
+    positions = result.get("positions") or {}
+    if isinstance(positions, dict):
+        for key in positions.keys():
+            _collect(key)
+    for row in (result.get("attribution") or {}).get("symbols") or []:
+        if isinstance(row, dict):
+            _collect(row.get("symbol"))
+
+    pairs = [_split_market_symbol(key) for key in keys]
+    pairs = [(m, s) for m, s in pairs if s]
+    if not pairs:
+        return
+    names = _batch_lookup_symbol_names(pairs)
+
+    def _name_for(raw: object) -> str:
+        market, symbol = _split_market_symbol(raw)
+        return names.get((market, symbol)) or names.get(("", symbol)) or ""
+
+    for snap in result.get("holdingSnapshots") or []:
+        if not isinstance(snap, dict):
+            continue
+        positions = snap.get("positions") or {}
+        if not isinstance(positions, dict):
+            continue
+        for key, pos in list(positions.items()):
+            if not isinstance(pos, dict):
+                continue
+            name = _name_for(key)
+            if name:
+                pos["name"] = name
+                pos["displaySymbol"] = _display_symbol(key, name)
+            else:
+                pos.setdefault("displaySymbol", str(key))
+
+    for collection in ("closedTrades", "trades", "executions", "rawTrades"):
+        for item in result.get(collection) or []:
+            if not isinstance(item, dict):
+                continue
+            raw = item.get("symbol") or item.get("position_key")
+            name = _name_for(raw)
+            if name:
+                item["name"] = name
+                item["displaySymbol"] = _display_symbol(raw, name)
+
+    for row in (result.get("attribution") or {}).get("symbols") or []:
+        if not isinstance(row, dict):
+            continue
+        raw = row.get("symbol")
+        name = _name_for(raw)
+        if name:
+            row["name"] = name
+            row["displaySymbol"] = _display_symbol(raw, name)
+
+    top_positions = result.get("positions") or {}
+    if isinstance(top_positions, dict):
+        for key, pos in list(top_positions.items()):
+            if not isinstance(pos, dict):
+                continue
+            name = _name_for(key)
+            if name:
+                pos["name"] = name
+                pos["displaySymbol"] = _display_symbol(key, name)
 
 
 def _backfill_equity_curve(
@@ -511,6 +731,18 @@ class FactorResearchRepository:
             row = cur.fetchone()
             cur.close()
         return self._hydrate(row, include_result=True) if row else None
+
+    def delete_run(self, *, user_id: int, run_id: int) -> bool:
+        with get_db_connection() as db:
+            cur = db.cursor()
+            cur.execute(
+                "DELETE FROM qd_factor_research_runs WHERE id = ? AND user_id = ?",
+                (int(run_id), int(user_id)),
+            )
+            deleted = int(cur.rowcount or 0) > 0
+            db.commit()
+            cur.close()
+        return deleted
 
     @staticmethod
     def _hydrate(row: dict[str, Any], *, include_result: bool) -> dict[str, Any]:

@@ -43,7 +43,7 @@ ADVANCED_KEYS = {
     'FINNHUB_API_KEY', 'FINNHUB_FREE_ONLY',
     'TRADING_ECONOMICS_CLIENT', 'TRADING_ECONOMICS_KEY',
     'COINGLASS_API_KEY', 'CRYPTOQUANT_API_KEY', 'TIINGO_API_KEY',
-    'TWELVE_DATA_API_KEY', 'ADANOS_API_KEY',
+    'TWELVE_DATA_API_KEY', 'TUSHARE_TOKEN', 'TUSHARE_HTTP_URL', 'ADANOS_API_KEY',
     # Agent gateway (operator-level)
     'AGENT_JOBS_MAX_WORKERS',
     'ENABLE_PENDING_ORDER_WORKER', 'DISABLE_RESTORE_RUNNING_STRATEGIES',
@@ -646,8 +646,8 @@ CONFIG_SCHEMA = {
                 'key': 'SPOT_CLOSE_SAFETY_RATIO',
                 'label': 'Spot Close Safety Ratio',
                 'type': 'number',
-                'default': '0.998',
-                'description': 'When closing spot long, sell qty is capped to (exchange free base × this ratio), then floored to lot step. Lower if full close fails due to fees (valid range 0.9–1.0).'
+                'default': '1.0',
+                'description': 'When closing spot long, sell qty is capped to (exchange free base × this ratio), then floored to lot step. Base-asset fees are already deducted from strategy inventory; lower only if a venue still rejects full closes (valid range 0.9–1.0).'
             },
             {
                 'key': 'SPOT_OPEN_QUOTE_BUFFER',
@@ -873,6 +873,23 @@ CONFIG_SCHEMA = {
                 'link': 'https://twelvedata.com/apikey',
                 'link_text': 'settings.link.getApiKey',
                 'description': 'Twelve Data API key for CN/HK stock K-lines (free 800 credits/day)'
+            },
+            {
+                'key': 'TUSHARE_TOKEN',
+                'label': 'Tushare Token',
+                'type': 'password',
+                'required': False,
+                'link': 'https://tushare.pro/register',
+                'link_text': 'settings.link.getToken',
+                'description': 'Tushare Pro token for China A-share daily bars, index weights, and factor panels (recommended primary CNStock source)'
+            },
+            {
+                'key': 'TUSHARE_HTTP_URL',
+                'label': 'Tushare HTTP URL',
+                'type': 'text',
+                'required': False,
+                'default': '',
+                'description': 'Optional Tushare Pro HTTP endpoint override (e.g. private mirror). Leave empty for the official API.'
             },
             {
                 'key': 'ADANOS_API_KEY',

@@ -158,12 +158,15 @@ def nasdaq100() -> list[dict]:
 def csi(index_code: str) -> list[dict]:
     import akshare as ak  # type: ignore
 
+    from app.data_sources.tushare_cn import tencent_code_to_ts_code
+
     frame = ak.index_stock_cons_weight_csindex(symbol=index_code)
     rows = []
     for index, item in enumerate(frame.to_dict("records"), start=1):
-        symbol = str(item.get("品种代码") or item.get("成分券代码") or item.get("代码") or "").strip().zfill(6)
+        raw = str(item.get("品种代码") or item.get("成分券代码") or item.get("代码") or "").strip().zfill(6)
         name = str(item.get("品种名称") or item.get("成分券名称") or item.get("名称") or "").strip()
-        if symbol.isdigit() and len(symbol) == 6:
+        if raw.isdigit() and len(raw) == 6:
+            symbol = tencent_code_to_ts_code(raw)
             raw_weight = item.get("权重")
             weight = float(raw_weight) / 100.0 if raw_weight not in (None, "") else None
             rows.append({

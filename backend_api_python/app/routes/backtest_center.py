@@ -82,21 +82,51 @@ def _source(payload: dict[str, Any], user_id: int) -> tuple[str, int | None, int
     return code, source_id, strategy_id, strategy_name
 
 
+def _parse_backtest_day(value: object, *, end_of_day: bool = False) -> datetime:
+    """Accept YYYY-MM-DD or ISO datetime; always return a naive calendar day bound."""
+    raw = str(value or "").strip()
+    if not raw:
+        raise ValueError("strategyV2.dateRangeRequired")
+    parsed: datetime | None = None
+    for candidate in (raw, raw.replace("Z", "+00:00")):
+        try:
+            parsed = datetime.strptime(candidate[:10], "%Y-%m-%d")
+            break
+        except ValueError:
+            parsed = None
+        try:
+            parsed = datetime.fromisoformat(candidate)
+            break
+        except ValueError:
+            parsed = None
+    if parsed is None:
+        raise ValueError("strategyV2.invalidDateRange")
+    if parsed.tzinfo is not None:
+        parsed = parsed.replace(tzinfo=None)
+    if end_of_day:
+        return parsed.replace(hour=23, minute=59, second=59, microsecond=0)
+    return parsed.replace(hour=0, minute=0, second=0, microsecond=0)
+
+
 def _prepare_run(payload: dict[str, Any], user_id: int) -> dict[str, Any]:
     code, source_id, strategy_id, strategy_name = _source(payload, user_id)
     start_raw = str(payload.get("startDate") or "").strip()
     end_raw = str(payload.get("endDate") or "").strip()
     if not start_raw or not end_raw:
         raise ValueError("strategyV2.dateRangeRequired")
-    start_date = datetime.strptime(start_raw, "%Y-%m-%d")
-    end_date = datetime.strptime(end_raw, "%Y-%m-%d").replace(hour=23, minute=59, second=59)
+    start_date = _parse_backtest_day(start_raw)
+    end_date = _parse_backtest_day(end_raw, end_of_day=True)
     leverage_enabled = bool(payload.get("leverageEnabled", False))
+    try:
+        initial_capital = float(payload.get("initialCapital") or 10_000)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("strategyV2.invalidInitialCapital") from exc
     return {
         "user_id": user_id,
         "code": code,
         "start_date": start_date,
         "end_date": end_date,
-        "initial_capital": float(payload.get("initialCapital") or 10_000),
+        "initial_capital": initial_capital,
         "leverage_enabled": leverage_enabled,
         "leverage": float(payload.get("leverage") or 1),
         "commission": parse_rate(payload.get("commission"), default=default_commission_if_missing(None)),
@@ -210,10 +240,37 @@ def run_strategy_backtest():
         })
     except BacktestRangeLimitError as exc:
         _refund_backtest_credits(billing, user_id, charge)
+        logger.warning("backtest range limit: %s details=%s", exc, exc.details)
         return jsonify({"code": 0, "msg": str(exc), "data": exc.details}), 400
     except ValueError as exc:
         _refund_backtest_credits(billing, user_id, charge)
-        return jsonify({"code": 0, "msg": str(exc), "data": None}), 400
+        payload = request.get_json(silent=True) or {}
+        err = str(exc)
+        logger.warning(
+            "backtest ValueError: %r payload_keys=%s sourceId=%s start=%s end=%s capital=%s params=%s",
+            err,
+            sorted(payload.keys()),
+            payload.get("sourceId") or payload.get("source_id"),
+            payload.get("startDate"),
+            payload.get("endDate"),
+            payload.get("initialCapital"),
+            payload.get("params"),
+        )
+        hints = {
+            "strategyV2.dateRangeRequired": "请选择回测起止日期",
+            "strategyV2.invalidDateRange": "回测日期无效或格式错误，请使用 YYYY-MM-DD",
+            "strategyV2.invalidInitialCapital": "初始资金必须大于 0",
+            "strategyV2.sourceNotFound": "未找到策略源，请重新从模板创建",
+            "strategyV2.codeRequired": "策略代码为空，请重新选择策略",
+            "strategyV2.universeHasNoData": "成分池无可用标的",
+            "strategyV2.noMarketData": "无法拉取行情数据，请检查 Tushare/行情源",
+            "strategyV2.universeTooLarge": "成分池过大，请降低 universe_top_n",
+            "strategyV2.backtestRangeLimit": "回测区间过长（含 warmup 超出上限）",
+        }
+        key = err.split(":", 1)[0] if err.startswith("strategyV2.") else err
+        hint = hints.get(key, "")
+        msg = f"{hint} ({err})" if hint else err
+        return jsonify({"code": 0, "msg": msg, "data": {"error": err}}), 400
     except Exception as exc:
         _refund_backtest_credits(billing, user_id, charge)
         logger.exception("Strategy backtest failed")
@@ -241,8 +298,8 @@ def run_factor_research():
         result = get_strategy_backtest_service().research_factor(
             user_id=int(g.user_id),
             code=code,
-            start_date=datetime.strptime(start_raw, "%Y-%m-%d"),
-            end_date=datetime.strptime(end_raw, "%Y-%m-%d").replace(hour=23, minute=59, second=59),
+            start_date=_parse_backtest_day(start_raw),
+            end_date=_parse_backtest_day(end_raw, end_of_day=True),
             factor_id=factor_id,
             groups=groups,
             holding_period=holding_period,
@@ -313,6 +370,28 @@ def get_factor_research_run():
         return jsonify({"code": 0, "msg": str(exc), "data": None}), 400
     except Exception as exc:
         logger.exception("Factor research lookup failed")
+        return jsonify({"code": 0, "msg": str(exc), "data": None}), 500
+
+
+@backtest_center_blp.route("/factor-research/delete", methods=["POST"])
+@login_required
+def delete_factor_research_run():
+    try:
+        payload = request.get_json(silent=True) or {}
+        run_id = _positive_int(payload.get("runId") or request.args.get("runId"))
+        if not run_id:
+            raise ValueError("strategyV2.runIdRequired")
+        deleted = get_factor_research_repository().delete_run(
+            user_id=int(g.user_id),
+            run_id=run_id,
+        )
+        if not deleted:
+            return jsonify({"code": 0, "msg": "strategyV2.factorResearchRunNotFound", "data": None}), 404
+        return jsonify({"code": 1, "msg": "success", "data": {"runId": run_id}})
+    except ValueError as exc:
+        return jsonify({"code": 0, "msg": str(exc), "data": None}), 400
+    except Exception as exc:
+        logger.exception("Factor research delete failed")
         return jsonify({"code": 0, "msg": str(exc), "data": None}), 500
 
 
@@ -405,6 +484,28 @@ def get_strategy_backtest():
         return jsonify({"code": 0, "msg": str(exc), "data": None}), 400
     except Exception as exc:
         logger.exception("Backtest lookup failed")
+        return jsonify({"code": 0, "msg": str(exc), "data": None}), 500
+
+
+@backtest_center_blp.route("/delete", methods=["POST"])
+@login_required
+def delete_strategy_backtest():
+    try:
+        payload = request.get_json(silent=True) or {}
+        run_id = _positive_int(payload.get("runId") or request.args.get("runId"))
+        if not run_id:
+            raise ValueError("strategyV2.runIdRequired")
+        deleted = get_strategy_backtest_repository().delete_run(
+            user_id=int(g.user_id),
+            run_id=run_id,
+        )
+        if not deleted:
+            return jsonify({"code": 0, "msg": "strategyV2.runNotFound", "data": None}), 404
+        return jsonify({"code": 1, "msg": "success", "data": {"runId": run_id}})
+    except ValueError as exc:
+        return jsonify({"code": 0, "msg": str(exc), "data": None}), 400
+    except Exception as exc:
+        logger.exception("Backtest delete failed")
         return jsonify({"code": 0, "msg": str(exc), "data": None}), 500
 
 

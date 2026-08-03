@@ -10,10 +10,13 @@ WHERE template_key NOT IN (
     'strategy_v2_indicator_resonance',
     'strategy_v2_macd_kdj',
     'strategy_v2_supertrend',
+    'strategy_v2_csi300_enhanced',
+    'strategy_v2_csi300_enhanced_v2',
     'strategy_v2_market_cap_barbell',
     'strategy_v2_momentum_top_n',
     'strategy_v2_low_volatility',
-    'strategy_v2_quality_growth'
+    'strategy_v2_quality_growth',
+    'strategy_v2_external_alpha_score'
 );
 
 INSERT INTO qd_script_templates
@@ -298,7 +301,7 @@ BTC perpetual momentum with state-transition entries confirmed by MACD and stoch
 # @param kdj_smooth_k int 3 range=1:20:1
 # @param kdj_smooth_d int 3 range=1:20:1
 # @param overbought float 85 range=50:100:1
-# @param target_pct float 4.75 range=0.1:5:0.05
+# @param target_pct float 0.95 range=0.1:5:0.05
 # @param stop_loss_pct float 0.02 range=0.005:0.2:0.005
 # @param trailing_activation_pct float 0.05 range=0.005:0.5:0.005
 # @param trailing_stop_pct float 0.01 range=0.005:0.2:0.005
@@ -320,7 +323,7 @@ def handle_data(context, data):
     kdj_smooth_k = int(context.params.get("kdj_smooth_k", 3))
     kdj_smooth_d = int(context.params.get("kdj_smooth_d", 3))
     overbought = float(context.params.get("overbought", 85))
-    target_pct = float(context.params.get("target_pct", 4.75))
+    target_pct = float(context.params.get("target_pct", 0.95))
     stop_loss_pct = float(context.params.get("stop_loss_pct", 0.02))
     trailing_activation_pct = float(context.params.get("trailing_activation_pct", 0.05))
     trailing_stop_pct = float(context.params.get("trailing_stop_pct", 0.01))
@@ -353,7 +356,7 @@ def handle_data(context, data):
         )
     elif exit_signal and is_long:
         order_target_percent(g.symbol, 0.0, reason="macd_kdj_exit")
-$macdkdj$, '{"params":[{"name":"fast_period","type":"integer","default":12,"min":2,"max":100,"step":1,"labelKey":"trading-assistant.templateParam.fast_period.label"},{"name":"slow_period","type":"integer","default":26,"min":3,"max":200,"step":1,"labelKey":"trading-assistant.templateParam.slow_period.label"},{"name":"signal_period","type":"integer","default":9,"min":2,"max":100,"step":1,"labelKey":"strategyV2.params.signalPeriod"},{"name":"kdj_period","type":"integer","default":9,"min":2,"max":100,"step":1,"labelKey":"strategyV2.params.kdjPeriod"},{"name":"kdj_smooth_k","type":"integer","default":3,"min":1,"max":20,"step":1,"labelKey":"strategyV2.params.kdjSmoothK"},{"name":"kdj_smooth_d","type":"integer","default":3,"min":1,"max":20,"step":1,"labelKey":"strategyV2.params.kdjSmoothD"},{"name":"overbought","type":"number","default":85,"min":50,"max":100,"step":1,"labelKey":"trading-assistant.templateParam.overbought.label"},{"name":"target_pct","type":"number","default":4.75,"min":0.1,"max":5,"step":0.05,"labelKey":"strategyV2.params.targetExposure"},{"name":"stop_loss_pct","type":"percent","default":0.02,"min":0.005,"max":0.2,"step":0.005,"labelKey":"strategyV2.params.stopLoss"},{"name":"trailing_activation_pct","type":"percent","default":0.05,"min":0.005,"max":0.5,"step":0.005,"labelKey":"strategyV2.params.trailingActivation"},{"name":"trailing_stop_pct","type":"percent","default":0.01,"min":0.005,"max":0.2,"step":0.005,"labelKey":"strategyV2.params.trailingDrawdown"}]}'::jsonb, '["strategy-v2","cta","ta-lib","macd","kdj","crypto","swap","risk"]'::jsonb, 'bar-chart', 'gold', 70, TRUE, '{"source":"system_seed","version":9,"apiVersion":2}'::jsonb, NOW()),
+$macdkdj$, '{"params":[{"name":"fast_period","type":"integer","default":12,"min":2,"max":100,"step":1,"labelKey":"trading-assistant.templateParam.fast_period.label"},{"name":"slow_period","type":"integer","default":26,"min":3,"max":200,"step":1,"labelKey":"trading-assistant.templateParam.slow_period.label"},{"name":"signal_period","type":"integer","default":9,"min":2,"max":100,"step":1,"labelKey":"strategyV2.params.signalPeriod"},{"name":"kdj_period","type":"integer","default":9,"min":2,"max":100,"step":1,"labelKey":"strategyV2.params.kdjPeriod"},{"name":"kdj_smooth_k","type":"integer","default":3,"min":1,"max":20,"step":1,"labelKey":"strategyV2.params.kdjSmoothK"},{"name":"kdj_smooth_d","type":"integer","default":3,"min":1,"max":20,"step":1,"labelKey":"strategyV2.params.kdjSmoothD"},{"name":"overbought","type":"number","default":85,"min":50,"max":100,"step":1,"labelKey":"trading-assistant.templateParam.overbought.label"},{"name":"target_pct","type":"number","default":0.95,"min":0.1,"max":5,"step":0.05,"labelKey":"strategyV2.params.targetExposure"},{"name":"stop_loss_pct","type":"percent","default":0.02,"min":0.005,"max":0.2,"step":0.005,"labelKey":"strategyV2.params.stopLoss"},{"name":"trailing_activation_pct","type":"percent","default":0.05,"min":0.005,"max":0.5,"step":0.005,"labelKey":"strategyV2.params.trailingActivation"},{"name":"trailing_stop_pct","type":"percent","default":0.01,"min":0.005,"max":0.2,"step":0.005,"labelKey":"strategyV2.params.trailingDrawdown"}]}'::jsonb, '["strategy-v2","cta","ta-lib","macd","kdj","crypto","swap","risk"]'::jsonb, 'bar-chart', 'gold', 70, TRUE, '{"source":"system_seed","version":10,"apiVersion":2}'::jsonb, NOW()),
 
 ('strategy_v2_supertrend', 'script', 'SuperTrend', 'A configurable SPY SuperTrend strategy using ATR trailing bands.', $supertrend$"""
 SuperTrend
@@ -449,48 +452,52 @@ def rebalance(context, data):
         order_target_percent(symbol, weight, reason="market_cap_barbell")
 $marketcap$, '{"params":[{"name":"per_side","type":"integer","default":3,"min":1,"max":6,"step":1,"labelKey":"strategyV2.params.perSide"},{"name":"min_roe","type":"number","default":0,"min":-1,"max":1,"step":0.01,"labelKey":"strategyV2.params.minRoe"},{"name":"max_weight","type":"percent","default":0.2,"min":0.05,"max":1,"step":0.05,"labelKey":"strategyV2.params.maxWeight"}]}'::jsonb, '["strategy-v2","portfolio","cross-sectional","fundamental","market-cap"]'::jsonb, 'appstore', 'geekblue', 110, TRUE, '{"source":"system_seed","version":8,"apiVersion":2}'::jsonb, NOW()),
 
-('strategy_v2_momentum_top_n', 'portfolio_strategy', 'Momentum Top-N Rotation', 'A weekly U.S. stock portfolio selecting the strongest trailing momentum.', $momentum$"""
+('strategy_v2_momentum_top_n', 'portfolio_strategy', 'Momentum Top-N Rotation', 'Weekly CSI500 (中证500) long-only Top-N by trailing price momentum.', $momentum$"""
 Momentum Top-N Rotation
-Weekly cross-sectional rotation into the strongest trailing momentum names.
+Weekly CSI500 long-only rotation into the strongest trailing momentum names.
 """
 
-# @param lookback int 60 range=10:250:5
-# @param top_n int 4 range=1:10:1
-# @param max_weight float 0.25 range=0.05:1:0.05
+# @param lookback int 60 Momentum lookback days range=10:250:5
+# @param top_n int 10 Number of holdings range=1:30:1
+# @param max_weight float 0.12 Max weight per name range=0.05:1:0.05
 
 def initialize(context):
-    g.universe = [
-        "USStock:AAPL", "USStock:MSFT", "USStock:NVDA", "USStock:AMZN", "USStock:META",
-        "USStock:GOOGL", "USStock:AVGO", "USStock:COST", "USStock:JPM", "USStock:XOM",
-    ]
-    context.set_universe(g.universe)
-    context.set_benchmark("USStock:SPY")
-    context.subscribe(frequency="1d")
-    context.set_warmup(260)
+    context.set_universe(pool="csi500")
+    context.set_benchmark("CNStock:000905.SH")
+    context.subscribe(frequency="1d", fields=["open", "high", "low", "close", "volume"])
+    context.set_warmup(130)
+    context.set_metadata(direction_mode="long_only")
     run_weekly(rebalance, weekday=1, time="09:35")
 
 
 def rebalance(context, data):
     lookback = int(context.params.get("lookback", 60))
-    top_n = int(context.params.get("top_n", 4))
-    max_weight = float(context.params.get("max_weight", 0.25))
+    top_n = int(context.params.get("top_n", 10))
+    max_weight = float(context.params.get("max_weight", 0.12))
     scores = {}
-    for symbol in g.universe:
-        bars = get_history(lookback + 1, "1d", "close", symbol)
-        if len(bars) < lookback + 1:
+    for symbol in get_universe_stocks():
+        try:
+            bars = get_history(lookback + 1, "1d", "close", symbol)
+        except Exception:
+            continue
+        if bars is None or len(bars) < lookback + 1:
             continue
         first = float(bars["close"].iloc[0])
         last = float(bars["close"].iloc[-1])
         if first > 0:
             scores[symbol] = last / first - 1.0
-    selected = [symbol for symbol, score in sorted(scores.items(), key=lambda item: item[1], reverse=True)[:top_n] if score > 0]
+    selected = [
+        symbol
+        for symbol, score in sorted(scores.items(), key=lambda item: item[1], reverse=True)[:top_n]
+        if score > 0
+    ]
     for symbol in get_positions().keys():
         if symbol not in selected:
             order_target_percent(symbol, 0.0, reason="momentum_removed")
     weight = min(max_weight, 1.0 / len(selected)) if selected else 0.0
     for symbol in selected:
         order_target_percent(symbol, weight, reason="momentum_top_n")
-$momentum$, '{"params":[{"name":"lookback","type":"integer","default":60,"min":10,"max":250,"step":5,"labelKey":"strategyV2.params.lookback"},{"name":"top_n","type":"integer","default":4,"min":1,"max":10,"step":1,"labelKey":"strategyV2.params.topN"},{"name":"max_weight","type":"percent","default":0.25,"min":0.05,"max":1,"step":0.05,"labelKey":"strategyV2.params.maxWeight"}]}'::jsonb, '["strategy-v2","portfolio","cross-sectional","momentum","rotation"]'::jsonb, 'rocket', 'blue', 120, TRUE, '{"source":"system_seed","version":8,"apiVersion":2}'::jsonb, NOW()),
+$momentum$, '{"params":[{"name":"lookback","type":"integer","default":60,"min":10,"max":250,"step":5,"labelKey":"strategyV2.params.lookback"},{"name":"top_n","type":"integer","default":10,"min":1,"max":30,"step":1,"labelKey":"strategyV2.params.topN"},{"name":"max_weight","type":"percent","default":0.12,"min":0.05,"max":1,"step":0.05,"labelKey":"strategyV2.params.maxWeight"}]}'::jsonb, '["strategy-v2","portfolio","cross-sectional","momentum","rotation","csi500","cn-stock"]'::jsonb, 'rocket', 'blue', 120, TRUE, '{"source":"system_seed","version":9,"apiVersion":2}'::jsonb, NOW()),
 
 ('strategy_v2_low_volatility', 'portfolio_strategy', 'Low Volatility Rotation', 'A weekly U.S. stock portfolio selecting the lowest realized volatility names.', $lowvol$"""
 Low Volatility Rotation

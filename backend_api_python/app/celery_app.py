@@ -46,6 +46,7 @@ celery_app.conf.update(
         "app.tasks.agent_jobs",
         "app.tasks.fast_analysis",
         "app.tasks.maintenance",
+        "app.tasks.csi300_enhanced",
     ),
     task_routes={
         "quantdinger.tasks.fast_analysis": {"queue": "ai"},
@@ -53,6 +54,7 @@ celery_app.conf.update(
         "quantdinger.tasks.reflection": {"queue": "maintenance"},
         "quantdinger.tasks.ai_calibration": {"queue": "maintenance"},
         "quantdinger.tasks.market_catalog_sync": {"queue": "maintenance"},
+        "quantdinger.tasks.csi300_enhanced_daily_sync": {"queue": "maintenance"},
         "quantdinger.tasks.worker_heartbeat": {"queue": "maintenance"},
         "quantdinger.tasks.cleanup_runtime_metadata": {"queue": "maintenance"},
     },
@@ -68,6 +70,10 @@ celery_app.conf.update(
         "market-catalog-sync": {
             "task": "quantdinger.tasks.market_catalog_sync",
             "schedule": max(900, int(os.getenv("MARKET_CATALOG_SYNC_INTERVAL_SEC", "86400"))),
+        },
+        "csi300-enhanced-daily-sync": {
+            "task": "quantdinger.tasks.csi300_enhanced_daily_sync",
+            "schedule": max(900, int(os.getenv("CSI300_ENHANCED_SYNC_INTERVAL_SEC", "86400"))),
         },
         "celery-worker-heartbeat": {
             "task": "quantdinger.tasks.worker_heartbeat",

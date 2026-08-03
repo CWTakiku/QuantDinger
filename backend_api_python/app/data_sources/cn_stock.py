@@ -1,6 +1,9 @@
 """
 中国A股数据源 — 多层 fallback
 
+已配置 TUSHARE_TOKEN:
+  日线 → Tushare（Tier 0） → Twelve Data → 腾讯 → yfinance → AkShare
+
 有 TWELVE_DATA_API_KEY:
   所有周期 → Twelve Data（主） → 腾讯日/周线 → yfinance → AkShare
 
@@ -22,13 +25,18 @@ from app.data_sources.asia_stock_kline import (
     fetch_akshare_minute_klines,
     fetch_akshare_weekly_klines,
 )
+from app.data_sources.tushare_cn import (
+    daily_bars_cover_today,
+    fetch_tushare_daily_klines,
+    is_tushare_configured,
+)
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
 
 class CNStockDataSource(BaseDataSource):
-    """A股数据源（TwelveData + Tencent + yfinance + AkShare）"""
+    """A股数据源（Tushare + TwelveData + Tencent + yfinance + AkShare）"""
 
     name = "CNStock/multi-source"
 
@@ -62,6 +70,21 @@ class CNStockDataSource(BaseDataSource):
         tf = normalize_chart_timeframe(timeframe)
         lim = max(int(limit or 300), 1)
 
+        # Tier 0: Tushare daily when it already includes today's Shanghai bar.
+        # Otherwise fall through — Tushare often lags the live session vs Tencent.
+        if tf in ("1D",) and is_tushare_configured():
+            rows = fetch_tushare_daily_klines(
+                tencent_code=code, limit=lim, before_time=before_time
+            )
+            if rows and (before_time is not None or daily_bars_cover_today(rows)):
+                return self.filter_and_limit(
+                    rows,
+                    limit=lim,
+                    before_time=before_time,
+                    after_time=after_time,
+                    truncate=(after_time is None),
+                )
+
         # Tier 1: Twelve Data (paid, most reliable)
         rows = fetch_twelvedata_klines(
             is_hk=False, tencent_code=code, timeframe=tf, limit=lim, before_time=before_time
@@ -75,7 +98,7 @@ class CNStockDataSource(BaseDataSource):
                 truncate=(after_time is None),
             )
 
-        # Tier 2: Tencent for daily/weekly (fast, free)
+        # Tier 2: Tencent for daily/weekly (fast, free, often freshest intraday)
         if tf in ("1D", "1W"):
             tf_map = {"1D": "day", "1W": "week"}
             period = tf_map.get(tf, "day")

@@ -24,7 +24,7 @@ from .models import InstrumentSpec, StrategyManifest
 from .market_data import load_strategy_frame
 from .runtime import StrategyV2BacktestRunner
 from .snapshot import MarketDataSnapshotStore, canonical_frame_bytes
-from .storage import StrategyBacktestRepository
+from .storage import StrategyBacktestRepository, _enrich_symbol_display_names
 
 
 class StrategyV2BacktestService:
@@ -150,6 +150,7 @@ class StrategyV2BacktestService:
             manifest=manifest,
             start_date=start_date,
             end_date=end_date,
+            params=params,
         )
         if not candidates:
             raise StrategyV2ContractError("strategyV2.universeHasNoData")
@@ -174,12 +175,18 @@ class StrategyV2BacktestService:
             frames = enricher(frames, candidates)
             self.validate_fundamental_dependencies(frames, manifest)
 
+        allowed_keys = {item["key"] for item in candidates}
+
         def resolve_universe(reference: str, timestamp: pd.Timestamp) -> list[str]:
             del reference
             if not universe_id:
-                return [item["key"] for item in candidates]
+                return [item["key"] for item in candidates if item["key"] in frames]
             members = self.universe_service.resolve_members(user_id, universe_id, as_of=timestamp.date())
-            return [_member_key(item) for item in members]
+            keys = [_member_key(item) for item in members]
+            # Keep runtime universe aligned with fetched candidates (e.g. universe_top_n).
+            # Fail closed: empty PIT membership must NOT expand to the full candidate set
+            # (that was membership look-ahead when snapshots were current-only).
+            return [key for key in keys if key in allowed_keys and key in frames]
 
         runner = StrategyV2BacktestRunner(
             code=code,
@@ -275,6 +282,8 @@ class StrategyV2BacktestService:
             "fundingMode": "not_modeled",
         }
 
+        _enrich_symbol_display_names(result)
+
         run_id = None
         if persist:
             if self.data_kind != "market":
@@ -307,6 +316,7 @@ class StrategyV2BacktestService:
         manifest: StrategyManifest,
         start_date: datetime,
         end_date: datetime,
+        params: dict[str, Any] | None = None,
     ) -> tuple[list[dict[str, Any]], int | None]:
         if manifest.universe.kind == "static":
             return [_instrument_member(item) for item in manifest.universe.instruments], None
@@ -325,6 +335,17 @@ class StrategyV2BacktestService:
         limit = max(1, int(os.getenv("STRATEGY_V2_MAX_SYMBOLS", "600") or 600))
         if len(members) > limit:
             raise StrategyV2ContractError("strategyV2.universeTooLarge")
+        top_n = 0
+        try:
+            top_n = int((params or {}).get("universe_top_n") or 0)
+        except (TypeError, ValueError):
+            top_n = 0
+        if top_n > 0 and len(members) > top_n:
+            members = sorted(
+                members,
+                key=lambda item: float(item.get("weight") or 0.0),
+                reverse=True,
+            )[:top_n]
         return [{**item, "key": _member_key(item)} for item in members], universe_id
 
     def fetch_frames(
@@ -421,9 +442,22 @@ def _warmup_calendar_days(frequency: str, warmup_bars: int) -> int:
     return backtest_warmup_calendar_days(frequency, warmup_bars)
 
 
+_POOL_DEFAULT_BENCHMARKS = {
+    "csi300": InstrumentSpec(market="CNStock", symbol="000300.SH", market_type="spot"),
+    "hs300": InstrumentSpec(market="CNStock", symbol="000300.SH", market_type="spot"),
+    "csi500": InstrumentSpec(market="CNStock", symbol="000905.SH", market_type="spot"),
+    "zz500": InstrumentSpec(market="CNStock", symbol="000905.SH", market_type="spot"),
+}
+
+
 def _benchmark_for_manifest(manifest: StrategyManifest) -> InstrumentSpec | None:
     if manifest.benchmark is not None:
         return manifest.benchmark
+    # Dynamic pool universes: prefer the matching local index over US SPY.
+    reference = str(manifest.universe.reference or "").strip()
+    pool_key = reference.split(":", 1)[-1].strip().lower() if reference else ""
+    if pool_key in _POOL_DEFAULT_BENCHMARKS:
+        return _POOL_DEFAULT_BENCHMARKS[pool_key]
     if manifest.strategy_type == "portfolio" or manifest.universe.kind != "static":
         return InstrumentSpec(market="USStock", symbol="SPY", market_type="spot")
     if not manifest.universe.instruments:
@@ -519,9 +553,15 @@ def _frame_provenance(
 
 
 def _member_key(member: dict[str, Any]) -> str:
+    market = str(member.get("market") or "")
+    symbol = str(member.get("symbol") or "")
+    if market.strip().upper() == "CNSTOCK":
+        from app.markets.cn_stock.symbols import canonicalize_cn_symbol
+
+        symbol = canonicalize_cn_symbol(symbol) or symbol
     item = InstrumentSpec(
-        market=str(member.get("market") or ""),
-        symbol=str(member.get("symbol") or ""),
+        market=market,
+        symbol=symbol,
         exchange_id=str(member.get("exchange_id") or ""),
         market_type=str(member.get("market_type") or ""),
         instrument_id=str(member.get("instrument_id") or ""),

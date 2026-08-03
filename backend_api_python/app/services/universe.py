@@ -371,7 +371,13 @@ class UniverseService:
                 member["market"], member["symbol"], member["exchange_id"],
                 member["market_type"], member["instrument_id"],
             )
-            deduped[key] = member
+            existing = deduped.get(key)
+            # Keep the largest weight seen in-range so universe_top_n fetch
+            # does not drop historically heavy names that later shrank.
+            if existing is None or float(member.get("weight") or 0.0) > float(
+                existing.get("weight") or 0.0
+            ):
+                deduped[key] = member
         return [deduped[key] for key in sorted(deduped)]
 
     def create_snapshot(self, user_id: int, universe_id: int, *, as_of: Any = None) -> dict:
@@ -479,9 +485,15 @@ def _serialize_universe(row: dict) -> dict:
 
 
 def _serialize_member(row: dict) -> dict:
+    market = str(row.get("market") or "")
+    symbol = str(row.get("symbol") or "")
+    if market.strip().upper() == "CNSTOCK":
+        from app.markets.cn_stock.symbols import canonicalize_cn_symbol
+
+        symbol = canonicalize_cn_symbol(symbol) or symbol
     return {
-        "market": str(row.get("market") or ""),
-        "symbol": str(row.get("symbol") or ""),
+        "market": market,
+        "symbol": symbol,
         "name": str(row.get("name") or ""),
         "exchange_id": str(row.get("exchange_id") or ""),
         "market_type": str(row.get("market_type") or ""),
