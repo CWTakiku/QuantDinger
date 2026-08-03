@@ -509,6 +509,28 @@ def delete_strategy_backtest():
         return jsonify({"code": 0, "msg": str(exc), "data": None}), 500
 
 
+@backtest_center_blp.route("/external-alpha/panels", methods=["GET"])
+@login_required
+def list_external_alpha_score_panels():
+    """List imported external alpha (source, version) panels for backtest param selects."""
+    try:
+        from app.services.external_alpha.store import list_external_alpha_panels
+
+        source = request.args.get("source")
+        panels = list_external_alpha_panels(source=source)
+        sources = sorted({str(item.get("source") or "") for item in panels if item.get("source")})
+        return jsonify(
+            {
+                "code": 1,
+                "msg": "success",
+                "data": {"panels": panels, "sources": sources},
+            }
+        )
+    except Exception as exc:
+        logger.exception("List external alpha panels failed")
+        return jsonify({"code": 0, "msg": str(exc), "data": None}), 500
+
+
 def _positive_int(value: Any) -> int | None:
     try:
         parsed = int(value)

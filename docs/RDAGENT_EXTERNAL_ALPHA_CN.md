@@ -12,9 +12,25 @@
 | 启停任务 | `POST /api/rdagent/jobs`、`POST .../stop` | `fin_factor` / `fin_quant`，`step_n` ≤ 20 |
 | 日志 / 会话 | `GET .../logs`、`GET /api/rdagent/sessions` | 会话来自工作区 `log/` |
 | RD UI | `GET/POST /api/rdagent/ui*` | 外链 Streamlit **19899** |
-| 分数导入 | `POST /api/rdagent/import-from-session` | 导出会话 → `qd_external_alpha_scores` |
+| 分数导入 | `POST /api/rdagent/import-from-session` | 导出会话 → `qd_external_alpha_scores`；可选 `loop_index` 按轮次导入 |
+| 会话深度 | `GET /api/rdagent/sessions/<id>/detail?include=...` | SOTA 因子库、模型摘要、可导出 Loop 列表 |
+| 因子矩阵 | `GET .../factor-matrix`、`GET .../factor-matrix.csv` | parquet 列清单 + 抽样截面；CSV 下载（可截断） |
+| 标的池 | `GET /api/rdagent/universes` | CNStock 池 +「全市场」；启动任务传 `universe_code` |
 
-OpenAPI 契约见 `docs/api/openapi.yaml`（RDAgent 标签，含 `import-from-session`）。
+OpenAPI 契约见 `docs/api/openapi.yaml`（RDAgent 标签）。
+
+### 会话深度（SOTA 库 / 模型 / 因子矩阵 / 按 Loop 导入）
+
+会话详情页（`/rdagent/sessions/<id>`）通过 Bridge 只读解析 `log/<session>/Loop_*` 与 workspace 产物：
+
+| 能力 | 说明 |
+|------|------|
+| **累积 SOTA 因子库** | `summary.sota_library[]`：各成功因子环采纳的因子名、首次 Loop、公式摘要；展开行懒加载 `factor.py`（`include=code,sota_library`） |
+| **SOTA 模型** | `summary.sota_model`：最后一次 `decision=True` 的模型环（结构、超参、`model.py`、训练日志） |
+| **按 Loop 导入** | 导入表单选 `exportable_loops` 中的轮次；POST 带 `loop_index`，默认 version 为 `session_<id>_loop<N>`；未选则仍取全会话最新 `pred.pkl` |
+| **因子矩阵** | Tab 展示 `combined_factors_df.parquet` 全部列与覆盖区间；`?loop_index=&sample_dates=&max_symbols=` 抽样预览；CSV 导出 `?max_rows=`（超限响应头 `X-Factor-Matrix-Truncated`） |
+
+Bridge 对应路由：`GET /v1/sessions/<id>/detail`、`GET .../factor-matrix(.csv)`、`POST /v1/export`（body 可选 `loop_index`）。设计详见 `docs/superpowers/specs/2026-08-03-research-factory-session-depth-design.md`。
 
 ### 启动 Bridge（19901）
 
@@ -28,6 +44,15 @@ cp .env.example .env   # 设置 RDAGENT_BRIDGE_TOKEN
 chmod +x scripts/run_rdagent_bridge.sh
 ./scripts/run_rdagent_bridge.sh
 # 健康检查: curl -s http://127.0.0.1:19901/health
+```
+
+macOS 可用 LaunchAgent 常驻（watchdog 自动拉起）：
+
+```bash
+# 安装: rdagent-workspace/scripts/install_bridge_launchagent.sh
+launchctl kickstart -k gui/$(id -u)/com.quantdinger.rdagent-bridge   # 重启
+# 或 kill 当前进程，watchdog 会秒级重建:
+pkill -f "python -m rdagent_bridge.app"
 ```
 
 ### QD 侧环境变量

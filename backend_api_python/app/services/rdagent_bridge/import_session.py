@@ -8,8 +8,11 @@ from app.services.external_alpha.store import persist_external_alpha_scores, row
 from app.services.rdagent_bridge.client import RdAgentBridgeClient
 
 
-def default_session_version(session_id: str) -> str:
-    return f"session_{session_id}"[:120]
+def default_session_version(session_id: str, loop_index: int | None = None) -> str:
+    base = f"session_{session_id}"
+    if loop_index is not None:
+        base = f"{base}_loop{int(loop_index)}"
+    return base[:120]
 
 
 def import_session_scores(
@@ -18,6 +21,7 @@ def import_session_scores(
     source: str = "rdagent",
     version: str | None = None,
     universe: str = "csi300",
+    loop_index: int | None = None,
     client: RdAgentBridgeClient | None = None,
 ) -> dict[str, Any]:
     """Export session scores from bridge, parse CSV, and persist to Postgres."""
@@ -26,11 +30,15 @@ def import_session_scores(
         raise ValueError("session_id is required")
 
     source_s = str(source or "rdagent").strip() or "rdagent"
-    version_s = (str(version).strip() if version else default_session_version(session_id))[:120]
+    version_s = (
+        str(version).strip() if version else default_session_version(session_id, loop_index)
+    )[:120]
     universe_s = str(universe or "csi300").strip() or "csi300"
 
     bridge = client or RdAgentBridgeClient.from_env()
-    export_meta = bridge.export_session(session_id, source_s, version_s, universe_s)
+    export_meta = bridge.export_session(
+        session_id, source_s, version_s, universe_s, loop_index=loop_index
+    )
     csv_text = bridge.download_export(str(export_meta["export_id"]))
     rows = rows_from_csv_text(
         csv_text,

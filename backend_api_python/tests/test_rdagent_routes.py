@@ -162,9 +162,15 @@ def test_bridge_error_maps_status_code(client, monkeypatch):
 def test_import_from_session_ok(client, monkeypatch):
     calls = []
 
-    def fake_import(session_id, *, source, version, universe):
+    def fake_import(session_id, *, source, version, universe, loop_index=None):
         calls.append(
-            {"session_id": session_id, "source": source, "version": version, "universe": universe}
+            {
+                "session_id": session_id,
+                "source": source,
+                "version": version,
+                "universe": universe,
+                "loop_index": loop_index,
+            }
         )
         return {
             "export_id": "e1",
@@ -190,8 +196,57 @@ def test_import_from_session_ok(client, monkeypatch):
             "source": "rdagent",
             "version": "v1",
             "universe": "csi300",
+            "loop_index": None,
         }
     ]
+
+
+def test_import_from_session_with_loop_index(client, monkeypatch):
+    calls = []
+
+    def fake_import(session_id, *, source, version, universe, loop_index=None):
+        calls.append({"loop_index": loop_index, "version": version})
+        return {"export_id": "e1", "inserted": 1}
+
+    monkeypatch.setattr("app.routes.rdagent.import_session_scores", fake_import)
+    resp = client.post(
+        "/api/rdagent/import-from-session",
+        json={"session_id": "sess-1", "loop_index": 7},
+        headers=_admin_auth_headers(monkeypatch),
+    )
+    assert resp.status_code == 200
+    assert calls[0]["loop_index"] == 7
+
+
+def test_factor_matrix_route_ok(client, monkeypatch):
+    class Fake:
+        def factor_matrix(self, session_id, **params):
+            assert session_id == "sess-1"
+            assert params["loop_index"] == 2
+            return {"session_id": session_id, "loop_index": 2, "columns": ["f1"]}
+
+    monkeypatch.setattr("app.routes.rdagent.get_bridge_client", lambda: Fake())
+    resp = client.get(
+        "/api/rdagent/sessions/sess-1/factor-matrix?loop_index=2",
+        headers=_admin_auth_headers(monkeypatch),
+    )
+    assert resp.status_code == 200
+    assert resp.get_json()["data"]["loop_index"] == 2
+
+
+def test_factor_matrix_csv_route_ok(client, monkeypatch):
+    class Fake:
+        def factor_matrix_csv(self, session_id, **params):
+            assert session_id == "sess-1"
+            return b"date,symbol,f1\n", "text/csv"
+
+    monkeypatch.setattr("app.routes.rdagent.get_bridge_client", lambda: Fake())
+    resp = client.get(
+        "/api/rdagent/sessions/sess-1/factor-matrix.csv",
+        headers=_admin_auth_headers(monkeypatch),
+    )
+    assert resp.status_code == 200
+    assert resp.data == b"date,symbol,f1\n"
 
 
 def test_import_from_session_requires_session_id(client, monkeypatch):

@@ -149,6 +149,52 @@ def persist_external_alpha_scores(rows: list[dict[str, Any]]) -> dict[str, Any]:
     return {"inserted": inserted, "skipped": skipped, "errors": errors[:20]}
 
 
+def list_external_alpha_panels(*, source: str | None = None) -> list[dict[str, Any]]:
+    """List distinct (source, version) panels with coverage stats for UI selects."""
+    source_filter = str(source or "").strip()
+    with get_db_connection() as db:
+        cur = db.cursor()
+        if source_filter:
+            cur.execute(
+                """
+                SELECT source, version,
+                       MIN(as_of) AS as_of_min,
+                       MAX(as_of) AS as_of_max,
+                       COUNT(*) AS row_count
+                FROM qd_external_alpha_scores
+                WHERE source = ?
+                GROUP BY source, version
+                ORDER BY MAX(as_of) DESC, version DESC
+                """,
+                (source_filter,),
+            )
+        else:
+            cur.execute(
+                """
+                SELECT source, version,
+                       MIN(as_of) AS as_of_min,
+                       MAX(as_of) AS as_of_max,
+                       COUNT(*) AS row_count
+                FROM qd_external_alpha_scores
+                GROUP BY source, version
+                ORDER BY MAX(as_of) DESC, source ASC, version DESC
+                """
+            )
+        rows = list(cur.fetchall() or [])
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        out.append(
+            {
+                "source": str(row.get("source") or ""),
+                "version": str(row.get("version") or ""),
+                "as_of_min": str(row.get("as_of_min") or ""),
+                "as_of_max": str(row.get("as_of_max") or ""),
+                "row_count": int(row.get("row_count") or 0),
+            }
+        )
+    return out
+
+
 def load_external_alpha_scores_as_of(
     as_of: date | str,
     *,

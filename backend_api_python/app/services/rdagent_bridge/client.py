@@ -50,6 +50,7 @@ class RdAgentBridgeClient:
         data_source: str = "default",
         start_date: str | None = None,
         end_date: str | None = None,
+        universe: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         body: dict[str, Any] = {
             "scenario": scenario,
@@ -64,6 +65,8 @@ class RdAgentBridgeClient:
             body["start_date"] = start_s
         if end_s:
             body["end_date"] = end_s
+        if universe:
+            body["universe"] = universe
         return self._request("POST", "/v1/jobs", json_body=body)
 
     def list_data_sources(self) -> list[dict[str, Any]]:
@@ -106,14 +109,76 @@ class RdAgentBridgeClient:
         source: str = "rdagent",
         version: str = "default",
         universe: str = "csi300",
+        loop_index: int | None = None,
     ) -> dict[str, Any]:
-        body = {
+        body: dict[str, Any] = {
             "session": session_id,
             "source": source,
             "version": version,
             "universe": universe,
         }
+        if loop_index is not None:
+            body["loop_index"] = int(loop_index)
         return self._request("POST", "/v1/export", json_body=body)
+
+    def factor_matrix(self, session_id: str, **params: Any) -> dict[str, Any]:
+        sid = str(session_id or "").strip()
+        if not sid:
+            raise RdAgentBridgeError(400, "rdagent_bridge_bad_request", "session_id is required")
+        query: dict[str, Any] = {}
+        for key in ("loop_index", "sample_dates", "max_symbols", "columns"):
+            if key in params and params[key] is not None:
+                query[key] = params[key]
+        return self._request(
+            "GET",
+            f"/v1/sessions/{sid}/factor-matrix",
+            params=query or None,
+            timeout_s=max(self.timeout_s, 60),
+        )
+
+    def factor_matrix_csv(self, session_id: str, **params: Any) -> tuple[bytes, str]:
+        sid = str(session_id or "").strip()
+        if not sid:
+            raise RdAgentBridgeError(400, "rdagent_bridge_bad_request", "session_id is required")
+        query: dict[str, Any] = {}
+        for key in ("loop_index", "max_rows", "columns"):
+            if key in params and params[key] is not None:
+                query[key] = params[key]
+        headers = self._headers()
+        timeout = max(self.timeout_s, 60)
+        try:
+            response = requests.get(
+                self._url(f"/v1/sessions/{sid}/factor-matrix.csv"),
+                headers=headers,
+                params=query or None,
+                timeout=timeout,
+                proxies={"http": None, "https": None},
+            )
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
+            raise RdAgentBridgeError(
+                503,
+                "rdagent_bridge_unreachable",
+                "无法连接 rdagent bridge，请先在本机启动 rdagent-bridge",
+            ) from exc
+
+        status = int(response.status_code)
+        if status == 401:
+            payload = self._decode_json(response)
+            message = self._error_message(payload, "rdagent bridge unauthorized")
+            raise RdAgentBridgeError(401, "rdagent_bridge_unauthorized", message)
+
+        if status >= 500:
+            payload = self._decode_json(response)
+            message = self._error_message(payload, f"rdagent bridge error ({status})")
+            raise RdAgentBridgeError(status, "rdagent_bridge_error", message)
+
+        if status >= 400:
+            payload = self._decode_json(response)
+            message = self._error_message(payload, f"rdagent bridge request failed ({status})")
+            raise RdAgentBridgeError(status, "rdagent_bridge_bad_request", message)
+
+        content_type = response.headers.get("Content-Type") or "text/csv"
+        return response.content, content_type
 
     def session_detail(self, session_id: str, include: str | None = None) -> dict[str, Any]:
         params: dict[str, Any] = {}
@@ -220,6 +285,7 @@ class RdAgentBridgeClient:
     ) -> dict[str, Any]:
         headers = self._headers() if auth else {}
         try:
+            # Bypass HTTP(S)_PROXY — Colima/Clash proxies break host bridge access.
             response = requests.request(
                 method,
                 self._url(path),
@@ -227,6 +293,7 @@ class RdAgentBridgeClient:
                 json=json_body,
                 params=params,
                 timeout=self.timeout_s if timeout_s is None else timeout_s,
+                proxies={"http": None, "https": None},
             )
         except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
             raise RdAgentBridgeError(

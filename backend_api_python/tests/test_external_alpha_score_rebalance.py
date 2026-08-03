@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 from app.services.strategy_v2 import StrategyV2BacktestRunner, compile_strategy_v2
 
@@ -104,6 +105,16 @@ def test_external_alpha_rebalance_with_scores_issues_equal_weight_targets(monkey
     assert target_weights, "expected rebalance target weights"
     for symbol in SYMBOLS:
         assert abs(target_weights.get(symbol, 0.0) - expected) < 1e-6
+
+
+def test_external_alpha_rebalance_requires_version(monkeypatch):
+    def _scores(_as_of, _source, version=None, symbols=None):
+        del version, symbols
+        return pd.Series(dtype=float)
+
+    with pytest.raises(Exception) as excinfo:
+        _run_backtest(monkeypatch, _scores, params={"version": ""})
+    assert "version is required" in str(excinfo.value)
 
 
 def test_external_alpha_rebalance_skips_when_scores_empty(monkeypatch):

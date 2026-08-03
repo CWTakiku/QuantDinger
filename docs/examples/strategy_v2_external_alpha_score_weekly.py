@@ -6,7 +6,7 @@ and flattens holdings outside the target set.
 """
 
 # @param source str rdagent External alpha signal source id range=
-# @param version str session_2026-08-03_05-53-05-847150 Score version tag range=
+# @param version str "" Score version tag (select from imported panels) range=
 # @param top_n int 30 Number of holdings range=5:100:1
 # @param min_names int 10 Minimum valid scores to rebalance range=3:50:1
 # @param score_lag_days int 1 Calendar days lag from rebalance date to score as_of range=0:5:1
@@ -33,8 +33,10 @@ def initialize(context):
 
 
 def rebalance(context, data):
-    source = str(context.params.get("source", "rdagent"))
-    version = str(context.params.get("version", "session_2026-08-03_05-53-05-847150"))
+    source = str(context.params.get("source", "rdagent") or "rdagent").strip() or "rdagent"
+    version = str(context.params.get("version", "") or "").strip()
+    if not version:
+        raise ValueError("external alpha version is required; select an imported panel version")
     top_n = int(context.params.get("top_n", 30))
     min_names = int(context.params.get("min_names", 10))
     score_lag_days = int(context.params.get("score_lag_days", 1))

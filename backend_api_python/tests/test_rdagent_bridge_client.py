@@ -135,3 +135,83 @@ def test_timeout_maps_to_unreachable(monkeypatch):
     with pytest.raises(RdAgentBridgeError) as exc_info:
         client.get_job("j1")
     assert exc_info.value.status_code == 503
+
+
+def test_export_session_without_loop_index(monkeypatch):
+    captured: dict = {}
+
+    def fake_request(method, url, **kwargs):
+        captured["method"] = method
+        captured["url"] = url
+        captured["kwargs"] = kwargs
+        return MagicMock(status_code=201, json=lambda: {"export_id": "e1"})
+
+    monkeypatch.setattr("app.services.rdagent_bridge.client.requests.request", fake_request)
+    client = RdAgentBridgeClient("http://127.0.0.1:19901", "token")
+    out = client.export_session("sess-1", "rdagent", "v1", "csi300")
+    assert out["export_id"] == "e1"
+    assert captured["kwargs"]["json"] == {
+        "session": "sess-1",
+        "source": "rdagent",
+        "version": "v1",
+        "universe": "csi300",
+    }
+
+
+def test_export_session_with_loop_index(monkeypatch):
+    captured: dict = {}
+
+    def fake_request(method, url, **kwargs):
+        captured["kwargs"] = kwargs
+        return MagicMock(status_code=201, json=lambda: {"export_id": "e2"})
+
+    monkeypatch.setattr("app.services.rdagent_bridge.client.requests.request", fake_request)
+    client = RdAgentBridgeClient("http://127.0.0.1:19901", "token")
+    client.export_session("sess-1", "rdagent", "v_loop7", "csi300", loop_index=7)
+    assert captured["kwargs"]["json"]["loop_index"] == 7
+
+
+def test_factor_matrix_gets_json(monkeypatch):
+    captured: dict = {}
+
+    def fake_request(method, url, **kwargs):
+        captured["method"] = method
+        captured["url"] = url
+        captured["kwargs"] = kwargs
+        return MagicMock(
+            status_code=200,
+            json=lambda: {"session_id": "sess-1", "loop_index": 0, "columns": ["f1"]},
+        )
+
+    monkeypatch.setattr("app.services.rdagent_bridge.client.requests.request", fake_request)
+    client = RdAgentBridgeClient("http://127.0.0.1:19901", "token")
+    out = client.factor_matrix("sess-1", loop_index=0, sample_dates=3, max_symbols=10)
+    assert out["session_id"] == "sess-1"
+    assert captured["method"] == "GET"
+    assert captured["url"] == "http://127.0.0.1:19901/v1/sessions/sess-1/factor-matrix"
+    assert captured["kwargs"]["params"] == {
+        "loop_index": 0,
+        "sample_dates": 3,
+        "max_symbols": 10,
+    }
+
+
+def test_factor_matrix_csv_returns_bytes(monkeypatch):
+    captured: dict = {}
+
+    def fake_get(url, **kwargs):
+        captured["url"] = url
+        captured["kwargs"] = kwargs
+        return MagicMock(
+            status_code=200,
+            content=b"date,symbol,f1\n",
+            headers={"Content-Type": "text/csv"},
+        )
+
+    monkeypatch.setattr("app.services.rdagent_bridge.client.requests.get", fake_get)
+    client = RdAgentBridgeClient("http://127.0.0.1:19901", "token")
+    body, ctype = client.factor_matrix_csv("sess-1", loop_index=1, max_rows=1000)
+    assert body == b"date,symbol,f1\n"
+    assert ctype == "text/csv"
+    assert captured["url"] == "http://127.0.0.1:19901/v1/sessions/sess-1/factor-matrix.csv"
+    assert captured["kwargs"]["params"] == {"loop_index": 1, "max_rows": 1000}

@@ -9,6 +9,55 @@ from app.services.external_alpha.store import (
 )
 
 
+def test_list_external_alpha_panels_groups_by_source_version():
+    class _Cur:
+        def execute(self, sql, params=None):
+            self.sql = sql
+            self.params = params
+
+        def fetchone(self):
+            return None
+
+        def fetchall(self):
+            return [
+                {
+                    "source": "rdagent",
+                    "version": "session_b",
+                    "as_of_min": date(2024, 1, 1),
+                    "as_of_max": date(2024, 6, 1),
+                    "row_count": 10,
+                },
+                {
+                    "source": "rdagent",
+                    "version": "session_a",
+                    "as_of_min": date(2023, 1, 1),
+                    "as_of_max": date(2023, 12, 1),
+                    "row_count": 5,
+                },
+            ]
+
+        def close(self):
+            pass
+
+    class _Db:
+        def cursor(self):
+            return _Cur()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    with patch("app.services.external_alpha.store.get_db_connection", return_value=_Db()):
+        from app.services.external_alpha.store import list_external_alpha_panels
+
+        panels = list_external_alpha_panels(source="rdagent")
+    assert len(panels) == 2
+    assert panels[0]["version"] == "session_b"
+    assert panels[0]["row_count"] == 10
+
+
 def test_persist_normalizes_symbol_and_defaults():
     captured = []
 

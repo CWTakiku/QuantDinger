@@ -1,6 +1,6 @@
 """RDAgent research factory proxy APIs (admin only)."""
 
-from flask import Response, jsonify, request
+from flask import Response, g, jsonify, request
 
 from app.openapi.blueprint import HumanBlueprint as Blueprint
 from app.services.rdagent_bridge import RdAgentBridgeClient, RdAgentBridgeError
@@ -90,11 +90,28 @@ def list_rdagent_jobs():
         return jsonify({"code": 0, "msg": "rdagent.jobsListFailed", "data": None}), 500
 
 
+@rdagent_blp.route("/universes", methods=["GET"])
+@login_required
+@admin_required
+def list_rdagent_universes():
+    try:
+        from app.services.rdagent_bridge.universe_payload import list_rdagent_universes as _list
+        from app.services.universe import get_universe_service
+
+        return _success(_list(get_universe_service(), g.user_id))
+    except Exception:
+        logger.exception("list rdagent universes failed")
+        return jsonify({"code": 0, "msg": "rdagent.universesListFailed", "data": None}), 500
+
+
 @rdagent_blp.route("/jobs", methods=["POST"])
 @login_required
 @admin_required
 def start_rdagent_job():
     try:
+        from app.services.rdagent_bridge.universe_payload import build_universe_job_payload
+        from app.services.universe import get_universe_service
+
         payload = request.get_json(silent=True) or {}
         scenario = str(payload.get("scenario") or "").strip()
         if not scenario:
@@ -109,6 +126,16 @@ def start_rdagent_job():
         end_date_raw = payload.get("end_date", payload.get("endDate"))
         start_date = str(start_date_raw).strip() if start_date_raw is not None and str(start_date_raw).strip() else None
         end_date = str(end_date_raw).strip() if end_date_raw is not None and str(end_date_raw).strip() else None
+        universe_code = payload.get("universe_code", payload.get("universeCode"))
+        try:
+            universe_body = build_universe_job_payload(
+                get_universe_service(),
+                g.user_id,
+                str(universe_code).strip() if universe_code is not None else None,
+                end_date=end_date,
+            )
+        except ValueError as exc:
+            return jsonify({"code": 0, "msg": str(exc), "data": None}), 400
         return _success(
             get_bridge_client().start_job(
                 scenario,
@@ -117,6 +144,7 @@ def start_rdagent_job():
                 data_source=data_source or "default",
                 start_date=start_date,
                 end_date=end_date,
+                universe=universe_body,
             ),
             status=201,
         )
@@ -197,6 +225,64 @@ def rdagent_session_detail(session_id: str):
     except Exception:
         logger.exception("rdagent session detail failed")
         return jsonify({"code": 0, "msg": "rdagent.sessionDetailFailed", "data": None}), 500
+
+
+@rdagent_blp.route("/sessions/<string:session_id>/factor-matrix", methods=["GET"])
+@login_required
+@admin_required
+def rdagent_session_factor_matrix(session_id: str):
+    try:
+        loop_index = request.args.get("loop_index", type=int)
+        sample_dates = request.args.get("sample_dates", type=int)
+        max_symbols = request.args.get("max_symbols", type=int)
+        columns = request.args.get("columns")
+        params: dict = {}
+        if loop_index is not None:
+            params["loop_index"] = loop_index
+        if sample_dates is not None:
+            params["sample_dates"] = sample_dates
+        if max_symbols is not None:
+            params["max_symbols"] = max_symbols
+        if columns:
+            params["columns"] = columns
+        return _success(get_bridge_client().factor_matrix(session_id, **params))
+    except RdAgentBridgeError as exc:
+        return _failure(exc)
+    except Exception:
+        logger.exception("rdagent session factor matrix failed")
+        return jsonify({"code": 0, "msg": "rdagent.sessionFactorMatrixFailed", "data": None}), 500
+
+
+@rdagent_blp.route("/sessions/<string:session_id>/factor-matrix.csv", methods=["GET"])
+@login_required
+@admin_required
+def rdagent_session_factor_matrix_csv(session_id: str):
+    try:
+        loop_index = request.args.get("loop_index", type=int)
+        max_rows = request.args.get("max_rows", type=int)
+        columns = request.args.get("columns")
+        params: dict = {}
+        if loop_index is not None:
+            params["loop_index"] = loop_index
+        if max_rows is not None:
+            params["max_rows"] = max_rows
+        if columns:
+            params["columns"] = columns
+        body, ctype = get_bridge_client().factor_matrix_csv(session_id, **params)
+        return Response(
+            body,
+            mimetype=ctype or "text/csv",
+            headers={
+                "Content-Disposition": (
+                    f'attachment; filename="session_{session_id}_factor_matrix.csv"'
+                ),
+            },
+        )
+    except RdAgentBridgeError as exc:
+        return _failure(exc)
+    except Exception:
+        logger.exception("rdagent session factor matrix csv failed")
+        return jsonify({"code": 0, "msg": "rdagent.sessionFactorMatrixCsvFailed", "data": None}), 500
 
 
 @rdagent_blp.route("/sessions/<string:session_id>/metrics.csv", methods=["GET"])
@@ -300,11 +386,13 @@ def rdagent_import_from_session():
             return jsonify({"code": 0, "msg": "rdagent.sessionIdRequired", "data": None}), 400
 
         source = str(payload.get("source") or "rdagent").strip() or "rdagent"
+        loop_index_raw = payload.get("loop_index", payload.get("loopIndex"))
+        loop_index = int(loop_index_raw) if loop_index_raw is not None else None
         version_raw = payload.get("version")
         if version_raw is not None and str(version_raw).strip():
             version = str(version_raw).strip()[:120]
         else:
-            version = default_session_version(session_id)
+            version = default_session_version(session_id, loop_index)
         universe = str(payload.get("universe") or "csi300").strip() or "csi300"
 
         result = import_session_scores(
@@ -312,6 +400,7 @@ def rdagent_import_from_session():
             source=source,
             version=version,
             universe=universe,
+            loop_index=loop_index,
         )
         logger.info(
             "rdagent import-from-session user=%s session=%s source=%s version=%s inserted=%s",
