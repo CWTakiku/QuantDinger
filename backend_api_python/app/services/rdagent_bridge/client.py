@@ -10,7 +10,7 @@ import requests
 from app.services.rdagent_bridge.errors import RdAgentBridgeError
 
 _DEFAULT_URL = "http://127.0.0.1:19901"
-_DEFAULT_TIMEOUT_S = 30.0
+_DEFAULT_TIMEOUT_S = 180.0
 _TOKEN_HEADER = "X-RDAgent-Bridge-Token"
 
 
@@ -80,6 +80,12 @@ class RdAgentBridgeClient:
         sessions = payload.get("sessions")
         return list(sessions) if isinstance(sessions, list) else []
 
+    def delete_session(self, session_id: str) -> dict[str, Any]:
+        sid = str(session_id or "").strip()
+        if not sid:
+            raise RdAgentBridgeError(400, "rdagent_bridge_bad_request", "session_id is required")
+        return self._request("DELETE", f"/v1/sessions/{sid}")
+
     def ui_status(self) -> dict[str, Any]:
         return self._request("GET", "/v1/ui")
 
@@ -100,6 +106,55 @@ class RdAgentBridgeClient:
             "universe": universe,
         }
         return self._request("POST", "/v1/export", json_body=body)
+
+    def session_detail(self, session_id: str, include: str | None = None) -> dict[str, Any]:
+        params: dict[str, Any] = {}
+        if include:
+            params["include"] = include
+        return self._request(
+            "GET",
+            f"/v1/sessions/{session_id}/detail",
+            params=params or None,
+            timeout_s=max(self.timeout_s, 60),
+        )
+
+    def session_metrics_csv(self, session_id: str) -> tuple[bytes, str]:
+        sid = str(session_id or "").strip()
+        if not sid:
+            raise RdAgentBridgeError(400, "rdagent_bridge_bad_request", "session_id is required")
+        headers = self._headers()
+        timeout = max(self.timeout_s, 60)
+        try:
+            response = requests.get(
+                self._url(f"/v1/sessions/{sid}/metrics.csv"),
+                headers=headers,
+                timeout=timeout,
+            )
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
+            raise RdAgentBridgeError(
+                503,
+                "rdagent_bridge_unreachable",
+                "无法连接 rdagent bridge，请先在本机启动 rdagent-bridge",
+            ) from exc
+
+        status = int(response.status_code)
+        if status == 401:
+            payload = self._decode_json(response)
+            message = self._error_message(payload, "rdagent bridge unauthorized")
+            raise RdAgentBridgeError(401, "rdagent_bridge_unauthorized", message)
+
+        if status >= 500:
+            payload = self._decode_json(response)
+            message = self._error_message(payload, f"rdagent bridge error ({status})")
+            raise RdAgentBridgeError(status, "rdagent_bridge_error", message)
+
+        if status >= 400:
+            payload = self._decode_json(response)
+            message = self._error_message(payload, f"rdagent bridge request failed ({status})")
+            raise RdAgentBridgeError(status, "rdagent_bridge_bad_request", message)
+
+        content_type = response.headers.get("Content-Type") or "text/csv"
+        return response.content, content_type
 
     def download_export(self, export_id: str) -> str:
         export_id = str(export_id or "").strip()
@@ -153,6 +208,7 @@ class RdAgentBridgeClient:
         auth: bool = True,
         json_body: dict[str, Any] | None = None,
         params: dict[str, Any] | None = None,
+        timeout_s: float | None = None,
     ) -> dict[str, Any]:
         headers = self._headers() if auth else {}
         try:
@@ -162,7 +218,7 @@ class RdAgentBridgeClient:
                 headers=headers,
                 json=json_body,
                 params=params,
-                timeout=self.timeout_s,
+                timeout=self.timeout_s if timeout_s is None else timeout_s,
             )
         except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
             raise RdAgentBridgeError(

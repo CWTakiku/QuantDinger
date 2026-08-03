@@ -1,6 +1,6 @@
 """RDAgent research factory proxy APIs (admin only)."""
 
-from flask import jsonify, request
+from flask import Response, jsonify, request
 
 from app.openapi.blueprint import HumanBlueprint as Blueprint
 from app.services.rdagent_bridge import RdAgentBridgeClient, RdAgentBridgeError
@@ -22,7 +22,9 @@ def _success(data=None, *, status: int = 200):
 
 
 def _failure(exc: RdAgentBridgeError):
-    return jsonify({"code": 0, "msg": exc.code, "data": None}), exc.status_code
+    detail = (exc.message or "").strip()
+    msg = f"{exc.code}: {detail}" if detail and detail != exc.code else exc.code
+    return jsonify({"code": 0, "msg": msg, "data": {"error_code": exc.code}}), exc.status_code
 
 
 def _running_jobs(jobs: list) -> list[dict]:
@@ -175,6 +177,58 @@ def list_rdagent_sessions():
     except Exception:
         logger.exception("list rdagent sessions failed")
         return jsonify({"code": 0, "msg": "rdagent.sessionsListFailed", "data": None}), 500
+
+
+@rdagent_blp.route("/sessions/<string:session_id>/detail", methods=["GET"])
+@login_required
+@admin_required
+def rdagent_session_detail(session_id: str):
+    try:
+        include = request.args.get("include")
+        return _success(get_bridge_client().session_detail(session_id, include=include))
+    except RdAgentBridgeError as exc:
+        return _failure(exc)
+    except Exception:
+        logger.exception("rdagent session detail failed")
+        return jsonify({"code": 0, "msg": "rdagent.sessionDetailFailed", "data": None}), 500
+
+
+@rdagent_blp.route("/sessions/<string:session_id>/metrics.csv", methods=["GET"])
+@login_required
+@admin_required
+def rdagent_session_metrics_csv(session_id: str):
+    try:
+        body, ctype = get_bridge_client().session_metrics_csv(session_id)
+        return Response(
+            body,
+            mimetype=ctype or "text/csv",
+            headers={
+                "Content-Disposition": (
+                    f'attachment; filename="session_{session_id}_metrics.csv"'
+                ),
+            },
+        )
+    except RdAgentBridgeError as exc:
+        return _failure(exc)
+    except Exception:
+        logger.exception("rdagent session metrics csv failed")
+        return jsonify({"code": 0, "msg": "rdagent.sessionMetricsCsvFailed", "data": None}), 500
+
+
+@rdagent_blp.route("/sessions/<string:session_id>", methods=["DELETE"])
+@login_required
+@admin_required
+def delete_rdagent_session(session_id: str):
+    try:
+        sid = str(session_id or "").strip()
+        if not sid:
+            return jsonify({"code": 0, "msg": "rdagent.sessionIdRequired", "data": None}), 400
+        return _success(get_bridge_client().delete_session(sid))
+    except RdAgentBridgeError as exc:
+        return _failure(exc)
+    except Exception:
+        logger.exception("delete rdagent session failed")
+        return jsonify({"code": 0, "msg": "rdagent.sessionDeleteFailed", "data": None}), 500
 
 
 @rdagent_blp.route("/ui", methods=["GET"])
