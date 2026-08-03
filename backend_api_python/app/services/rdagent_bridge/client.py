@@ -45,7 +45,7 @@ class RdAgentBridgeClient:
     def start_job(
         self,
         scenario: str,
-        step_n: int,
+        loop_n: int,
         timeout_h: float | None = None,
         data_source: str = "default",
         start_date: str | None = None,
@@ -53,7 +53,7 @@ class RdAgentBridgeClient:
     ) -> dict[str, Any]:
         body: dict[str, Any] = {
             "scenario": scenario,
-            "step_n": int(step_n),
+            "loop_n": int(loop_n),
             "data_source": (data_source or "default").strip() or "default",
         }
         if timeout_h is not None:

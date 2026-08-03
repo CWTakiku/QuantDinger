@@ -510,6 +510,26 @@ CONFIG_SCHEMA = {
                 'description': 'Model name to use (e.g. gpt-4o, claude-3-opus)',
                 'group': 'custom'
             },
+            {
+                'key': 'CUSTOM_ACTIVE_PROFILE',
+                'label': 'Active Custom Profile',
+                'type': 'text',
+                'default': '',
+                'required': False,
+                'description': 'Active named Custom API profile id',
+                'group': 'custom',
+                'ui_hidden': True,
+            },
+            {
+                'key': 'CUSTOM_LLM_PROFILES',
+                'label': 'Custom API Profiles',
+                'type': 'text',
+                'default': '',
+                'required': False,
+                'description': 'JSON store for named Custom API profiles',
+                'group': 'custom',
+                'ui_hidden': True,
+            },
             # MiniMax
             {
                 'key': 'MINIMAX_API_KEY',
@@ -1758,8 +1778,26 @@ def get_brand_config():
 @admin_required
 def get_settings_values():
     """Return current settings values without exposing stored secrets."""
+    from app.services.settings.custom_llm_profiles import (
+        ACTIVE_KEY as CUSTOM_ACTIVE_KEY,
+        PROFILES_KEY as CUSTOM_PROFILES_KEY,
+        ensure_profiles_from_env,
+        materialize_active,
+        profiles_for_api,
+        serialize_profiles,
+    )
+
     env_values = read_env_file()
-    
+
+    # Lazily seed named Custom profiles from CUSTOM_API_* when missing.
+    profiles, active_id, mutated = ensure_profiles_from_env(env_values)
+    if mutated and profiles:
+        seeded = materialize_active(profiles, active_id)
+        env_values.update(seeded)
+        write_env_file(env_values)
+        clear_config_cache()
+        reload_runtime_env()
+
     result = {}
     for group_key, group in CONFIG_SCHEMA.items():
         result[group_key] = {}
@@ -1769,9 +1807,27 @@ def get_settings_values():
                 value = env_values.get(key, '')
                 result[group_key][key] = ''
                 result[group_key][f'{key}_configured'] = bool(value)
+            elif key == CUSTOM_PROFILES_KEY:
+                # Never return raw secrets; frontend uses masked profile list.
+                result[group_key][key] = serialize_profiles(
+                    [
+                        {
+                            "id": p["id"],
+                            "name": p["name"],
+                            "url": p["url"],
+                            "model": p["model"],
+                            "key": "",
+                        }
+                        for p in profiles
+                    ]
+                )
             else:
                 result[group_key][key] = env_values.get(key, item.get('default', ''))
-    
+
+        if group_key == 'ai':
+            result[group_key]['CUSTOM_LLM_PROFILE_LIST'] = profiles_for_api(profiles)
+            result[group_key][CUSTOM_ACTIVE_KEY] = active_id or env_values.get(CUSTOM_ACTIVE_KEY, '')
+
     return jsonify({
         'code': 1,
         'msg': 'success',
@@ -1877,7 +1933,10 @@ def save_settings():
                         'code': 0,
                         'msg': 'Admin email is already used by another account'
                     }), 409
-        
+
+        from app.services.settings.custom_llm_profiles import reconcile_on_save
+
+        updates = reconcile_on_save(current_env, updates)
         current_env.update(updates)
         
         if write_env_file(current_env):

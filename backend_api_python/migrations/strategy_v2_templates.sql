@@ -580,7 +580,96 @@ def rebalance(context, data):
     weight = min(max_weight, 1.0 / len(selected)) if selected else 0.0
     for symbol in selected:
         order_target_percent(symbol, weight, reason="quality_growth")
-$quality$, '{"params":[{"name":"top_n","type":"integer","default":5,"min":1,"max":10,"step":1,"labelKey":"strategyV2.params.topN"},{"name":"min_roe","type":"number","default":0.1,"min":-1,"max":1,"step":0.01,"labelKey":"strategyV2.params.minRoe"},{"name":"min_growth","type":"number","default":0,"min":-1,"max":5,"step":0.01,"labelKey":"strategyV2.params.minGrowth"},{"name":"max_debt_to_equity","type":"number","default":2,"min":0,"max":10,"step":0.1,"labelKey":"strategyV2.params.maxDebtToEquity"},{"name":"max_weight","type":"percent","default":0.2,"min":0.05,"max":1,"step":0.05,"labelKey":"strategyV2.params.maxWeight"}]}'::jsonb, '["strategy-v2","portfolio","cross-sectional","fundamental","quality","growth"]'::jsonb, 'radar-chart', 'purple', 140, TRUE, '{"source":"system_seed","version":8,"apiVersion":2}'::jsonb, NOW())
+$quality$, '{"params":[{"name":"top_n","type":"integer","default":5,"min":1,"max":10,"step":1,"labelKey":"strategyV2.params.topN"},{"name":"min_roe","type":"number","default":0.1,"min":-1,"max":1,"step":0.01,"labelKey":"strategyV2.params.minRoe"},{"name":"min_growth","type":"number","default":0,"min":-1,"max":5,"step":0.01,"labelKey":"strategyV2.params.minGrowth"},{"name":"max_debt_to_equity","type":"number","default":2,"min":0,"max":10,"step":0.1,"labelKey":"strategyV2.params.maxDebtToEquity"},{"name":"max_weight","type":"percent","default":0.2,"min":0.05,"max":1,"step":0.05,"labelKey":"strategyV2.params.maxWeight"}]}'::jsonb, '["strategy-v2","portfolio","cross-sectional","fundamental","quality","growth"]'::jsonb, 'radar-chart', 'purple', 140, TRUE, '{"source":"system_seed","version":8,"apiVersion":2}'::jsonb, NOW()),
+('strategy_v2_external_alpha_score', 'portfolio_strategy', 'External Alpha Score Weekly', 'Weekly CSI300 long-only Top-N from imported external alpha scores with PIT lag.', $extalpha$"""External Alpha Score Weekly
+Long-only weekly Top-N on CSI300 using imported external alpha scores (PIT).
+
+Reads scores with a configurable calendar-day lag, selects Top-N equal-weight names,
+and flattens holdings outside the target set.
+"""
+
+# @param source str rdagent External alpha signal source id range=
+# @param version str session_2026-08-03_05-53-05-847150 Score version tag range=
+# @param top_n int 30 Number of holdings range=5:100:1
+# @param min_names int 10 Minimum valid scores to rebalance range=3:50:1
+# @param score_lag_days int 1 Calendar days lag from rebalance date to score as_of range=0:5:1
+
+from datetime import timedelta
+
+import pandas as pd
+
+
+def _base_key(symbol):
+    text = str(symbol or "").strip()
+    if "@" in text:
+        text = text.split("@", 1)[0]
+    return text
+
+
+def initialize(context):
+    context.set_universe(pool="csi300")
+    context.subscribe(frequency="1d", fields=["open", "high", "low", "close", "volume"])
+    context.set_warmup(5)
+    context.set_benchmark("CNStock:000300.SH")
+    context.set_metadata(direction_mode="long_only")
+    run_weekly(rebalance, weekday=1, time="09:35")
+
+
+def rebalance(context, data):
+    source = str(context.params.get("source", "rdagent"))
+    version = str(context.params.get("version", "session_2026-08-03_05-53-05-847150"))
+    top_n = int(context.params.get("top_n", 30))
+    min_names = int(context.params.get("min_names", 10))
+    score_lag_days = int(context.params.get("score_lag_days", 1))
+
+    as_of = context.current_dt.date() - timedelta(days=score_lag_days)
+    scores = get_external_alpha_scores(as_of, source, version=version)
+    if scores is None:
+        log("skip rebalance: no scores returned as_of=%s source=%s version=%s" % (as_of, source, version))
+        return
+
+    scores = pd.to_numeric(scores, errors="coerce").dropna()
+    if len(scores) < min_names:
+        log(
+            "skip rebalance: valid_scores=%d < min_names=%d as_of=%s source=%s"
+            % (len(scores), min_names, as_of, source)
+        )
+        return
+
+    # Scores use CNStock:600519.SH; universe/frames often use CNStock:600519.SH@spot.
+    universe = get_universe_stocks() or []
+    portal_by_base = {}
+    for item in universe:
+        portal_by_base[_base_key(item)] = item
+    if portal_by_base:
+        scores = scores[scores.index.map(_base_key).isin(portal_by_base)]
+        if len(scores) < min_names:
+            log(
+                "skip rebalance: universe_scores=%d < min_names=%d as_of=%s"
+                % (len(scores), min_names, as_of)
+            )
+            return
+
+    selected_base = list(scores.nlargest(top_n).index.map(_base_key))
+    selected = [portal_by_base.get(base, base) for base in selected_base]
+    if not selected:
+        return
+
+    selected_set = set(selected)
+    selected_base_set = set(selected_base)
+    target_weight = 1.0 / len(selected)
+    current = get_positions()
+
+    for symbol in current:
+        if symbol in selected_set or _base_key(symbol) in selected_base_set:
+            continue
+        order_target_percent(symbol, 0.0, reason="ext_alpha_exit")
+
+    for symbol in selected:
+        order_target_percent(symbol, target_weight, reason="ext_alpha_target")
+
+    log("ext_alpha rebalance names=%d as_of=%s source=%s version=%s" % (len(selected), as_of, source, version))
+$extalpha$, '{"params":[{"name":"source","type":"text","default":"rdagent","labelKey":"strategyV2.params.alphaSource","descriptionKey":"strategyV2.params.alphaSourceDesc"},{"name":"version","type":"text","default":"session_2026-08-03_05-53-05-847150","labelKey":"strategyV2.params.alphaVersion","descriptionKey":"strategyV2.params.alphaVersionDesc"},{"name":"top_n","type":"integer","default":30,"min":5,"max":100,"step":1,"labelKey":"strategyV2.params.topN"},{"name":"min_names","type":"integer","default":10,"min":3,"max":50,"step":1,"labelKey":"strategyV2.params.minNames","descriptionKey":"strategyV2.params.minNamesDesc"},{"name":"score_lag_days","type":"integer","default":1,"min":0,"max":5,"step":1,"labelKey":"strategyV2.params.scoreLagDays","descriptionKey":"strategyV2.params.scoreLagDaysDesc"}]}'::jsonb, '["strategy-v2","portfolio","csi300","cn-stock","external-alpha"]'::jsonb, 'fund', 'purple', 102, TRUE, '{"source":"system_seed","version":2,"apiVersion":2}'::jsonb, NOW())
 ON CONFLICT (template_key) DO UPDATE SET
     asset_type = EXCLUDED.asset_type,
     title = EXCLUDED.title,

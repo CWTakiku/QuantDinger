@@ -99,7 +99,7 @@ def test_start_job_ok(client, monkeypatch):
         def start_job(
             self,
             scenario,
-            step_n,
+            loop_n,
             timeout_h=None,
             data_source="default",
             start_date=None,
@@ -108,7 +108,7 @@ def test_start_job_ok(client, monkeypatch):
             calls.append(
                 {
                     "scenario": scenario,
-                    "step_n": step_n,
+                    "loop_n": loop_n,
                     "timeout_h": timeout_h,
                     "data_source": data_source,
                     "start_date": start_date,
@@ -122,7 +122,7 @@ def test_start_job_ok(client, monkeypatch):
         "/api/rdagent/jobs",
         json={
             "scenario": "fin_factor",
-            "step_n": 2,
+            "loop_n": 2,
             "timeout_h": 1.5,
             "data_source": "quantmind",
             "start_date": "2018-01-01",
@@ -135,7 +135,7 @@ def test_start_job_ok(client, monkeypatch):
     assert calls == [
         {
             "scenario": "fin_factor",
-            "step_n": 2,
+            "loop_n": 2,
             "timeout_h": 1.5,
             "data_source": "quantmind",
             "start_date": "2018-01-01",

@@ -75,7 +75,7 @@ def test_start_job_posts_payload(monkeypatch):
     client = RdAgentBridgeClient("http://127.0.0.1:19901", "token")
     out = client.start_job(
         "fin_factor",
-        step_n=3,
+        loop_n=3,
         timeout_h=1.5,
         start_date="2018-01-01",
         end_date="2024-12-31",
@@ -85,7 +85,7 @@ def test_start_job_posts_payload(monkeypatch):
     assert captured["url"] == "http://127.0.0.1:19901/v1/jobs"
     assert captured["kwargs"]["json"] == {
         "scenario": "fin_factor",
-        "step_n": 3,
+        "loop_n": 3,
         "data_source": "default",
         "timeout_h": 1.5,
         "start_date": "2018-01-01",

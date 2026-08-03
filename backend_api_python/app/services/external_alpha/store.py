@@ -69,10 +69,41 @@ def rows_from_csv_text(
     return rows
 
 
+_UPSERT_SQL = """
+INSERT INTO qd_external_alpha_scores
+(as_of, source, version, universe, symbol, score, weight, meta_json)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?::jsonb)
+ON CONFLICT (as_of, source, version, symbol)
+DO UPDATE SET
+  score = EXCLUDED.score,
+  weight = EXCLUDED.weight,
+  universe = EXCLUDED.universe,
+  meta_json = EXCLUDED.meta_json,
+  ingested_at = NOW()
+"""
+
+_PERSIST_BATCH_SIZE = 2000
+
+
+def _flush_score_rows(cur: Any, params_list: list[tuple[Any, ...]]) -> None:
+    """Batch upsert; prefer raw executemany to avoid per-row RETURNING/savepoint overhead."""
+    if not params_list:
+        return
+    raw = getattr(cur, "_cursor", None)
+    if raw is not None and hasattr(raw, "executemany"):
+        sql_pg = _UPSERT_SQL.replace("?", "%s")
+        for i in range(0, len(params_list), _PERSIST_BATCH_SIZE):
+            raw.executemany(sql_pg, params_list[i : i + _PERSIST_BATCH_SIZE])
+        return
+    for params in params_list:
+        cur.execute(_UPSERT_SQL, params)
+
+
 def persist_external_alpha_scores(rows: list[dict[str, Any]]) -> dict[str, Any]:
     inserted = 0
     skipped = 0
     errors: list[str] = []
+    params_list: list[tuple[Any, ...]] = []
     with get_db_connection() as db:
         cur = db.cursor()
         for idx, raw in enumerate(rows or []):
@@ -100,19 +131,7 @@ def persist_external_alpha_scores(rows: list[dict[str, Any]]) -> dict[str, Any]:
             version = str(raw.get("version") or DEFAULT_VERSION).strip() or DEFAULT_VERSION
             universe = str(raw.get("universe") or "").strip()
             meta = raw.get("meta") if isinstance(raw.get("meta"), dict) else {}
-            cur.execute(
-                """
-                INSERT INTO qd_external_alpha_scores
-                (as_of, source, version, universe, symbol, score, weight, meta_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?::jsonb)
-                ON CONFLICT (as_of, source, version, symbol)
-                DO UPDATE SET
-                  score = EXCLUDED.score,
-                  weight = EXCLUDED.weight,
-                  universe = EXCLUDED.universe,
-                  meta_json = EXCLUDED.meta_json,
-                  ingested_at = NOW()
-                """,
+            params_list.append(
                 (
                     as_of,
                     source,
@@ -122,9 +141,10 @@ def persist_external_alpha_scores(rows: list[dict[str, Any]]) -> dict[str, Any]:
                     score,
                     weight_f,
                     json.dumps(meta, ensure_ascii=False),
-                ),
+                )
             )
             inserted += 1
+        _flush_score_rows(cur, params_list)
         db.commit()
     return {"inserted": inserted, "skipped": skipped, "errors": errors[:20]}
 

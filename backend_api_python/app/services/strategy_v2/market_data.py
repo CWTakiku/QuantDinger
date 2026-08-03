@@ -74,16 +74,37 @@ def load_strategy_frame(
     if cached is not None and not cached.empty:
         return cached.copy()
     try:
-        rows = DataSourceFactory.get_kline(
-            market=market,
-            symbol=symbol,
-            timeframe=provider_timeframe,
-            limit=limit,
-            before_time=before_time,
-            after_time=after_time,
-            exchange_id=exchange_id,
-            market_type=market_type,
-        )
+        rows = []
+        # Prefer local A-share daily CSV for historical backtests only.
+        # Chart/indicator paths use DataSourceFactory (Tencent qfq), not this loader.
+        if str(market).strip() == "CNStock" and provider_timeframe == "1D":
+            try:
+                from app.data_sources.cn_stock_local_daily import fetch_local_daily_klines
+
+                rows = fetch_local_daily_klines(
+                    symbol=symbol,
+                    limit=limit,
+                    before_time=before_time,
+                    after_time=after_time,
+                )
+            except Exception as local_exc:
+                logger.info(
+                    "Local CNStock daily miss for %s: %s",
+                    symbol,
+                    local_exc,
+                )
+                rows = []
+        if not rows:
+            rows = DataSourceFactory.get_kline(
+                market=market,
+                symbol=symbol,
+                timeframe=provider_timeframe,
+                limit=limit,
+                before_time=before_time,
+                after_time=after_time,
+                exchange_id=exchange_id,
+                market_type=market_type,
+            )
     except Exception as exc:
         logger.warning(
             "Strategy market-data fetch failed for %s:%s %s via %s/%s: %s",

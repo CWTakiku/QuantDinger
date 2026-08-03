@@ -99,9 +99,9 @@ def start_rdagent_job():
         scenario = str(payload.get("scenario") or "").strip()
         if not scenario:
             return jsonify({"code": 0, "msg": "rdagent.scenarioRequired", "data": None}), 400
-        step_n = payload.get("step_n", payload.get("stepN"))
-        if step_n is None:
-            return jsonify({"code": 0, "msg": "rdagent.stepNRequired", "data": None}), 400
+        loop_n = payload.get("loop_n", payload.get("loopN"))
+        if loop_n is None:
+            return jsonify({"code": 0, "msg": "rdagent.loopNRequired", "data": None}), 400
         timeout_h = payload.get("timeout_h", payload.get("timeoutH"))
         timeout = float(timeout_h) if timeout_h is not None else None
         data_source = str(payload.get("data_source") or payload.get("dataSource") or "default").strip()
@@ -112,7 +112,7 @@ def start_rdagent_job():
         return _success(
             get_bridge_client().start_job(
                 scenario,
-                int(step_n),
+                int(loop_n),
                 timeout_h=timeout,
                 data_source=data_source or "default",
                 start_date=start_date,
