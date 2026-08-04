@@ -8,7 +8,7 @@ from typing import Any
 
 import pandas as pd
 
-from app.services.external_alpha.symbols import canonicalize_cnstock_key
+from app.services.external_alpha.symbols import canonicalize_cnstock_key, cnstock_name_lookup_candidates
 from app.utils.db import get_db_connection
 
 DEFAULT_SOURCE = "external"
@@ -24,6 +24,66 @@ def _as_date(value: date | str | datetime) -> date:
     if len(text) == 8 and text.isdigit():
         return date(int(text[:4]), int(text[4:6]), int(text[6:8]))
     return date.fromisoformat(text[:10])
+
+
+def resolve_cnstock_names(symbols: list[str]) -> dict[str, str]:
+    """Map canonical / raw CNStock keys to display names via ``qd_market_symbols``."""
+    if not symbols:
+        return {}
+    candidate_to_keys: dict[str, list[str]] = {}
+    for raw in symbols:
+        key = str(raw or "").strip()
+        if not key:
+            continue
+        for cand in cnstock_name_lookup_candidates(key):
+            candidate_to_keys.setdefault(cand, []).append(key)
+
+    if not candidate_to_keys:
+        return {}
+
+    cand_list = sorted(candidate_to_keys.keys())
+    placeholders = ",".join(["?"] * len(cand_list))
+    name_by_cand: dict[str, str] = {}
+    try:
+        with get_db_connection() as db:
+            cur = db.cursor()
+            cur.execute(
+                f"""
+                SELECT symbol, name
+                FROM qd_market_symbols
+                WHERE market = 'CNStock'
+                  AND UPPER(symbol) IN ({placeholders})
+                  AND name IS NOT NULL AND name <> ''
+                """,
+                tuple(cand_list),
+            )
+            for row in cur.fetchall() or []:
+                sym = str(row.get("symbol") or "").strip().upper()
+                name = str(row.get("name") or "").strip()
+                if sym and name and sym not in name_by_cand:
+                    name_by_cand[sym] = name
+    except Exception:
+        return {}
+
+    out: dict[str, str] = {}
+    for cand, keys in candidate_to_keys.items():
+        name = name_by_cand.get(cand)
+        if not name:
+            continue
+        for key in keys:
+            out.setdefault(key, name)
+            canon = canonicalize_cnstock_key(key)
+            if canon:
+                out.setdefault(canon, name)
+    return out
+
+
+def _attach_names(preview_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    names = resolve_cnstock_names([str(r.get("symbol") or "") for r in preview_rows])
+    for row in preview_rows:
+        sym = str(row.get("symbol") or "")
+        row["name"] = names.get(sym) or names.get(canonicalize_cnstock_key(sym)) or ""
+    return preview_rows
 
 
 _REQUIRED_CSV_FIELDS = ("as_of", "symbol", "score")
@@ -193,6 +253,118 @@ def list_external_alpha_panels(*, source: str | None = None) -> list[dict[str, A
             }
         )
     return out
+
+
+def list_external_alpha_as_ofs(*, source: str, version: str) -> list[str]:
+    """Distinct as_of dates for a panel, newest first."""
+    source_s = str(source or "").strip()
+    version_s = DEFAULT_VERSION if version is None or str(version).strip() == "" else str(version).strip()
+    if not source_s:
+        return []
+    with get_db_connection() as db:
+        cur = db.cursor()
+        cur.execute(
+            """
+            SELECT DISTINCT as_of
+            FROM qd_external_alpha_scores
+            WHERE source = ? AND version = ?
+            ORDER BY as_of DESC
+            """,
+            (source_s, version_s),
+        )
+        rows = list(cur.fetchall() or [])
+    return [str(r.get("as_of") or "")[:10] for r in rows if r.get("as_of")]
+
+
+def preview_external_alpha_scores(
+    *,
+    source: str,
+    version: str,
+    as_of: date | str | None = None,
+    limit: int = 50,
+    order: str = "desc",
+) -> dict[str, Any]:
+    """Return ranked score rows for one as_of (default = latest), plus panel dates."""
+    source_s = str(source or "").strip()
+    version_s = DEFAULT_VERSION if version is None or str(version).strip() == "" else str(version).strip()
+    limit_n = max(1, min(int(limit or 50), 500))
+    order_s = "ASC" if str(order or "").strip().lower() in {"asc", "bottom", "low"} else "DESC"
+    if not source_s:
+        return {"as_of": "", "as_of_dates": [], "rows": [], "stats": {}, "total": 0, "order": "desc"}
+
+    as_of_dates = list_external_alpha_as_ofs(source=source_s, version=version_s)
+    if not as_of_dates:
+        return {"as_of": "", "as_of_dates": [], "rows": [], "stats": {}, "total": 0, "order": "desc"}
+
+    if as_of:
+        eff = str(_as_date(as_of))
+    else:
+        eff = as_of_dates[0]
+
+    with get_db_connection() as db:
+        cur = db.cursor()
+        cur.execute(
+            f"""
+            SELECT symbol, score
+            FROM qd_external_alpha_scores
+            WHERE source = ? AND version = ? AND as_of = ?
+            ORDER BY score {order_s}
+            """,
+            (source_s, version_s, eff),
+        )
+        rows = list(cur.fetchall() or [])
+
+    scored: list[tuple[str, float]] = []
+    for row in rows:
+        key = canonicalize_cnstock_key(str(row.get("symbol") or ""))
+        if not key:
+            continue
+        try:
+            val = float(row["score"])
+        except (TypeError, ValueError):
+            continue
+        if val != val or val in (float("inf"), float("-inf")):
+            continue
+        scored.append((key, val))
+
+    # Stats always over full cross-section (desc order).
+    all_desc = sorted(scored, key=lambda x: x[1], reverse=True)
+    values = [v for _, v in all_desc]
+    stats: dict[str, Any] = {"n": len(values)}
+    if values:
+        stats["mean"] = float(sum(values) / len(values))
+        stats["min"] = float(min(values))
+        stats["max"] = float(max(values))
+        mid = len(values) // 2
+        stats["median"] = float(values[mid] if len(values) % 2 else (values[mid - 1] + values[mid]) / 2)
+
+    if order_s == "ASC":
+        scored_view = list(reversed(all_desc))  # low → high
+        preview_slice = scored_view[:limit_n]
+        preview_rows = [
+            {"rank": len(all_desc) - i, "symbol": sym, "score": score}
+            for i, (sym, score) in enumerate(preview_slice)
+        ]
+    else:
+        preview_slice = all_desc[:limit_n]
+        preview_rows = [
+            {"rank": i + 1, "symbol": sym, "score": score}
+            for i, (sym, score) in enumerate(preview_slice)
+        ]
+
+    preview_rows = _attach_names(preview_rows)
+
+    return {
+        "source": source_s,
+        "version": version_s,
+        "as_of": str(eff)[:10],
+        "as_of_dates": as_of_dates,
+        "rows": preview_rows,
+        "stats": stats,
+        "total": len(all_desc),
+        "limit": limit_n,
+        "order": "asc" if order_s == "ASC" else "desc",
+    }
 
 
 def load_external_alpha_scores_as_of(

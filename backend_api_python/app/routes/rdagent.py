@@ -4,7 +4,12 @@ from flask import Response, g, jsonify, request
 
 from app.openapi.blueprint import HumanBlueprint as Blueprint
 from app.services.rdagent_bridge import RdAgentBridgeClient, RdAgentBridgeError
-from app.services.rdagent_bridge.import_session import default_session_version, import_session_scores
+from app.services.rdagent_bridge.import_session import (
+    default_infer_version,
+    default_session_version,
+    import_session_scores,
+    infer_and_import_session_scores,
+)
 from app.utils.auth import admin_required, login_required
 from app.utils.logger import get_logger
 
@@ -418,3 +423,101 @@ def rdagent_import_from_session():
     except Exception:
         logger.exception("rdagent import-from-session failed")
         return jsonify({"code": 0, "msg": "rdagent.importFromSessionFailed", "data": None}), 500
+
+
+@rdagent_blp.route("/infer-from-session", methods=["POST"])
+@login_required
+@admin_required
+def rdagent_infer_from_session():
+    """Forward-score session factors/models on latest Qlib data; optionally import."""
+    try:
+        payload = request.get_json(silent=True) or {}
+        session_id = str(payload.get("session_id") or payload.get("sessionId") or "").strip()
+        if not session_id:
+            return jsonify({"code": 0, "msg": "rdagent.sessionIdRequired", "data": None}), 400
+
+        source = str(payload.get("source") or "rdagent").strip() or "rdagent"
+        mode = str(payload.get("mode") or "model").strip().lower() or "model"
+        loop_index_raw = payload.get("loop_index", payload.get("loopIndex"))
+        loop_index = int(loop_index_raw) if loop_index_raw is not None and str(loop_index_raw) != "" else None
+        version_raw = payload.get("version")
+        if version_raw is not None and str(version_raw).strip():
+            version = str(version_raw).strip()[:120]
+        else:
+            version = default_infer_version(session_id, loop_index, mode)
+        universe = str(payload.get("universe") or "csi300").strip() or "csi300"
+        start = payload.get("start") or payload.get("start_date")
+        end = payload.get("end") or payload.get("end_date")
+        max_asofs_raw = payload.get("max_asofs", payload.get("maxAsOfs"))
+        max_asofs = int(max_asofs_raw) if max_asofs_raw is not None and str(max_asofs_raw) != "" else None
+        do_import_raw = payload.get("import", payload.get("do_import", True))
+        do_import = bool(do_import_raw) if not isinstance(do_import_raw, str) else do_import_raw.strip().lower() not in {
+            "0",
+            "false",
+            "no",
+        }
+
+        result = infer_and_import_session_scores(
+            session_id,
+            source=source,
+            version=version,
+            universe=universe,
+            mode=mode,
+            loop_index=loop_index,
+            start=str(start).strip() if start else None,
+            end=str(end).strip() if end else None,
+            max_asofs=max_asofs,
+            do_import=do_import,
+        )
+        logger.info(
+            "rdagent infer-from-session user=%s session=%s mode=%s version=%s as_of=%s..%s imported=%s",
+            getattr(request, "user_id", None),
+            session_id,
+            mode,
+            version,
+            result.get("as_of_min"),
+            result.get("as_of_max"),
+            result.get("imported"),
+        )
+        return _success(result)
+    except RdAgentBridgeError as exc:
+        return _failure(exc)
+    except ValueError as exc:
+        return jsonify({"code": 0, "msg": str(exc), "data": None}), 400
+    except Exception:
+        logger.exception("rdagent infer-from-session failed")
+        return jsonify({"code": 0, "msg": "rdagent.inferFromSessionFailed", "data": None}), 500
+
+
+@rdagent_blp.route("/alpha-preview", methods=["GET"])
+@login_required
+@admin_required
+def rdagent_alpha_preview():
+    """Ranked External Alpha scores for one as_of (used by infer result table)."""
+    try:
+        from app.services.external_alpha.store import preview_external_alpha_scores
+
+        source = str(request.args.get("source") or "rdagent").strip() or "rdagent"
+        version = str(request.args.get("version") or "").strip()
+        if not version:
+            return jsonify({"code": 0, "msg": "rdagent.versionRequired", "data": None}), 400
+        as_of = request.args.get("as_of") or request.args.get("asOf")
+        limit_raw = request.args.get("limit") or 50
+        order = request.args.get("order") or "desc"
+        try:
+            limit = int(limit_raw)
+        except (TypeError, ValueError):
+            limit = 50
+        data = preview_external_alpha_scores(
+            source=source,
+            version=version,
+            as_of=as_of,
+            limit=limit,
+            order=order,
+        )
+        return _success(data)
+    except ValueError as exc:
+        return jsonify({"code": 0, "msg": str(exc), "data": None}), 400
+    except Exception:
+        logger.exception("rdagent alpha-preview failed")
+        return jsonify({"code": 0, "msg": "rdagent.alphaPreviewFailed", "data": None}), 500

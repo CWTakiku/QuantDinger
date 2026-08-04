@@ -8,7 +8,7 @@ import os
 import re
 import threading
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import pandas as pd
@@ -551,6 +551,9 @@ class TradingExecutor:
             last_panel_fetch_at = time.monotonic()
             stale_price_logged = False
             consecutive_errors = 0
+            # Tracks the last trade_date for which the bound quant model's
+            # score panel was ensured, so we only call ensure once per bar.
+            last_ensured_trade_date: date | None = None
             strategy_name = str(strategy.get("strategy_name") or f"strategy_{strategy_id}")
             notification_config = _json_object(strategy.get("notification_config"))
             leverage = max(1.0, float(trading_config.get("leverage") or strategy.get("leverage") or 1))
@@ -755,42 +758,63 @@ class TradingExecutor:
                             last_panel_fetch_at = time.monotonic()
                             if execution_mode == "live":
                                 frames = self._align_latest_frame_prices(frames, runtime_prices())
-                        intents, messages, timestamp = session.process(frames)
-                        intents = [
-                            intent
-                            for intent in intents
-                            if _runtime_position_key(
-                                intent.symbol,
-                                intent.position_side,
-                            ) not in protected
-                        ]
-                        pending_count += len(intents)
-                        for message in messages:
-                            append_strategy_log(strategy_id, "info", message)
-                        for intent in intents:
-                            submitted = self._execute_strategy_v2_intent(
-                                strategy_id=strategy_id,
-                                strategy_name=strategy_name,
-                                intent=intent,
-                                frames=frames,
-                                candidates=candidates,
-                                initial_capital=initial_capital,
-                                leverage=leverage,
-                                execution_mode=execution_mode,
-                                notification_config=notification_config,
-                                trading_config=trading_config,
-                                exchange_config=exchange_config,
-                                signal_ts=self._intent_signal_timestamp(intent, timestamp),
-                                strategy_run_id=run_id,
-                                direction_mode=direction_mode,
+                        # Quant model ensure: skip this rebalance (place no
+                        # orders) if the bound model's score panel for
+                        # as_of = trade_date - score_lag_days is missing or
+                        # inference failed. No model binding → no-op (existing
+                        # strategies unaffected). Runs once per new trade_date.
+                        skip_rebalance = False
+                        trade_date = self._latest_frame_date(frames)
+                        if trade_date and trade_date != last_ensured_trade_date:
+                            from app.services.quant_models.live_hook import (
+                                ensure_before_rebalance,
                             )
-                            if intent.client_order_id:
-                                session.context.update_order_statuses({
-                                    intent.client_order_id: {
-                                        "client_order_id": intent.client_order_id,
-                                        "status": "submitted" if submitted else "rejected",
-                                    },
-                                })
+                            if not ensure_before_rebalance(strategy, trade_date):
+                                append_strategy_log(
+                                    strategy_id,
+                                    "warning",
+                                    f"Skip rebalance: quant model scores unavailable for trade_date={trade_date}",
+                                )
+                                skip_rebalance = True
+                            else:
+                                last_ensured_trade_date = trade_date
+                        if not skip_rebalance:
+                            intents, messages, timestamp = session.process(frames)
+                            intents = [
+                                intent
+                                for intent in intents
+                                if _runtime_position_key(
+                                    intent.symbol,
+                                    intent.position_side,
+                                ) not in protected
+                            ]
+                            pending_count += len(intents)
+                            for message in messages:
+                                append_strategy_log(strategy_id, "info", message)
+                            for intent in intents:
+                                submitted = self._execute_strategy_v2_intent(
+                                    strategy_id=strategy_id,
+                                    strategy_name=strategy_name,
+                                    intent=intent,
+                                    frames=frames,
+                                    candidates=candidates,
+                                    initial_capital=initial_capital,
+                                    leverage=leverage,
+                                    execution_mode=execution_mode,
+                                    notification_config=notification_config,
+                                    trading_config=trading_config,
+                                    exchange_config=exchange_config,
+                                    signal_ts=self._intent_signal_timestamp(intent, timestamp),
+                                    strategy_run_id=run_id,
+                                    direction_mode=direction_mode,
+                                )
+                                if intent.client_order_id:
+                                    session.context.update_order_statuses({
+                                        intent.client_order_id: {
+                                            "client_order_id": intent.client_order_id,
+                                            "status": "submitted" if submitted else "rejected",
+                                        },
+                                    })
                         next_signal_poll = cycle_started + process_poll
                     state_store.save(session.session_snapshot())
                     self._heartbeat(
@@ -1880,6 +1904,35 @@ class TradingExecutor:
             if price > 0:
                 prices[str(key)] = price
         return prices
+
+    @staticmethod
+    def _latest_frame_date(frames: dict[str, pd.DataFrame] | None) -> date | None:
+        """Return the calendar date of the latest bar across all frames.
+
+        Used by the quant-model ensure hook to compute
+        ``as_of = trade_date - score_lag_days`` once per new bar.
+        """
+        latest: pd.Timestamp | None = None
+        for frame in (frames or {}).values():
+            if frame is None or getattr(frame, "empty", True):
+                continue
+            try:
+                index = frame.index
+                if len(index) == 0:
+                    continue
+                ts = pd.Timestamp(index[-1])
+            except Exception:
+                continue
+            if ts is None:
+                continue
+            if latest is None or ts > latest:
+                latest = ts
+        if latest is None:
+            return None
+        try:
+            return latest.date()
+        except Exception:
+            return None
 
     @staticmethod
     def _live_prices(candidates: list[dict[str, Any]]) -> dict[str, float]:

@@ -3,8 +3,17 @@ Long-only weekly Top-N on CSI300 using imported external alpha scores (PIT).
 
 Reads scores with a configurable calendar-day lag, selects Top-N equal-weight names,
 and flattens holdings outside the target set.
+
+Live binding (optional): set ``params.model_key`` to a published quant model
+(``GET /api/quant-models``). Before each scheduled rebalance the live runtime
+then calls ``ensure_quant_model_scores(model, [as_of=trade_date-score_lag_days])``
+and **skips the rebalance** (no orders) if the score panel is still missing or
+inference fails — see ``app/services/quant_models/live_hook.py``. Without
+``model_key`` (or a matching ``source``+``version``) the hook is a no-op and
+existing strategies are unaffected.
 """
 
+# @param model_key str "" Optional published quant model key; binds this strategy to a model for live/paper auto-ensure before rebalance range=
 # @param source str rdagent External alpha signal source id range=
 # @param version str "" Score version tag (select from imported panels) range=
 # @param top_n int 30 Number of holdings range=5:100:1

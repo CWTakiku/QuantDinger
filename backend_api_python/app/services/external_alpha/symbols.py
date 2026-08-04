@@ -31,3 +31,34 @@ def canonicalize_cnstock_key(value: str) -> str:
         return f"CNStock:{ts}" if ts else raw
     ts = _to_ts_code(raw)
     return f"CNStock:{ts}" if ts else raw
+
+
+def cnstock_name_lookup_candidates(value: str) -> list[str]:
+    """Candidate keys for ``qd_market_symbols.symbol`` given a CNStock alpha key."""
+    key = canonicalize_cnstock_key(value)
+    if not key:
+        return []
+    raw = key.split(":", 1)[-1].strip().upper()
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def _add(item: str) -> None:
+        s = (item or "").strip().upper()
+        if s and s not in seen:
+            seen.add(s)
+            out.append(s)
+
+    _add(raw)
+    if raw.endswith(".SH") or raw.endswith(".SZ"):
+        code = raw[:-3]
+        exch = raw[-2:]
+        _add(code)
+        _add(f"{exch}{code}")
+    elif raw.startswith("SH") or raw.startswith("SZ"):
+        _add(raw[2:])
+        _add(_to_ts_code(raw))
+    elif raw.isdigit() and len(raw) == 6:
+        _add(_to_ts_code(raw))
+        prefix = "SH" if raw.startswith("6") else "SZ"
+        _add(f"{prefix}{raw}")
+    return out

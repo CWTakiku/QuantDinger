@@ -531,6 +531,77 @@ def list_external_alpha_score_panels():
         return jsonify({"code": 0, "msg": str(exc), "data": None}), 500
 
 
+@backtest_center_blp.route("/run-with-model", methods=["POST"])
+@login_required
+def run_strategy_backtest_with_model():
+    """Submit a quant-model-driven backtest job.
+
+    Accepts the same body as ``/api/backtest/run`` plus a ``model_key``. The
+    worker overrides ``params.source`` / ``params.version`` from the model,
+    ensures score panels exist for every rebalance ``as_of``, then runs the
+    canonical Strategy V2 backtest. Returns 202 with ``{job_id}`` for polling
+    via ``GET /api/backtest/model-jobs/<job_id>``.
+    """
+    try:
+        from app.services.quant_models.jobs import submit_prepare_and_backtest
+
+        payload = request.get_json(silent=True) or {}
+        model_key = str(payload.get("model_key") or payload.get("modelKey") or "").strip()
+        if not model_key:
+            return jsonify({
+                "code": 0,
+                "msg": "quantModels.modelKeyRequired",
+                "data": None,
+            }), 400
+        user_id = int(g.user_id)
+        snapshot = submit_prepare_and_backtest(payload=payload, user_id=user_id)
+        return jsonify({
+            "code": 1,
+            "msg": "queued",
+            "data": snapshot,
+        }), 202
+    except ValueError as exc:
+        return jsonify({"code": 0, "msg": str(exc), "data": None}), 400
+    except Exception as exc:
+        logger.exception("run-with-model submit failed")
+        return jsonify({"code": 0, "msg": str(exc), "data": None}), 500
+
+
+@backtest_center_blp.route("/model-jobs/<job_id>", methods=["GET"])
+@login_required
+def get_strategy_backtest_model_job(job_id: str):
+    """Poll a quant-model-driven backtest job created by ``/run-with-model``."""
+    try:
+        from app.services.quant_models.jobs import get_job
+
+        snapshot = get_job(str(job_id or ""), user_id=int(g.user_id))
+        if not snapshot:
+            return jsonify({
+                "code": 0,
+                "msg": "strategyV2.modelJobNotFound",
+                "data": None,
+            }), 404
+        return jsonify({"code": 1, "msg": "success", "data": snapshot})
+    except Exception as exc:
+        logger.exception("model job lookup failed")
+        return jsonify({"code": 0, "msg": str(exc), "data": None}), 500
+
+
+@backtest_center_blp.route("/model-jobs", methods=["GET"])
+@login_required
+def list_strategy_backtest_model_jobs():
+    """List the caller's recent quant-model backtest jobs (newest first)."""
+    try:
+        from app.services.quant_models.jobs import list_jobs
+
+        limit = max(1, min(200, int(request.args.get("limit") or 50)))
+        rows = list_jobs(user_id=int(g.user_id), limit=limit)
+        return jsonify({"code": 1, "msg": "success", "data": rows})
+    except Exception as exc:
+        logger.exception("model job list failed")
+        return jsonify({"code": 0, "msg": str(exc), "data": None}), 500
+
+
 def _positive_int(value: Any) -> int | None:
     try:
         parsed = int(value)

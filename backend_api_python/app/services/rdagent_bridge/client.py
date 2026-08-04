@@ -121,6 +121,43 @@ class RdAgentBridgeClient:
             body["loop_index"] = int(loop_index)
         return self._request("POST", "/v1/export", json_body=body)
 
+    def infer_session(
+        self,
+        session_id: str,
+        *,
+        source: str = "rdagent",
+        version: str = "default",
+        universe: str = "csi300",
+        mode: str = "model",
+        loop_index: int | None = None,
+        start: str | None = None,
+        end: str | None = None,
+        max_asofs: int | None = None,
+    ) -> dict[str, Any]:
+        """Ask bridge to forward-score factors/models on the latest Qlib calendar."""
+        body: dict[str, Any] = {
+            "session": session_id,
+            "source": source,
+            "version": version,
+            "universe": universe,
+            "mode": mode,
+        }
+        if loop_index is not None:
+            body["loop_index"] = int(loop_index)
+        if start:
+            body["start"] = str(start).strip()
+        if end:
+            body["end"] = str(end).strip()
+        if max_asofs is not None:
+            body["max_asofs"] = int(max_asofs)
+        # Model infer may rebuild Qlib datasets; allow longer than default export.
+        return self._request(
+            "POST",
+            "/v1/infer",
+            json_body=body,
+            timeout_s=max(self.timeout_s, 600),
+        )
+
     def factor_matrix(self, session_id: str, **params: Any) -> dict[str, Any]:
         sid = str(session_id or "").strip()
         if not sid:

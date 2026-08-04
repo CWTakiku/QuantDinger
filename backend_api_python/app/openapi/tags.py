@@ -24,6 +24,7 @@ QUICK_TRADE = "QuickTrade"
 IBKR = "IBKR"
 ALPACA = "Alpaca"
 RDAGENT = "RDAgent"
+QUANT_MODELS = "QuantModels"
 
 ALL_TAGS = [
     {"name": HEALTH, "description": "Liveness and API metadata (Public)"},
@@ -50,4 +51,5 @@ ALL_TAGS = [
     {"name": IBKR, "description": "Interactive Brokers adapter (Internal)"},
     {"name": ALPACA, "description": "Alpaca adapter (Internal)"},
     {"name": RDAGENT, "description": "RD-Agent research factory proxy (Internal)"},
+    {"name": QUANT_MODELS, "description": "Published quant models and factors (Internal)"},
 ]
