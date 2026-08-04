@@ -278,12 +278,28 @@ def get_positions():
                     market_type=market_type,
                     allowed_symbols=allowed,
                 )
+                from app.services.live_trading.position_ownership import (
+                    build_ownership_rows,
+                    list_reservations,
+                )
+
+                protected_rows = list_reservations(
+                    user_id=int(user_id),
+                    credential_id=cred_id,
+                    market_type=market_type,
+                )
                 account_reconciliation = reconcile_strategy_vs_account(
                     out,
                     account_rows,
                     allocated_rows=allocated_rows,
+                    protected_rows=protected_rows,
                 )
                 account_reconciliation["account_positions"] = account_rows
+                account_reconciliation["ownership"] = build_ownership_rows(
+                    account_rows=account_rows,
+                    allocated_rows=allocated_rows,
+                    reservation_rows=protected_rows,
+                )
             except Exception as e:
                 account_reconciliation = {
                     "status": "error",
@@ -340,7 +356,9 @@ def get_positions():
                 )
             except Exception as e:
                 account_risk = {"allowed": False, "violations": [f"accountRisk.snapshotFailed:{e}"]}
-        bot_type = str(st.get("bot_type") or trading_config.get("bot_type") or "").strip().lower()
+        from app.services.strategy_runtime.bot_type import resolve_bot_type
+
+        bot_type = resolve_bot_type(st, trading_config)
         if execution_mode == "live" and bot_type == "grid":
             try:
                 from app.services.exchange_execution import resolve_exchange_config
@@ -377,4 +395,3 @@ def get_positions():
         logger.error(f"get_positions failed: {str(e)}")
         logger.error(traceback.format_exc())
         return jsonify({'code': 0, 'msg': str(e), 'data': {'positions': [], 'items': []}}), 500
-
