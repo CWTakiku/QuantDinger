@@ -10,6 +10,7 @@ from app.services.external_alpha.store import (
     list_external_alpha_as_ofs,
     load_external_alpha_scores_as_of,
 )
+from app.services.market.ashare_session import decide_ashare_daily_sync
 from app.services.rdagent_bridge.client import RdAgentBridgeClient
 from app.services.rdagent_bridge.errors import RdAgentBridgeError
 from app.services.rdagent_bridge.import_session import infer_and_import_session_scores
@@ -41,12 +42,7 @@ def _as_of_covered(
     version: str,
     min_names: int = 1,
 ) -> bool:
-    """True when PIT load yields at least *min_names* scores on/before *as_of*.
-
-    Weekly ``score_lag_days`` often lands on weekends; scores are stored on
-    trading days only. Exact ``as_of`` membership is the wrong coverage test —
-    the strategy runtime uses the same PIT ``as_of <=`` semantics.
-    """
+    """True when PIT load yields at least *min_names* scores on/before *as_of*."""
     series = load_external_alpha_scores_as_of(
         as_of, source=source, version=version
     )
@@ -60,11 +56,57 @@ def _missing_as_ofs(
     version: str,
     min_names: int = 1,
 ) -> list[str]:
-    return [
-        d
-        for d in requested
-        if not _as_of_covered(d, source=source, version=version, min_names=min_names)
-    ]
+    """Dates that still need infer / import.
+
+    - Exact panel day with enough names → covered.
+    - Weekend/gap on or before the latest score day → PIT cover (strategy lag).
+    - Calendar day *after* the latest score day → missing (e.g. 08-05 after
+      08-04 scores), except Sat/Sun which stay PIT-covered until the next
+      trading-day refresh.
+    """
+    panel = list_external_alpha_as_ofs(source=source, version=version)
+    panel_set = set(panel)
+    max_panel = max(panel) if panel else ""
+    min_n = max(1, int(min_names))
+    missing: list[str] = []
+    for d in requested:
+        if d in panel_set and _as_of_covered(
+            d, source=source, version=version, min_names=min_n
+        ):
+            continue
+        if max_panel and d <= max_panel and _as_of_covered(
+            d, source=source, version=version, min_names=min_n
+        ):
+            continue
+        if max_panel and d > max_panel and _as_of_covered(
+            d, source=source, version=version, min_names=min_n
+        ):
+            try:
+                weekday = date.fromisoformat(d).weekday()
+            except ValueError:
+                weekday = -1
+            # Sat/Sun after Friday scores: weekly lag, not a new session close.
+            if weekday >= 5:
+                continue
+        missing.append(d)
+    return missing
+
+
+def _pit_as_of(as_of: str, panel: list[str]) -> str | None:
+    """Newest panel date on/before *as_of* (same semantics as strategy PIT)."""
+    candidates = [d for d in panel if d and d <= as_of]
+    return max(candidates) if candidates else None
+
+
+def _effective_as_ofs_for_requested(requested: list[str], panel: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for d in requested:
+        pit = _pit_as_of(d, panel)
+        if pit and pit not in seen:
+            seen.add(pit)
+            out.append(pit)
+    return sorted(out)
 
 
 def _ensure_qlib_for_as_ofs(
@@ -128,20 +170,52 @@ def ensure_quant_model_scores(
     )
 
     if not missing:
+        # PIT already covers request — still tell UI which exact panel days apply
+        # so stock-picker can snap away from dates with no exact cross-section.
+        panel = list_external_alpha_as_ofs(source=source, version=version)
         return {
             "missing_before": [],
             "inferred": 0,
             "still_missing": [],
+            "effective_as_ofs": _effective_as_ofs_for_requested(requested, panel),
+            "sync_reason": None,
+            "qlib_update": None,
         }
 
-    qlib_meta = _ensure_qlib_for_as_ofs(missing, client=client, on_progress=on_progress)
+    syncable: list[str] = []
+    block_reason: str | None = None
+    for d in missing:
+        decision = decide_ashare_daily_sync(d)
+        if decision.ok:
+            syncable.append(d)
+        else:
+            block_reason = block_reason or decision.reason
+
+    if not syncable:
+        panel = list_external_alpha_as_ofs(source=source, version=version)
+        return {
+            "missing_before": missing,
+            "inferred": 0,
+            "still_missing": missing,
+            "effective_as_ofs": _effective_as_ofs_for_requested(requested, panel),
+            "sync_reason": block_reason or "not_syncable",
+            "qlib_update": None,
+        }
+
+    qlib_meta = _ensure_qlib_for_as_ofs(
+        syncable, client=client, on_progress=on_progress
+    )
+    sync_reason = block_reason
+    if isinstance(qlib_meta, dict) and qlib_meta.get("ok") is False:
+        # Bridge soft-fail (HTTP 200 + ok:false) — do not raise; surface reason.
+        sync_reason = sync_reason or str(qlib_meta.get("reason") or "qlib_update_failed")
 
     if on_progress:
         on_progress(
             {
                 "phase": "inferring_scores",
                 "missing_before": missing,
-                "count": len(missing),
+                "count": len(syncable),
             }
         )
 
@@ -152,8 +226,8 @@ def ensure_quant_model_scores(
         universe=universe,
         mode=kind,
         loop_index=loop_index,
-        start=missing[0],
-        end=missing[-1],
+        start=syncable[0],
+        end=syncable[-1],
         do_import=True,
         client=client,
     )
@@ -187,5 +261,6 @@ def ensure_quant_model_scores(
         "export_meta": export_meta,
         "effective_as_ofs": sorted(effective_as_ofs),
         "qlib_update": qlib_meta,
+        "sync_reason": sync_reason,
     }
     return result

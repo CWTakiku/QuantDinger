@@ -296,8 +296,16 @@ def preview_external_alpha_scores(
     if not as_of_dates:
         return {"as_of": "", "as_of_dates": [], "rows": [], "stats": {}, "total": 0, "order": "desc"}
 
+    requested_as_of = ""
     if as_of:
-        eff = str(_as_date(as_of))
+        requested_as_of = str(_as_date(as_of))
+        eff = requested_as_of
+        # Exact panel day preferred; otherwise PIT-snap to newest as_of <= request
+        # (weekends / beyond-calendar dates share strategy runtime semantics).
+        if eff not in as_of_dates:
+            candidates = [d for d in as_of_dates if d and d <= eff]
+            if candidates:
+                eff = max(candidates)
     else:
         eff = as_of_dates[0]
 
@@ -354,7 +362,7 @@ def preview_external_alpha_scores(
 
     preview_rows = _attach_names(preview_rows)
 
-    return {
+    result: dict[str, Any] = {
         "source": source_s,
         "version": version_s,
         "as_of": str(eff)[:10],
@@ -365,6 +373,10 @@ def preview_external_alpha_scores(
         "limit": limit_n,
         "order": "asc" if order_s == "ASC" else "desc",
     }
+    if requested_as_of and requested_as_of != str(eff)[:10]:
+        result["requested_as_of"] = requested_as_of
+        result["pit_snapped"] = True
+    return result
 
 
 def load_external_alpha_scores_as_of(

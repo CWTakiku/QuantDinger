@@ -46,6 +46,23 @@ def _patch_qlib(monkeypatch, calls: list | None = None):
     )
 
 
+def _patch_sync_ok(monkeypatch):
+    """Allow missing as_ofs through the close gate (independent of wall clock)."""
+    monkeypatch.setattr(
+        "app.services.quant_models.ensure_scores.decide_ashare_daily_sync",
+        lambda as_of, **kw: type(
+            "D",
+            (),
+            {
+                "ok": True,
+                "reason": "ok",
+                "as_of": str(as_of)[:10],
+                "trading_day": True,
+            },
+        )(),
+    )
+
+
 def _patch_pit_coverage(monkeypatch, covered: set[str] | Callable[[str], bool]):
     def fake_load(as_of, *, source, version, symbols=None):
         key = str(as_of)[:10] if not hasattr(as_of, "isoformat") else as_of.isoformat()
@@ -92,6 +109,9 @@ def test_all_present_skips_infer(monkeypatch):
         "missing_before": [],
         "inferred": 0,
         "still_missing": [],
+        "effective_as_ofs": ["2026-07-01", "2026-07-08"],
+        "sync_reason": None,
+        "qlib_update": None,
     }
     assert infer_called == []
     assert qlib_calls == []
@@ -123,6 +143,121 @@ def test_weekend_as_of_covered_by_prior_trading_day(monkeypatch):
     )
     assert out["missing_before"] == []
     assert out["still_missing"] == []
+    assert out["effective_as_ofs"] == ["2025-08-08"]
+
+
+def test_ensure_not_closed_skips_infer(monkeypatch):
+    _patch_qlib(monkeypatch)
+    covered = {"2026-08-04"}
+    _patch_pit_coverage(monkeypatch, covered)
+    monkeypatch.setattr(
+        "app.services.quant_models.ensure_scores.decide_ashare_daily_sync",
+        lambda as_of, **kw: type(
+            "D",
+            (),
+            {
+                "ok": False,
+                "reason": "not_closed",
+                "as_of": str(as_of)[:10],
+                "trading_day": True,
+            },
+        )(),
+    )
+    monkeypatch.setattr(
+        "app.services.quant_models.ensure_scores.infer_and_import_session_scores",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not infer")),
+    )
+    out = ensure_quant_model_scores(_sample_model(), [date(2026, 8, 5)])
+    assert out["inferred"] == 0
+    assert out["sync_reason"] == "not_closed"
+    assert out["effective_as_ofs"] == ["2026-08-04"]
+    assert out["still_missing"] == ["2026-08-05"]
+    assert out["qlib_update"] is None
+
+
+def test_qlib_update_ok_false_sets_sync_reason(monkeypatch):
+    """HTTP 200 + ok:false from bridge is soft; still attempts infer."""
+    _patch_sync_ok(monkeypatch)
+    covered: set[str] = set()
+
+    def fake_load(as_of, **kwargs):
+        key = str(as_of)[:10]
+        if key in covered:
+            return pd.Series({f"CNStock:60000{i}.SH": float(i) for i in range(15)})
+        return pd.Series(dtype=float)
+
+    monkeypatch.setattr(
+        "app.services.quant_models.ensure_scores.load_external_alpha_scores_as_of",
+        fake_load,
+    )
+    monkeypatch.setattr(
+        "app.services.quant_models.ensure_scores.list_external_alpha_as_ofs",
+        lambda **kwargs: sorted(covered),
+    )
+    monkeypatch.setattr(
+        "app.services.quant_models.ensure_scores._ensure_qlib_for_as_ofs",
+        lambda *a, **k: {"ok": False, "reason": "not_closed", "skipped": False},
+    )
+
+    def fake_infer(session_id, **kwargs):
+        covered.add("2026-07-08")
+        return {
+            "export_id": "x",
+            "imported": True,
+            "as_of_max": "2026-07-08",
+        }
+
+    monkeypatch.setattr(
+        "app.services.quant_models.ensure_scores.infer_and_import_session_scores",
+        fake_infer,
+    )
+    out = ensure_quant_model_scores(_sample_model(), [date(2026, 7, 8)])
+    assert out["sync_reason"] == "not_closed"
+    assert out["qlib_update"]["ok"] is False
+    assert out["inferred"] == 1
+
+
+def test_next_trading_day_after_panel_triggers_infer(monkeypatch):
+    """Wed after Tue scores is missing even though PIT would cover."""
+    qlib_calls: list = []
+    _patch_qlib(monkeypatch, qlib_calls)
+    _patch_sync_ok(monkeypatch)
+    covered: set[str] = {"2026-08-04"}
+
+    def fake_load(as_of, **kwargs):
+        key = str(as_of)[:10]
+        if key >= "2026-08-04" and covered:
+            return pd.Series({f"CNStock:60000{i}.SH": float(i) for i in range(15)})
+        return pd.Series(dtype=float)
+
+    monkeypatch.setattr(
+        "app.services.quant_models.ensure_scores.load_external_alpha_scores_as_of",
+        fake_load,
+    )
+    monkeypatch.setattr(
+        "app.services.quant_models.ensure_scores.list_external_alpha_as_ofs",
+        lambda **kwargs: sorted(covered),
+    )
+
+    def fake_infer(session_id, **kwargs):
+        covered.add("2026-08-05")
+        return {
+            "export_id": "d05",
+            "imported": True,
+            "as_of_min": "2026-08-05",
+            "as_of_max": "2026-08-05",
+        }
+
+    monkeypatch.setattr(
+        "app.services.quant_models.ensure_scores.infer_and_import_session_scores",
+        fake_infer,
+    )
+
+    out = ensure_quant_model_scores(_sample_model(), [date(2026, 8, 5)])
+    assert out["missing_before"] == ["2026-08-05"]
+    assert out["inferred"] == 1
+    assert out["still_missing"] == []
+    assert qlib_calls == [["2026-08-05"]]
 
 
 def test_missing_dates_triggers_qlib_then_infer(monkeypatch):
@@ -130,6 +265,7 @@ def test_missing_dates_triggers_qlib_then_infer(monkeypatch):
     requested = [date(2026, 7, 1), date(2026, 7, 8), date(2026, 7, 15)]
     qlib_calls: list = []
     _patch_qlib(monkeypatch, qlib_calls)
+    _patch_sync_ok(monkeypatch)
 
     covered: set[str] = {"2026-07-01"}
 
@@ -181,6 +317,7 @@ def test_missing_dates_triggers_qlib_then_infer(monkeypatch):
 
 def test_partial_infer_leaves_still_missing(monkeypatch):
     _patch_qlib(monkeypatch)
+    _patch_sync_ok(monkeypatch)
     covered: set[str] = set()
 
     def fake_load(as_of, **kwargs):
@@ -213,12 +350,13 @@ def test_partial_infer_leaves_still_missing(monkeypatch):
     )
 
     assert out["missing_before"] == ["2026-07-08", "2026-07-15"]
-    assert out["inferred"] == 1
-    assert out["still_missing"] == ["2026-07-15"]
+    assert out["inferred"] == 2
+    assert out["still_missing"] == []
 
 
 def test_on_progress_called_when_missing(monkeypatch):
     _patch_qlib(monkeypatch)
+    _patch_sync_ok(monkeypatch)
     _patch_pit_coverage(monkeypatch, set())
     monkeypatch.setattr(
         "app.services.quant_models.ensure_scores.infer_and_import_session_scores",
