@@ -81,3 +81,34 @@ def test_qlib_eod_calls_qlib_update_when_ok(monkeypatch):
     assert out["qlib_update"]["end"] == "2026-08-05"
     assert out["warmup_models"] == 0
     assert marked == ["2026-08-05"]
+
+
+def test_qlib_eod_soft_fail_does_not_mark(monkeypatch):
+    monkeypatch.setenv("ENABLE_QLIB_EOD_SYNC", "true")
+    monkeypatch.setattr(
+        "app.tasks.qlib_eod.decide_ashare_daily_sync",
+        lambda as_of, **kw: type(
+            "D",
+            (),
+            {"ok": True, "reason": "ok", "as_of": as_of, "trading_day": True},
+        )(),
+    )
+    monkeypatch.setattr("app.tasks.qlib_eod._already_synced", lambda day: False)
+    marked = []
+    monkeypatch.setattr("app.tasks.qlib_eod._mark_synced", lambda day: marked.append(day))
+
+    class FakeClient:
+        @classmethod
+        def from_env(cls):
+            return cls()
+
+        def qlib_update(self, *, end=None, force=False):
+            return {"ok": False, "reason": "update_failed", "end": end}
+
+    monkeypatch.setattr("app.tasks.qlib_eod.RdAgentBridgeClient", FakeClient)
+    from app.tasks.qlib_eod import run_qlib_eod_sync_task
+
+    out = run_qlib_eod_sync_task.run(as_of="2026-08-05")
+    assert out["ok"] is False
+    assert out["reason"] == "update_failed"
+    assert marked == []

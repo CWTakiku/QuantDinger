@@ -117,6 +117,19 @@ def run_qlib_eod_sync_task(self, as_of: str | None = None):
 
     client = RdAgentBridgeClient.from_env()
     qlib_meta = client.qlib_update(end=day)
+    # Soft Bridge failures (HTTP 200 + ok:false) must NOT mark the day —
+    # otherwise Beat will skip retries for the rest of the session.
+    if not isinstance(qlib_meta, dict) or qlib_meta.get("ok") is not True:
+        reason = None
+        if isinstance(qlib_meta, dict):
+            reason = qlib_meta.get("reason") or qlib_meta.get("error")
+        return {
+            "ok": False,
+            "as_of": day,
+            "qlib_update": qlib_meta,
+            "reason": reason or "qlib_update_failed",
+        }
+
     _mark_synced(day)
     warmup_models = _maybe_warmup(day)
     return {
