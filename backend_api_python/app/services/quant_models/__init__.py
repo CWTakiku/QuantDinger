@@ -1,3 +1,4 @@
+from app.services.quant_models.composition import build_quant_model_composition
 from app.services.quant_models.store import (
     archive_quant_model,
     get_quant_model,
@@ -7,6 +8,7 @@ from app.services.quant_models.store import (
 
 __all__ = [
     "archive_quant_model",
+    "build_quant_model_composition",
     "get_quant_model",
     "list_quant_models",
     "publish_quant_model",

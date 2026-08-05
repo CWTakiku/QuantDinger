@@ -19,6 +19,10 @@
 
 OpenAPI 契约见 `docs/api/openapi.yaml`（RDAgent 标签）。
 
+### 选股（已发布量化模型）
+
+管理员侧栏 **选股**（`/stock-picker`，位于「研究工厂」之上，**仅 admin**）消费研究工厂已发布的量化模型：左栏列出 `published` 模型；中栏展示组成（因子清单 + 学习器，Bridge 离线时降级提示）；右栏选择交易日、调用 `ensure-scores` 推理并预览 **Top-N** 选股名单（默认 30）。发布/归档仍在研究工厂完成。设计见 `docs/superpowers/specs/2026-08-04-stock-picker-design.md`。
+
 ### 会话深度（SOTA 库 / 模型 / 因子矩阵 / 按 Loop 导入）
 
 会话详情页（`/rdagent/sessions/<id>`）通过 Bridge 只读解析 `log/<session>/Loop_*` 与 workspace 产物：

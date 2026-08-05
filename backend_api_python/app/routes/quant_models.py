@@ -1,13 +1,19 @@
 """Quant model publish/archive APIs (admin only)."""
 
+from datetime import date, datetime, timedelta
+
 from flask import g, jsonify, request
 
 from app.openapi.blueprint import HumanBlueprint as Blueprint
 from app.services.quant_models import (
     archive_quant_model,
+    get_quant_model,
     list_quant_models,
     publish_quant_model,
 )
+from app.services.quant_models.composition import build_quant_model_composition
+from app.services.quant_models.ensure_scores import ensure_quant_model_scores
+from app.services.rdagent_bridge.errors import RdAgentBridgeError
 from app.utils.auth import admin_required, login_required
 from app.utils.logger import get_logger
 
@@ -18,6 +24,48 @@ quant_models_blp = Blueprint("quant_models", __name__)
 
 def _success(data=None, *, status: int = 200):
     return jsonify({"code": 1, "msg": "success", "data": data}), status
+
+
+def _parse_day(value: object) -> date:
+    text = str(value or "").strip()[:10]
+    return datetime.strptime(text, "%Y-%m-%d").date()
+
+
+def _as_ofs_from_body(payload: dict) -> list[date]:
+    raw_list = payload.get("as_ofs")
+    if isinstance(raw_list, list) and raw_list:
+        return sorted({_parse_day(item) for item in raw_list})
+    start = payload.get("start")
+    end = payload.get("end")
+    if start and end:
+        a = _parse_day(start)
+        b = _parse_day(end)
+        if b < a:
+            raise ValueError("end must be >= start")
+        out: list[date] = []
+        cur = a
+        for _ in range(400):
+            out.append(cur)
+            if cur >= b:
+                break
+            cur = cur + timedelta(days=1)
+        return out
+    raise ValueError("as_ofs or start/end required")
+
+
+def _provenance_session_loop(model: dict) -> tuple[str | None, int | None]:
+    provenance = model.get("provenance_json") or {}
+    if not isinstance(provenance, dict):
+        provenance = {}
+    session_id = str(provenance.get("session_id") or "").strip()
+    loop_raw = provenance.get("loop_index")
+    loop_index: int | None = None
+    if loop_raw is not None and str(loop_raw).strip() != "":
+        try:
+            loop_index = int(loop_raw)
+        except (TypeError, ValueError):
+            loop_index = None
+    return (session_id or None, loop_index)
 
 
 def _is_unique_violation(exc: BaseException) -> bool:
@@ -86,7 +134,7 @@ def publish_model():
         return jsonify({"code": 0, "msg": "quantModels.publishFailed", "data": None}), 500
 
 
-@quant_models_blp.route("/", methods=["GET"])
+@quant_models_blp.route("/", methods=["GET"], strict_slashes=False)
 @login_required
 @admin_required
 def list_models():
@@ -98,6 +146,48 @@ def list_models():
     except Exception:
         logger.exception("list quant models failed")
         return jsonify({"code": 0, "msg": "quantModels.listFailed", "data": None}), 500
+
+
+@quant_models_blp.route("/<string:model_key>/ensure-scores", methods=["POST"])
+@login_required
+@admin_required
+def ensure_model_scores(model_key: str):
+    model = get_quant_model(model_key)
+    if not model:
+        return jsonify({"code": 0, "msg": "quantModels.notFound", "data": None}), 404
+    if str(model.get("status") or "").strip() != "published":
+        return jsonify({"code": 0, "msg": "quantModels.notPublished", "data": None}), 400
+    payload = request.get_json(silent=True) or {}
+    try:
+        as_ofs = _as_ofs_from_body(payload)
+    except ValueError as exc:
+        return jsonify({"code": 0, "msg": str(exc), "data": None}), 400
+    session_id, loop_index = _provenance_session_loop(model)
+    if not session_id or loop_index is None:
+        return jsonify(
+            {"code": 0, "msg": "量化模型缺少 session_id/loop_index 溯源", "data": None}
+        ), 400
+    try:
+        result = ensure_quant_model_scores(model, as_ofs)
+    except RdAgentBridgeError as exc:
+        return jsonify({"code": 0, "msg": str(exc), "data": None}), int(getattr(exc, "status_code", None) or 503)
+    except Exception as exc:
+        logger.exception("ensure quant model scores failed")
+        return jsonify({"code": 0, "msg": str(exc)[:240] or "quantModels.ensureFailed", "data": None}), 500
+    return _success(result)
+
+
+@quant_models_blp.route("/<string:model_key>", methods=["GET"], strict_slashes=False)
+@login_required
+@admin_required
+def get_model(model_key: str):
+    model = get_quant_model(model_key)
+    if not model:
+        return jsonify({"code": 0, "msg": "quantModels.notFound", "data": None}), 404
+    composition = build_quant_model_composition(model)
+    data = dict(model)
+    data["composition"] = composition
+    return _success(data)
 
 
 @quant_models_blp.route("/<string:model_key>/archive", methods=["POST"])

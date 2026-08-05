@@ -180,3 +180,113 @@ def test_archive_not_found(client, monkeypatch):
     )
     assert resp.status_code == 400
     assert "not found" in resp.get_json()["msg"]
+
+
+def test_get_model_detail_includes_composition(client, monkeypatch):
+    monkeypatch.setattr(
+        "app.routes.quant_models.get_quant_model",
+        lambda key: {
+            "model_key": key,
+            "display_name": "M1",
+            "kind": "factor",
+            "status": "published",
+            "alpha_source": "rdagent",
+            "alpha_version": "qm_m1",
+            "universe": "csi300",
+            "provenance_json": {"session_id": "s1", "loop_index": 1, "mode": "factor"},
+            "metrics_json": {},
+        },
+    )
+    monkeypatch.setattr(
+        "app.routes.quant_models.build_quant_model_composition",
+        lambda model, detail_fetcher=None: {
+            "available": True,
+            "kind": "factor",
+            "session_id": "s1",
+            "loop_index": 1,
+            "learner": None,
+            "factors": [{"name": "f1", "formulation": "x", "description": "d"}],
+            "bridge_error": None,
+        },
+    )
+    resp = client.get("/api/quant-models/m1", headers=_admin_auth_headers(monkeypatch))
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["code"] == 1
+    assert body["data"]["composition"]["factors"][0]["name"] == "f1"
+
+
+def test_get_model_detail_404(client, monkeypatch):
+    monkeypatch.setattr("app.routes.quant_models.get_quant_model", lambda key: None)
+    resp = client.get("/api/quant-models/missing", headers=_admin_auth_headers(monkeypatch))
+    assert resp.status_code == 404
+
+
+def test_ensure_scores_published_only(client, monkeypatch):
+    calls = {}
+
+    monkeypatch.setattr(
+        "app.routes.quant_models.get_quant_model",
+        lambda key: {
+            "model_key": key,
+            "status": "published",
+            "kind": "model",
+            "alpha_source": "rdagent",
+            "alpha_version": "qm_m1",
+            "universe": "csi300",
+            "provenance_json": {"session_id": "s1", "loop_index": 0, "mode": "model"},
+        },
+    )
+
+    def fake_ensure(model, as_ofs, on_progress=None):
+        calls["as_ofs"] = [d.isoformat() if hasattr(d, "isoformat") else str(d) for d in as_ofs]
+        return {"missing_before": calls["as_ofs"], "inferred": 1, "still_missing": []}
+
+    monkeypatch.setattr("app.routes.quant_models.ensure_quant_model_scores", fake_ensure)
+    resp = client.post(
+        "/api/quant-models/m1/ensure-scores",
+        json={"as_ofs": ["2026-04-10"]},
+        headers=_admin_auth_headers(monkeypatch),
+    )
+    assert resp.status_code == 200
+    assert calls["as_ofs"] == ["2026-04-10"]
+
+
+def test_ensure_scores_rejects_missing_provenance(client, monkeypatch):
+    ensure_called = []
+
+    monkeypatch.setattr(
+        "app.routes.quant_models.get_quant_model",
+        lambda key: {
+            "model_key": key,
+            "status": "published",
+            "provenance_json": {},
+        },
+    )
+
+    def fake_ensure(model, as_ofs, on_progress=None):
+        ensure_called.append(True)
+        return {}
+
+    monkeypatch.setattr("app.routes.quant_models.ensure_quant_model_scores", fake_ensure)
+    resp = client.post(
+        "/api/quant-models/m1/ensure-scores",
+        json={"as_ofs": ["2026-04-10"]},
+        headers=_admin_auth_headers(monkeypatch),
+    )
+    assert resp.status_code == 400
+    assert "session_id" in resp.get_json()["msg"]
+    assert ensure_called == []
+
+
+def test_ensure_scores_rejects_archived(client, monkeypatch):
+    monkeypatch.setattr(
+        "app.routes.quant_models.get_quant_model",
+        lambda key: {"model_key": key, "status": "archived", "provenance_json": {}},
+    )
+    resp = client.post(
+        "/api/quant-models/m1/ensure-scores",
+        json={"as_ofs": ["2026-04-10"]},
+        headers=_admin_auth_headers(monkeypatch),
+    )
+    assert resp.status_code == 400
