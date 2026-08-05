@@ -1,7 +1,8 @@
 # Qlib 收盘同步与选股刷新设计
 
 > 日期：2026-08-05  
-> 状态：已确认；实现计划见 `docs/superpowers/plans/2026-08-05-qlib-eod-sync.md`  
+> 状态：已实现；计划见 `docs/superpowers/plans/2026-08-05-qlib-eod-sync.md`（Tasks 1–6）  
+
 > 范围：交易日收盘判定、Bridge `qlib/update`、选股「刷新分数」即时同步、Celery Beat 日终同步  
 > 相关：`docs/superpowers/specs/2026-08-04-stock-picker-design.md`、`docs/superpowers/specs/2026-08-02-qd-rdagent-bridge-module-design.md`
 
