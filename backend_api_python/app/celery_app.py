@@ -47,6 +47,7 @@ celery_app.conf.update(
         "app.tasks.fast_analysis",
         "app.tasks.maintenance",
         "app.tasks.csi300_enhanced",
+        "app.tasks.qlib_eod",
     ),
     task_routes={
         "quantdinger.tasks.fast_analysis": {"queue": "ai"},
@@ -55,6 +56,7 @@ celery_app.conf.update(
         "quantdinger.tasks.ai_calibration": {"queue": "maintenance"},
         "quantdinger.tasks.market_catalog_sync": {"queue": "maintenance"},
         "quantdinger.tasks.csi300_enhanced_daily_sync": {"queue": "maintenance"},
+        "quantdinger.tasks.qlib_eod_sync": {"queue": "maintenance"},
         "quantdinger.tasks.worker_heartbeat": {"queue": "maintenance"},
         "quantdinger.tasks.cleanup_runtime_metadata": {"queue": "maintenance"},
     },
@@ -74,6 +76,10 @@ celery_app.conf.update(
         "csi300-enhanced-daily-sync": {
             "task": "quantdinger.tasks.csi300_enhanced_daily_sync",
             "schedule": max(900, int(os.getenv("CSI300_ENHANCED_SYNC_INTERVAL_SEC", "86400"))),
+        },
+        "qlib-eod-sync": {
+            "task": "quantdinger.tasks.qlib_eod_sync",
+            "schedule": max(300, int(os.getenv("QLIB_EOD_POLL_INTERVAL_SEC", "900"))),
         },
         "celery-worker-heartbeat": {
             "task": "quantdinger.tasks.worker_heartbeat",
