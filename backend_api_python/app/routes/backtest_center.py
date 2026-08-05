@@ -207,7 +207,27 @@ def run_strategy_backtest():
     user_id = int(g.user_id)
     try:
         payload = request.get_json(silent=True) or {}
+        # Selecting a published quant model must go through ensure-scores first.
+        model_key = str(payload.get("model_key") or payload.get("modelKey") or "").strip()
+        if model_key:
+            from app.services.quant_models.jobs import submit_prepare_and_backtest
+
+            snapshot = submit_prepare_and_backtest(payload=payload, user_id=user_id)
+            return jsonify({
+                "code": 1,
+                "msg": "success",
+                "data": snapshot,
+            }), 202
+
         prepared = _prepare_run(payload, user_id)
+        from app.services.external_alpha.coverage import assert_external_alpha_score_coverage
+
+        assert_external_alpha_score_coverage(
+            code=str(prepared.get("code") or ""),
+            params=prepared.get("params") or {},
+            start_date=prepared["start_date"],
+            end_date=prepared["end_date"],
+        )
         billing, charge = _consume_backtest_credits(user_id)
         if charge.get("error") == "insufficient_credits":
             return jsonify({
@@ -578,7 +598,7 @@ def get_strategy_backtest_model_job(job_id: str):
         if not snapshot:
             return jsonify({
                 "code": 0,
-                "msg": "strategyV2.modelJobNotFound",
+                "msg": "strategyV2.backtest.modelJobNotFound",
                 "data": None,
             }), 404
         return jsonify({"code": 1, "msg": "success", "data": snapshot})

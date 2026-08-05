@@ -84,6 +84,7 @@ def test_publish_sets_alpha_version():
     assert out["provenance_json"]["mode"] == "model"
     assert len(captured) == 1
     _sql, params = captured[0]
+    assert "ON CONFLICT" in _sql.upper()
     # model_key, display_name, kind, alpha_source, alpha_version, universe,
     # owner_user_id, provenance_json, metrics_json
     assert params[4] == "qm_sess-1_loop0_model"

@@ -60,12 +60,25 @@ def publish_quant_model(
 
     with get_db_connection() as db:
         cur = db.cursor()
+        # Same session/loop/kind re-publish keeps model_key stable (strategies keep working).
         cur.execute(
             """
             INSERT INTO qd_quant_models
             (model_key, display_name, status, kind, alpha_source, alpha_version,
              universe, owner_user_id, provenance_json, metrics_json, published_at)
             VALUES (?, ?, 'published', ?, ?, ?, ?, ?, ?::jsonb, ?::jsonb, NOW())
+            ON CONFLICT (model_key) DO UPDATE SET
+              display_name = EXCLUDED.display_name,
+              status = 'published',
+              kind = EXCLUDED.kind,
+              alpha_source = EXCLUDED.alpha_source,
+              alpha_version = EXCLUDED.alpha_version,
+              universe = EXCLUDED.universe,
+              owner_user_id = EXCLUDED.owner_user_id,
+              provenance_json = EXCLUDED.provenance_json,
+              metrics_json = EXCLUDED.metrics_json,
+              published_at = NOW(),
+              updated_at = NOW()
             RETURNING *
             """,
             (
@@ -142,6 +155,76 @@ def archive_quant_model(model_key: str) -> dict[str, Any]:
             """
             UPDATE qd_quant_models
             SET status = 'archived', updated_at = NOW()
+            WHERE model_key = ?
+            RETURNING *
+            """,
+            (key,),
+        )
+        row = cur.fetchone()
+        db.commit()
+    out = _serialize_row(row)
+    if not out:
+        raise ValueError(f"quant model not found: {key}")
+    return out
+
+
+def update_quant_model(
+    model_key: str,
+    *,
+    display_name: str | None = None,
+    universe: str | None = None,
+) -> dict[str, Any]:
+    """Update editable fields only (display_name / universe)."""
+    key = str(model_key or "").strip()
+    if not key:
+        raise ValueError("model_key is required")
+
+    sets: list[str] = []
+    params: list[Any] = []
+    if display_name is not None:
+        name = str(display_name).strip()
+        if not name:
+            raise ValueError("display_name must not be empty")
+        sets.append("display_name = ?")
+        params.append(name)
+    if universe is not None:
+        uni = str(universe).strip() or "csi300"
+        sets.append("universe = ?")
+        params.append(uni)
+    if not sets:
+        raise ValueError("no fields to update")
+
+    sets.append("updated_at = NOW()")
+    params.append(key)
+    with get_db_connection() as db:
+        cur = db.cursor()
+        cur.execute(
+            f"""
+            UPDATE qd_quant_models
+            SET {', '.join(sets)}
+            WHERE model_key = ?
+            RETURNING *
+            """,
+            tuple(params),
+        )
+        row = cur.fetchone()
+        db.commit()
+    out = _serialize_row(row)
+    if not out:
+        raise ValueError(f"quant model not found: {key}")
+    return out
+
+
+def delete_quant_model(model_key: str) -> dict[str, Any]:
+    """Hard-delete the model row. Does not remove alpha score panels."""
+    key = str(model_key or "").strip()
+    if not key:
+        raise ValueError("model_key is required")
+    with get_db_connection() as db:
+        cur = db.cursor()
+        cur.execute(
+            """
+            DELETE FROM qd_quant_models
             WHERE model_key = ?
             RETURNING *
             """,

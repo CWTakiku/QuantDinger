@@ -7,9 +7,11 @@ from flask import g, jsonify, request
 from app.openapi.blueprint import HumanBlueprint as Blueprint
 from app.services.quant_models import (
     archive_quant_model,
+    delete_quant_model,
     get_quant_model,
     list_quant_models,
     publish_quant_model,
+    update_quant_model,
 )
 from app.services.quant_models.composition import build_quant_model_composition
 from app.services.quant_models.ensure_scores import ensure_quant_model_scores
@@ -129,7 +131,13 @@ def publish_model():
         return jsonify({"code": 0, "msg": str(exc), "data": None}), 400
     except Exception as exc:
         if _is_unique_violation(exc):
-            return jsonify({"code": 0, "msg": str(exc), "data": None}), 409
+            return jsonify(
+                {
+                    "code": 0,
+                    "msg": "该量化模型已存在（相同会话/Loop/类型）。请直接使用已发布列表，或先归档后再发布。",
+                    "data": None,
+                }
+            ), 409
         logger.exception("publish quant model failed")
         return jsonify({"code": 0, "msg": "quantModels.publishFailed", "data": None}), 500
 
@@ -188,6 +196,65 @@ def get_model(model_key: str):
     data = dict(model)
     data["composition"] = composition
     return _success(data)
+
+
+@quant_models_blp.route("/<string:model_key>", methods=["PATCH"], strict_slashes=False)
+@login_required
+@admin_required
+def patch_model(model_key: str):
+    """Update display_name and/or universe."""
+    try:
+        key = str(model_key or "").strip()
+        if not key:
+            return jsonify({"code": 0, "msg": "quantModels.modelKeyRequired", "data": None}), 400
+        payload = request.get_json(silent=True) or {}
+        kwargs: dict = {}
+        if "display_name" in payload or "displayName" in payload:
+            kwargs["display_name"] = payload.get("display_name", payload.get("displayName"))
+        if "universe" in payload:
+            kwargs["universe"] = payload.get("universe")
+        if not kwargs:
+            return jsonify({"code": 0, "msg": "quantModels.noFieldsToUpdate", "data": None}), 400
+        result = update_quant_model(key, **kwargs)
+        logger.info(
+            "quant model updated user=%s model_key=%s fields=%s",
+            getattr(g, "user_id", None),
+            key,
+            sorted(kwargs.keys()),
+        )
+        return _success(result)
+    except ValueError as exc:
+        msg = str(exc)
+        status = 404 if "not found" in msg.lower() else 400
+        return jsonify({"code": 0, "msg": msg, "data": None}), status
+    except Exception:
+        logger.exception("update quant model failed")
+        return jsonify({"code": 0, "msg": "quantModels.updateFailed", "data": None}), 500
+
+
+@quant_models_blp.route("/<string:model_key>", methods=["DELETE"], strict_slashes=False)
+@login_required
+@admin_required
+def remove_model(model_key: str):
+    """Hard-delete a published quant model row (scores panels are kept)."""
+    try:
+        key = str(model_key or "").strip()
+        if not key:
+            return jsonify({"code": 0, "msg": "quantModels.modelKeyRequired", "data": None}), 400
+        result = delete_quant_model(key)
+        logger.info(
+            "quant model deleted user=%s model_key=%s",
+            getattr(g, "user_id", None),
+            key,
+        )
+        return _success(result)
+    except ValueError as exc:
+        msg = str(exc)
+        status = 404 if "not found" in msg.lower() else 400
+        return jsonify({"code": 0, "msg": msg, "data": None}), status
+    except Exception:
+        logger.exception("delete quant model failed")
+        return jsonify({"code": 0, "msg": "quantModels.deleteFailed", "data": None}), 500
 
 
 @quant_models_blp.route("/<string:model_key>/archive", methods=["POST"])

@@ -101,11 +101,20 @@ def build_quant_model_composition(
     if loop is None:
         return _empty(kind, session_id, loop_index, f"会话中未找到 Loop_{loop_index}")
 
+    # Prefer the loop's own kind: a model may be published with mode=factor by mistake
+    # (e.g. Loop_7 is model while model_key ends with _factor), which would otherwise
+    # yield an empty factor table.
+    loop_kind = str(loop.get("kind") or "").strip().lower()
+    effective_kind = loop_kind if loop_kind in ("factor", "model") else kind
+
     factors: list[dict[str, Any]] = []
     learner = None
     artifacts = loop.get("artifacts") or loop.get("factors") or []
-    if kind == "factor":
+    sota = detail.get("sota_library") if isinstance(detail, dict) else None
+    if effective_kind == "factor":
         factors = _factor_rows(artifacts)
+        if not factors:
+            factors = _factor_rows(sota)
         learner = None
     else:
         model_art = next(
@@ -115,11 +124,11 @@ def build_quant_model_composition(
         learner = _learner_from_artifact(model_art)
         factors = _factor_rows(artifacts)
         if not factors:
-            factors = _factor_rows(detail.get("sota_library") if isinstance(detail, dict) else None)
+            factors = _factor_rows(sota)
 
     return {
         "available": True,
-        "kind": kind,
+        "kind": effective_kind,
         "session_id": session_id,
         "loop_index": loop_index,
         "learner": learner,

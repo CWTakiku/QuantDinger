@@ -171,6 +171,28 @@ def test_export_session_with_loop_index(monkeypatch):
     assert captured["kwargs"]["json"]["loop_index"] == 7
 
 
+def test_qlib_update_posts_end(monkeypatch):
+    captured: dict = {}
+
+    def fake_request(method, url, **kwargs):
+        captured["method"] = method
+        captured["url"] = url
+        captured["kwargs"] = kwargs
+        return MagicMock(
+            status_code=200,
+            json=lambda: {"updated": True, "calendar_end": "2026-08-04"},
+        )
+
+    monkeypatch.setattr("app.services.rdagent_bridge.client.requests.request", fake_request)
+    client = RdAgentBridgeClient("http://127.0.0.1:19901", "token")
+    out = client.qlib_update(end="2026-08-04")
+    assert out["updated"] is True
+    assert captured["method"] == "POST"
+    assert captured["url"] == "http://127.0.0.1:19901/v1/qlib/update"
+    assert captured["kwargs"]["json"] == {"force": False, "end": "2026-08-04"}
+    assert captured["kwargs"]["timeout"] >= 900
+
+
 def test_factor_matrix_gets_json(monkeypatch):
     captured: dict = {}
 

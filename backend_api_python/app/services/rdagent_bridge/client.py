@@ -121,6 +121,24 @@ class RdAgentBridgeClient:
             body["loop_index"] = int(loop_index)
         return self._request("POST", "/v1/export", json_body=body)
 
+    def qlib_update(
+        self,
+        *,
+        end: str | None = None,
+        force: bool = False,
+    ) -> dict[str, Any]:
+        """Ask bridge to incrementally update local Qlib cn_data through *end*."""
+        body: dict[str, Any] = {"force": bool(force)}
+        if end:
+            body["end"] = str(end).strip()
+        # Tushare fetch + dump_update can take several minutes for a multi-day gap.
+        return self._request(
+            "POST",
+            "/v1/qlib/update",
+            json_body=body,
+            timeout_s=max(self.timeout_s, 900),
+        )
+
     def infer_session(
         self,
         session_id: str,

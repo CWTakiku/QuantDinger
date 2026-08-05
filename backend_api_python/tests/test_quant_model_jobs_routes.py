@@ -168,7 +168,7 @@ def test_get_model_job_not_found(client, monkeypatch):
         headers=_user_auth_headers(monkeypatch),
     )
     assert resp.status_code == 404
-    assert resp.get_json()["msg"] == "strategyV2.modelJobNotFound"
+    assert resp.get_json()["msg"] == "strategyV2.backtest.modelJobNotFound"
 
 
 def test_get_model_job_returns_snapshot(client, monkeypatch):

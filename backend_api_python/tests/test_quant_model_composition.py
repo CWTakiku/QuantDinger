@@ -127,3 +127,40 @@ def test_build_composition_bridge_down():
     assert out["learner"] is None
     assert out["factors"] == []
     assert "bridge" in (out["bridge_error"] or "").lower() or "rdagent" in (out["bridge_error"] or "").lower()
+
+
+def test_build_composition_published_factor_but_loop_is_model():
+    """Loop kind wins when publish mode mismatches (empty factor table otherwise)."""
+    model = {
+        "kind": "factor",
+        "provenance_json": {"session_id": "sess-1", "loop_index": 7, "mode": "factor"},
+    }
+
+    def fake_detail(session_id, include=None):
+        return {
+            "loops": [
+                {
+                    "loop_index": 7,
+                    "kind": "model",
+                    "artifacts": [
+                        {
+                            "kind": "model",
+                            "name": "BatchNorm_Linear_Ridge",
+                            "model_type": "sklearn",
+                            "architecture": "ridge",
+                            "hyperparameters": {},
+                        }
+                    ],
+                }
+            ],
+            "sota_library": [
+                {"name": "MOM_20D", "formulation": "c/c20-1", "description": "mom"},
+            ],
+        }
+
+    out = build_quant_model_composition(model, detail_fetcher=fake_detail)
+    assert out["available"] is True
+    assert out["kind"] == "model"
+    assert out["learner"]["name"] == "BatchNorm_Linear_Ridge"
+    assert out["factors"][0]["name"] == "MOM_20D"
+    assert out["bridge_error"] is None

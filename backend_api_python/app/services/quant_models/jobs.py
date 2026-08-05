@@ -1,27 +1,15 @@
-"""In-process async job registry for quant-model-driven backtests.
+"""Async job registry for quant-model-driven backtests.
 
-MVP backend: thread-pool + in-memory dict. We deliberately avoid reusing
-``app.utils.agent_jobs.submit_job`` here because that path is built around an
-Agent token (``agent_token_id``, per-token concurrency caps, idempotency
-keys read from request headers). The human Vue backtest page does not carry
-an Agent token, so wiring Celery+agent_jobs for an admin backtest would force
-us to either mint a synthetic token or refactor the tenant model. Both are
-out of scope for the MVP.
+Job *state* is stored in Redis so Gunicorn multi-worker setups can poll a job
+created by another worker. Execution still runs in a process-local thread pool
+on the worker that accepted ``POST /run-with-model``.
 
-Trade-offs:
-  * Pro: zero new infra, no DB migration, no Agent token required, survives
-    single-process restarts within the request lifecycle.
-  * Con: jobs are lost on process restart (no durability) and bounded by a
-    single process. Acceptable for MVP — the Vue admin backtest is a
-    single-user, low-frequency flow.
-
-When this stops being enough, swap ``start_job`` to dispatch a Celery task
-and persist snapshots in ``qd_agent_jobs`` (or a new table). The public
-snapshot shape returned to clients is intentionally compatible with that
-future migration.
+Falls back to an in-memory dict when Redis is unavailable or
+``QUANT_MODEL_JOBS_STORE=memory`` (used by unit tests).
 """
 from __future__ import annotations
 
+import json
 import os
 import threading
 import time
@@ -37,11 +25,17 @@ logger = get_logger(__name__)
 
 
 _JOB_TTL_SECONDS = 24 * 3600
+_REDIS_KEY_PREFIX = "quantdinger:quant-model-job:v1:"
+_REDIS_USER_INDEX_PREFIX = "quantdinger:quant-model-jobs:user:v1:"
 
 _jobs: dict[str, dict[str, Any]] = {}
 _jobs_lock = threading.Lock()
 _executor: Optional[ThreadPoolExecutor] = None
 _executor_lock = threading.Lock()
+_redis_client = None
+_redis_lock = threading.Lock()
+_redis_warned = False
+_force_memory = False
 
 
 def _max_workers() -> int:
@@ -72,6 +66,63 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
+def _store_mode() -> str:
+    if _force_memory:
+        return "memory"
+    raw = (os.getenv("QUANT_MODEL_JOBS_STORE") or "").strip().lower()
+    if raw in {"memory", "mem", "local"}:
+        return "memory"
+    if raw in {"redis"}:
+        return "redis"
+    return "auto"
+
+
+def _get_redis():
+    """Return a decode_responses Redis client, or None."""
+    global _redis_client, _redis_warned
+    mode = _store_mode()
+    if mode == "memory":
+        return None
+    if _redis_client is not None:
+        return _redis_client
+    with _redis_lock:
+        if _redis_client is not None:
+            return _redis_client
+        try:
+            import redis
+            from app.config.redis_urls import cache_redis_url
+
+            client = redis.Redis.from_url(
+                cache_redis_url(),
+                decode_responses=True,
+                socket_connect_timeout=2,
+                socket_timeout=2,
+            )
+            client.ping()
+            _redis_client = client
+            logger.info("quant_model_jobs: using Redis store")
+            return _redis_client
+        except Exception as exc:
+            if mode == "redis":
+                raise
+            if not _redis_warned:
+                logger.warning(
+                    "quant_model_jobs: Redis unavailable, falling back to "
+                    "process-local memory (GUNICORN_WORKERS>1 will break polling): %s",
+                    exc,
+                )
+                _redis_warned = True
+            return None
+
+
+def _job_key(job_id: str) -> str:
+    return f"{_REDIS_KEY_PREFIX}{job_id}"
+
+
+def _user_index_key(user_id: int) -> str:
+    return f"{_REDIS_USER_INDEX_PREFIX}{int(user_id)}"
+
+
 def _public_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
     """Project the internal job state to a client-safe view.
 
@@ -91,8 +142,52 @@ def _public_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _persist_snapshot(snapshot: dict[str, Any]) -> None:
+    job_id = str(snapshot.get("job_id") or "")
+    if not job_id:
+        return
+    client = _get_redis()
+    if client is None:
+        with _jobs_lock:
+            _jobs[job_id] = snapshot
+        return
+    payload = json.dumps(snapshot, ensure_ascii=False, default=str)
+    pipe = client.pipeline()
+    pipe.setex(_job_key(job_id), _JOB_TTL_SECONDS, payload)
+    user_id = int(snapshot.get("user_id") or 0)
+    if user_id:
+        try:
+            score = datetime.fromisoformat(
+                str(snapshot.get("created_at") or _now_iso()).rstrip("Z")
+            ).timestamp()
+        except Exception:
+            score = time.time()
+        pipe.zadd(_user_index_key(user_id), {job_id: score})
+        pipe.expire(_user_index_key(user_id), _JOB_TTL_SECONDS)
+    pipe.execute()
+
+
+def _load_snapshot(job_id: str) -> Optional[dict[str, Any]]:
+    key = str(job_id or "").strip()
+    if not key:
+        return None
+    client = _get_redis()
+    if client is None:
+        with _jobs_lock:
+            snap = _jobs.get(key)
+            return dict(snap) if snap else None
+    raw = client.get(_job_key(key))
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
 def create_job(*, payload: dict[str, Any], user_id: int) -> dict[str, Any]:
-    """Persist a new job row in memory and return its public snapshot."""
+    """Persist a new job and return its public snapshot."""
     job_id = _new_job_id()
     snapshot: dict[str, Any] = {
         "job_id": job_id,
@@ -107,15 +202,13 @@ def create_job(*, payload: dict[str, Any], user_id: int) -> dict[str, Any]:
         "finished_at": None,
         "request": dict(payload),
     }
-    with _jobs_lock:
-        _jobs[job_id] = snapshot
+    _persist_snapshot(snapshot)
     return _public_snapshot(snapshot)
 
 
 def get_job(job_id: str, *, user_id: int) -> Optional[dict[str, Any]]:
     """Tenant-scoped job lookup. Returns ``None`` if missing or not owned."""
-    with _jobs_lock:
-        snapshot = _jobs.get(job_id)
+    snapshot = _load_snapshot(job_id)
     if snapshot is None:
         return None
     if int(snapshot.get("user_id") or 0) != int(user_id):
@@ -125,35 +218,46 @@ def get_job(job_id: str, *, user_id: int) -> Optional[dict[str, Any]]:
 
 def list_jobs(*, user_id: int, limit: int = 50) -> list[dict[str, Any]]:
     limit = max(1, min(int(limit or 50), 200))
-    with _jobs_lock:
-        rows = [
-            _public_snapshot(s)
-            for s in _jobs.values()
-            if int(s.get("user_id") or 0) == int(user_id)
-        ]
-    rows.sort(key=lambda r: str(r.get("created_at") or ""), reverse=True)
-    return rows[:limit]
+    uid = int(user_id)
+    client = _get_redis()
+    if client is None:
+        with _jobs_lock:
+            rows = [
+                _public_snapshot(s)
+                for s in _jobs.values()
+                if int(s.get("user_id") or 0) == uid
+            ]
+        rows.sort(key=lambda r: str(r.get("created_at") or ""), reverse=True)
+        return rows[:limit]
+
+    ids = client.zrevrange(_user_index_key(uid), 0, limit - 1) or []
+    rows: list[dict[str, Any]] = []
+    for job_id in ids:
+        snap = _load_snapshot(str(job_id))
+        if snap and int(snap.get("user_id") or 0) == uid:
+            rows.append(_public_snapshot(snap))
+    return rows
 
 
 def _update_job(job_id: str, **changes: Any) -> None:
-    with _jobs_lock:
-        snapshot = _jobs.get(job_id)
-        if snapshot is None:
-            return
-        snapshot.update(changes)
+    snapshot = _load_snapshot(job_id)
+    if snapshot is None:
+        return
+    snapshot.update(changes)
+    _persist_snapshot(snapshot)
 
 
 def set_progress(job_id: str, event: dict[str, Any]) -> None:
-    """Publish a progress event into the job snapshot (in-memory only)."""
+    """Publish a progress event into the job snapshot."""
     if not isinstance(event, dict):
         event = {"value": event}
-    with _jobs_lock:
-        snapshot = _jobs.get(job_id)
-        if snapshot is None:
-            return
-        snapshot["progress"] = dict(event)
-        if "phase" in event:
-            snapshot["phase"] = event["phase"]
+    snapshot = _load_snapshot(job_id)
+    if snapshot is None:
+        return
+    snapshot["progress"] = dict(event)
+    if "phase" in event:
+        snapshot["phase"] = event["phase"]
+    _persist_snapshot(snapshot)
 
 
 def mark_succeeded(job_id: str, result: Any) -> None:
@@ -162,6 +266,7 @@ def mark_succeeded(job_id: str, result: Any) -> None:
         status="succeeded",
         phase="succeeded",
         result=result,
+        error=None,
         finished_at=_now_iso(),
     )
 
@@ -171,31 +276,20 @@ def mark_failed(job_id: str, error: str) -> None:
         job_id,
         status="failed",
         phase="failed",
-        error=str(error)[:6000],
+        error=str(error or "unknown error"),
         finished_at=_now_iso(),
     )
 
 
 def start_job(job_id: str, runner: Callable[[str, dict[str, Any]], None]) -> None:
-    """Dispatch ``runner(job_id, payload)`` on the thread pool.
-
-    The runner is responsible for calling ``set_progress`` / ``mark_succeeded``
-    / ``mark_failed``. If the runner raises, the job is marked failed here.
-    """
-    with _jobs_lock:
-        snapshot = _jobs.get(job_id)
-        if snapshot is None:
-            logger.warning("start_job: unknown job_id=%s", job_id)
-            return
-        payload = dict(snapshot.get("request") or {})
+    """Mark the job running and dispatch ``runner(job_id, request)``."""
+    snapshot = _load_snapshot(job_id)
+    if snapshot is None:
+        raise ValueError(f"unknown job: {job_id}")
+    payload = dict(snapshot.get("request") or {})
+    _update_job(job_id, status="running", phase="preparing", started_at=_now_iso())
 
     def _run() -> None:
-        _update_job(
-            job_id,
-            status="running",
-            phase="preparing",
-            started_at=_now_iso(),
-        )
         try:
             runner(job_id, payload)
         except Exception as exc:
@@ -225,6 +319,10 @@ def prune_old_jobs() -> int:
     """Drop finished jobs older than ``_JOB_TTL_SECONDS``. Returns removed count."""
     cutoff = time.time() - _JOB_TTL_SECONDS
     removed = 0
+    client = _get_redis()
+    if client is not None:
+        # TTL on keys handles expiry; only clean stale user-index members.
+        return 0
     with _jobs_lock:
         for job_id in list(_jobs.keys()):
             snapshot = _jobs[job_id]
@@ -245,7 +343,10 @@ def prune_old_jobs() -> int:
 
 def _reset_for_tests() -> None:
     """Test-only: clear all in-memory state and shut down the executor."""
-    global _executor
+    global _executor, _force_memory, _redis_client, _redis_warned
+    _force_memory = True
+    _redis_client = None
+    _redis_warned = False
     with _executor_lock:
         if _executor is not None:
             _executor.shutdown(wait=False)
@@ -355,6 +456,19 @@ def run_prepare_and_backtest(job_id: str, payload: dict[str, Any]) -> None:
             job_id,
             f"scores still missing for {len(still_missing)} dates: {still_missing[:5]}",
         )
+        return
+
+    from app.services.external_alpha.coverage import assert_external_alpha_score_coverage
+
+    try:
+        assert_external_alpha_score_coverage(
+            code=code,
+            params=prepared.get("params") or {},
+            start_date=start_d,
+            end_date=end_d,
+        )
+    except ValueError as exc:
+        mark_failed(job_id, str(exc))
         return
 
     set_progress(job_id, {

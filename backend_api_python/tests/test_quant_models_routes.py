@@ -135,6 +135,7 @@ def test_publish_duplicate_maps_409(client, monkeypatch):
         headers=_admin_auth_headers(monkeypatch),
     )
     assert resp.status_code == 409
+    assert "已存在" in resp.get_json()["msg"]
 
 
 def test_list_requires_login(client):
@@ -167,6 +168,58 @@ def test_archive_ok(client, monkeypatch):
     )
     assert resp.status_code == 200
     assert resp.get_json()["data"]["status"] == "archived"
+
+
+def test_patch_model_ok(client, monkeypatch):
+    calls = []
+
+    def fake_update(model_key, **kwargs):
+        calls.append((model_key, kwargs))
+        return {
+            "model_key": model_key,
+            "display_name": kwargs.get("display_name"),
+            "universe": kwargs.get("universe"),
+            "status": "published",
+        }
+
+    monkeypatch.setattr("app.routes.quant_models.update_quant_model", fake_update)
+    resp = client.patch(
+        "/api/quant-models/m1",
+        json={"display_name": "新名称", "universe": "csi500"},
+        headers=_admin_auth_headers(monkeypatch),
+    )
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["code"] == 1
+    assert body["data"]["display_name"] == "新名称"
+    assert body["data"]["universe"] == "csi500"
+    assert calls == [("m1", {"display_name": "新名称", "universe": "csi500"})]
+
+
+def test_delete_model_ok(client, monkeypatch):
+    def fake_delete(model_key):
+        assert model_key == "m1"
+        return {"model_key": "m1", "status": "published"}
+
+    monkeypatch.setattr("app.routes.quant_models.delete_quant_model", fake_delete)
+    resp = client.delete(
+        "/api/quant-models/m1",
+        headers=_admin_auth_headers(monkeypatch),
+    )
+    assert resp.status_code == 200
+    assert resp.get_json()["data"]["model_key"] == "m1"
+
+
+def test_delete_model_not_found(client, monkeypatch):
+    def raise_not_found(model_key):
+        raise ValueError(f"quant model not found: {model_key}")
+
+    monkeypatch.setattr("app.routes.quant_models.delete_quant_model", raise_not_found)
+    resp = client.delete(
+        "/api/quant-models/missing",
+        headers=_admin_auth_headers(monkeypatch),
+    )
+    assert resp.status_code == 404
 
 
 def test_archive_not_found(client, monkeypatch):
