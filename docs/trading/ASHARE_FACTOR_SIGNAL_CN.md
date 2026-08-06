@@ -197,3 +197,31 @@ signal 模式 **不需要** 券商凭证；不会向交易所下单。
 - 策略 API V2：[STRATEGY_DEV_GUIDE_CN.md](./STRATEGY_DEV_GUIDE_CN.md)
 - 公开股票池：[PUBLIC_UNIVERSE_AND_FUNDAMENTALS_CN.md](./PUBLIC_UNIVERSE_AND_FUNDAMENTALS_CN.md)
 - SMTP 详解：[NOTIFICATION_EMAIL_CONFIG_EN.md](../deployment/NOTIFICATION_EMAIL_CONFIG_EN.md)
+
+---
+
+## 11. 玻纤行业周信号 / 巨石 CTA（扩展示例）
+
+除周频动量示例外，仓库提供 **中国巨石卫星仓 CTA**，消费周度玻纤行业信号（7628 电子布趋势、库存、新产能）作为开仓门闩；无有效行业行时 **不开新卫星仓**。A 股仍建议 **signal 模式 + 邮件** 部署。
+
+| 资源 | 路径 |
+|---|---|
+| 设计规格 | [2026-08-06-jushi-cta-industry-signal-design.md](../superpowers/specs/2026-08-06-jushi-cta-industry-signal-design.md) |
+| 实现计划 | [2026-08-06-jushi-cta-industry-signal.md](../superpowers/plans/2026-08-06-jushi-cta-industry-signal.md) |
+| 示例策略 | [`strategy_v2_jushi_satellite_cta.py`](../examples/strategy_v2_jushi_satellite_cta.py) |
+| 表迁移 | `backend_api_python/migrations/20260806_industry_glass_fiber_weekly.sql` |
+| manual 覆盖 CLI | `backend_api_python/scripts/upsert_glass_fiber_industry_week.py` |
+
+**人工覆盖周信号（示例）：**
+
+```bash
+cd backend_api_python
+python scripts/upsert_glass_fiber_industry_week.py \
+  --as-of 2026-08-01 --cloth-trend 1 --inventory-trend -1 --source manual
+```
+
+策略沙箱内调用 `get_glass_fiber_industry_week()` 读取合并后的有效行（优先级：`manual` > 付费源预留 > `public_news`）。公开快讯由 Celery Beat 任务 `quantdinger.tasks.glass_fiber_industry_sync` 写入；`GLASS_FIBER_NEWS_URLS` 为空时任务 **skip**，不伪造行业中性信号。
+
+**日内 T 语义（MVP）：** `enable_intraday_t=1` 时策略 **仅记录日志**，表示允许外部执行器在日内做 T；**不会**在 14:55 单独下平仓单。外部执行器须在收盘前自行平掉 T 敞口；策略日频 `order_target_percent` 始终是 **卫星仓目标权重**，不含 T 往返。
+
+公开解析 **非官方点价**，仅供研究；付费卓创/隆众源本期未接，仅 `source` 预留。

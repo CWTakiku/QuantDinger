@@ -114,6 +114,48 @@ def get_external_alpha_scores(
     )
 
 
+def get_ashare_pe_percentile(
+    symbol: object = None,
+    as_of: object = None,
+    lookback_days: object = 756,
+) -> dict:
+    """PIT PE-TTM and rolling percentile from Tushare daily_basic (qd_ashare_daily_basic).
+
+    Does not use get_fundamentals, so A-share backtests will not fail with
+    strategyV2.fundamentalDataMissing for pe_ratio.
+    """
+    from app.services.csi300_enhanced.pe_ttm import compute_pe_percentile
+
+    return compute_pe_percentile(
+        symbol=symbol,
+        as_of=None if as_of is None else as_of,
+        lookback_days=int(lookback_days or 756),
+        autofetch=True,
+    )
+
+
+def get_glass_fiber_industry_week(as_of: object = None) -> dict:
+    """PIT 行业周信号；无有效行时 industry_available=False。"""
+    from datetime import date
+
+    from app.services.industry_glass_fiber.store import resolve_glass_fiber_week
+
+    if as_of is None:
+        as_of = date.today()
+    row = resolve_glass_fiber_week(as_of)
+    if not row:
+        return {
+            "industry_available": False,
+            "as_of": None,
+            "cloth_trend": 0,
+            "inventory_trend": 0,
+            "new_capacity_flag": 0,
+            "source": None,
+            "confidence": 0.0,
+        }
+    return row
+
+
 def _backtest_time_iso(value: Any) -> str:
     """Serialize the UTC-naive market index as an unambiguous UTC instant."""
     timestamp = pd.Timestamp(value)
@@ -1659,6 +1701,8 @@ class StrategyV2BacktestRunner:
             "get_factors": ctx.get_factors,
             "get_fundamentals": ctx.get_fundamentals,
             "get_external_alpha_scores": get_external_alpha_scores,
+            "get_glass_fiber_industry_week": get_glass_fiber_industry_week,
+            "get_ashare_pe_percentile": get_ashare_pe_percentile,
             "is_trade": ctx.is_trade,
             "apply_icir_weights": apply_icir_weights,
             "apply_regime": apply_regime,
@@ -1673,6 +1717,8 @@ class StrategyV2BacktestRunner:
             "get_ashare_consensus_panel": get_ashare_consensus_panel,
             "get_ashare_valuation_panel": get_ashare_valuation_panel,
             "get_external_alpha_scores": get_external_alpha_scores,
+            "get_glass_fiber_industry_week": get_glass_fiber_industry_week,
+            "get_ashare_pe_percentile": get_ashare_pe_percentile,
             "build_enhanced_index_diagnostics": build_enhanced_index_diagnostics,
             "record_enhanced_index_diagnostics": lambda **kwargs: ctx.record_enhanced_index_diagnostics(
                 build_enhanced_index_diagnostics(**kwargs)
@@ -2400,6 +2446,8 @@ class StrategyV2LiveSession:
             "get_factors": ctx.get_factors,
             "get_fundamentals": ctx.get_fundamentals,
             "get_external_alpha_scores": get_external_alpha_scores,
+            "get_glass_fiber_industry_week": get_glass_fiber_industry_week,
+            "get_ashare_pe_percentile": get_ashare_pe_percentile,
             "is_trade": ctx.is_trade,
             "apply_icir_weights": apply_icir_weights,
             "apply_regime": apply_regime,
@@ -2414,6 +2462,8 @@ class StrategyV2LiveSession:
             "get_ashare_consensus_panel": get_ashare_consensus_panel,
             "get_ashare_valuation_panel": get_ashare_valuation_panel,
             "get_external_alpha_scores": get_external_alpha_scores,
+            "get_glass_fiber_industry_week": get_glass_fiber_industry_week,
+            "get_ashare_pe_percentile": get_ashare_pe_percentile,
             "build_enhanced_index_diagnostics": build_enhanced_index_diagnostics,
             "record_enhanced_index_diagnostics": lambda **kwargs: ctx.record_enhanced_index_diagnostics(
                 build_enhanced_index_diagnostics(**kwargs)

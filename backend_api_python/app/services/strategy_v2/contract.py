@@ -210,6 +210,23 @@ def compile_strategy_v2(code: str) -> CompiledStrategyV2:
         "history": lambda *_args, **_kwargs: [],
         "is_trade": lambda *_args, **_kwargs: False,
         "log": discovery_log,
+        "set_default_protection": lambda **_kwargs: None,
+        "get_glass_fiber_industry_week": lambda *_args, **_kwargs: {
+            "industry_available": False,
+            "as_of": None,
+            "cloth_trend": 0,
+            "inventory_trend": 0,
+            "new_capacity_flag": 0,
+            "source": None,
+            "confidence": 0.0,
+        },
+        "get_ashare_pe_percentile": lambda *_args, **_kwargs: {
+            "pe_ttm": None,
+            "pe_percentile": None,
+            "samples": 0,
+        },
+        "get_fundamentals": lambda *_args, **_kwargs: [],
+        "order_target_percent": lambda *_args, **_kwargs: None,
     }
     result = safe_exec_with_validation(raw, namespace, namespace, timeout=10)
     if not result.get("success"):
@@ -326,6 +343,8 @@ _RUNTIME_GLOBAL_CALL_NAMES = {
     "get_factors",
     "get_fundamentals",
     "get_external_alpha_scores",
+    "get_glass_fiber_industry_week",
+    "get_ashare_pe_percentile",
     "get_history",
     "get_index_stocks",
     "get_position",
