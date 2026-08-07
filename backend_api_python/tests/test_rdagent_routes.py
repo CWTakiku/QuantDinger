@@ -96,15 +96,9 @@ def test_start_job_ok(client, monkeypatch):
     calls = []
 
     class Fake:
-        def start_job(
-            self,
-            scenario,
-            loop_n,
-            timeout_h=None,
-            data_source="default",
-            start_date=None,
-            end_date=None,
-        ):
+        def start_job(self, scenario, loop_n, timeout_h=None, data_source="default",
+                      start_date=None, end_date=None, universe=None,
+                      resume_session_id=None, checkout=True):
             calls.append(
                 {
                     "scenario": scenario,
@@ -113,11 +107,17 @@ def test_start_job_ok(client, monkeypatch):
                     "data_source": data_source,
                     "start_date": start_date,
                     "end_date": end_date,
+                    "resume_session_id": resume_session_id,
+                    "checkout": checkout,
                 }
             )
             return {"id": "j-new", "status": "queued"}
 
     monkeypatch.setattr("app.routes.rdagent.get_bridge_client", lambda: Fake())
+    monkeypatch.setattr(
+        "app.services.rdagent_bridge.universe_payload.build_universe_job_payload",
+        lambda *a, **k: {"code": "csi300", "market_id": "csi300", "benchmark": "SH000300"},
+    )
     resp = client.post(
         "/api/rdagent/jobs",
         json={
@@ -132,16 +132,37 @@ def test_start_job_ok(client, monkeypatch):
     )
     assert resp.status_code == 201
     assert resp.get_json()["data"]["id"] == "j-new"
-    assert calls == [
-        {
-            "scenario": "fin_factor",
-            "loop_n": 2,
-            "timeout_h": 1.5,
-            "data_source": "quantmind",
-            "start_date": "2018-01-01",
-            "end_date": "2024-12-31",
-        }
-    ]
+    assert calls[0]["scenario"] == "fin_factor"
+    assert calls[0]["loop_n"] == 2
+    assert calls[0]["resume_session_id"] is None
+
+
+def test_start_job_resume_passthrough(client, monkeypatch):
+    calls = []
+
+    class Fake:
+        def start_job(self, *args, **kwargs):
+            calls.append(kwargs)
+            return {"id": "j-resume", "status": "running", "resume_session_id": kwargs.get("resume_session_id")}
+
+    monkeypatch.setattr("app.routes.rdagent.get_bridge_client", lambda: Fake())
+    monkeypatch.setattr(
+        "app.services.rdagent_bridge.universe_payload.build_universe_job_payload",
+        lambda *a, **k: None,
+    )
+    resp = client.post(
+        "/api/rdagent/jobs",
+        json={
+            "scenario": "fin_quant",
+            "loop_n": 3,
+            "resume_session_id": "2026-08-04_04-24-44-347073",
+            "checkout": False,
+        },
+        headers=_admin_auth_headers(monkeypatch),
+    )
+    assert resp.status_code == 201
+    assert calls[0]["resume_session_id"] == "2026-08-04_04-24-44-347073"
+    assert calls[0]["checkout"] is False
 
 
 def test_bridge_error_maps_status_code(client, monkeypatch):

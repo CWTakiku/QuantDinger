@@ -2001,6 +2001,25 @@ def save_settings():
             }
             if admin_email_sync is not None:
                 response_data['admin_email_sync'] = admin_email_sync
+
+            # Keep research-factory / rdagent-bridge LLM mirror in sync with Settings.
+            try:
+                from app.services.rdagent_bridge.llm_sync import (
+                    filter_qd_llm_env,
+                    push_llm_settings_to_bridge,
+                )
+
+                if filter_qd_llm_env(updates) or filter_qd_llm_env(current_env):
+                    bridge_llm = push_llm_settings_to_bridge(current_env)
+                    if bridge_llm:
+                        response_data['rdagent_llm_sync'] = {
+                            'applied': bridge_llm.get('applied'),
+                            'provider': bridge_llm.get('provider'),
+                            'chat_model': bridge_llm.get('chat_model'),
+                            'error': bridge_llm.get('error'),
+                        }
+            except Exception as sync_exc:
+                logger.warning("rdagent LLM mirror push failed: %s", sync_exc)
             
             return jsonify({
                 'code': 1,

@@ -51,6 +51,8 @@ class RdAgentBridgeClient:
         start_date: str | None = None,
         end_date: str | None = None,
         universe: dict[str, Any] | None = None,
+        resume_session_id: str | None = None,
+        checkout: bool = True,
     ) -> dict[str, Any]:
         body: dict[str, Any] = {
             "scenario": scenario,
@@ -67,6 +69,10 @@ class RdAgentBridgeClient:
             body["end_date"] = end_s
         if universe:
             body["universe"] = universe
+        resume_sid = (resume_session_id or "").strip()
+        if resume_sid:
+            body["resume_session_id"] = resume_sid
+            body["checkout"] = bool(checkout)
         return self._request("POST", "/v1/jobs", json_body=body)
 
     def list_data_sources(self) -> list[dict[str, Any]]:
@@ -76,6 +82,9 @@ class RdAgentBridgeClient:
 
     def llm_sync_status(self) -> dict[str, Any]:
         return self._request("GET", "/v1/llm-sync")
+
+    def push_llm_sync(self, env: dict[str, Any]) -> dict[str, Any]:
+        return self._request("POST", "/v1/llm-sync", json_body={"env": env})
 
     def get_job(self, job_id: str) -> dict[str, Any]:
         return self._request("GET", f"/v1/jobs/{job_id}")

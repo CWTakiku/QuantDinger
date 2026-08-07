@@ -190,9 +190,8 @@ services:
     # RD-Agent bridge runs on the host (port 19901), not in this image.
     # Set in backend_api_python/.env: RDAGENT_BRIDGE_URL=http://host.docker.internal:19901
     # and RDAGENT_BRIDGE_TOKEN=<same as rdagent-workspace/.env>.
-    # Linux: uncomment if host.docker.internal is unavailable:
-    # extra_hosts:
-    #   - "host.docker.internal:host-gateway"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     restart: unless-stopped
     ulimits:
       nofile:

@@ -9,8 +9,8 @@
 | 能力 | QD API（admin） | 说明 |
 |------|-----------------|------|
 | 桥接状态 | `GET /api/rdagent/status` | 页内「已连接 / 未连接」 |
-| 启停任务 | `POST /api/rdagent/jobs`、`POST .../stop` | `fin_factor` / `fin_quant`，`step_n` ≤ 20 |
-| 日志 / 会话 | `GET .../logs`、`GET /api/rdagent/sessions` | 会话来自工作区 `log/` |
+| 启停任务 | `POST /api/rdagent/jobs`、`POST .../stop` | `fin_factor` / `fin_quant`，`loop_n` ≤ 20；可选 `resume_session_id` 续跑 |
+| 日志 / 会话 | `GET .../logs`、`GET /api/rdagent/sessions` | 会话来自工作区 `log/`；会话表可「续跑」 |
 | RD UI | `GET/POST /api/rdagent/ui*` | 外链 Streamlit **19899** |
 | 分数导入 | `POST /api/rdagent/import-from-session` | 导出会话 → `qd_external_alpha_scores`；可选 `loop_index` 按轮次导入 |
 | 会话深度 | `GET /api/rdagent/sessions/<id>/detail?include=...` | SOTA 因子库、模型摘要、可导出 Loop 列表 |
@@ -18,6 +18,32 @@
 | 标的池 | `GET /api/rdagent/universes` | CNStock 池 +「全市场」；启动任务传 `universe_code` |
 
 OpenAPI 契约见 `docs/api/openapi.yaml`（RDAgent 标签）。
+
+### 会话续跑
+
+任务中断或跑完后，可在会话列表点 **续跑**：弹出对话框填写 **再跑轮数**（与上方「启动」的循环轮数无关），使用当前表单场景/数据源/标的池，对已有 `log/<session_id>/__session__` checkpoint 继续训练（RD-Agent `--path`，默认 checkout）。
+
+**日期与数据集划分**：续跑优先从原会话 **最早一轮** checkpoint 提取并套用：
+
+- handler 总区间  
+- **train / valid / test**（不再按表单日期重算 70/20/10）  
+- backtest end  
+- market / benchmark（忽略表单标的池，避免改写股票池）
+
+若会话中无法解析，才回退到表单日期与标的池。
+
+```http
+POST /api/rdagent/jobs
+{
+  "scenario": "fin_factor",
+  "loop_n": 3,
+  "resume_session_id": "2026-08-04_04-24-44-347073",
+  "data_source": "quantmind",
+  "universe_code": "csi300"
+}
+```
+
+不传 `resume_session_id` 时仍创建新会话。无 checkpoint 或非法 id 返回 400。设计见 `docs/superpowers/specs/2026-08-07-rdagent-session-resume-design.md`。
 
 ### 选股（已发布量化模型）
 

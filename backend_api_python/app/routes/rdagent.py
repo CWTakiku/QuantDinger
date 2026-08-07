@@ -132,6 +132,15 @@ def start_rdagent_job():
         start_date = str(start_date_raw).strip() if start_date_raw is not None and str(start_date_raw).strip() else None
         end_date = str(end_date_raw).strip() if end_date_raw is not None and str(end_date_raw).strip() else None
         universe_code = payload.get("universe_code", payload.get("universeCode"))
+        resume_session_id = payload.get("resume_session_id", payload.get("resumeSessionId"))
+        resume_sid = str(resume_session_id).strip() if resume_session_id is not None else ""
+        checkout_raw = payload.get("checkout")
+        if checkout_raw is None:
+            checkout = True
+        elif isinstance(checkout_raw, bool):
+            checkout = checkout_raw
+        else:
+            checkout = str(checkout_raw).strip().lower() not in {"0", "false", "no", "off"}
         try:
             universe_body = build_universe_job_payload(
                 get_universe_service(),
@@ -150,6 +159,8 @@ def start_rdagent_job():
                 start_date=start_date,
                 end_date=end_date,
                 universe=universe_body,
+                resume_session_id=resume_sid or None,
+                checkout=checkout,
             ),
             status=201,
         )

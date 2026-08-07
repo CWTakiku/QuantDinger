@@ -94,6 +94,28 @@ def test_start_job_posts_payload(monkeypatch):
     assert captured["kwargs"]["headers"]["X-RDAgent-Bridge-Token"] == "token"
 
 
+def test_start_job_posts_resume_session_id(monkeypatch):
+    captured: dict = {}
+
+    def fake_request(method, url, **kwargs):
+        captured["method"] = method
+        captured["url"] = url
+        captured["kwargs"] = kwargs
+        return MagicMock(status_code=201, json=lambda: {"id": "j3", "status": "running"})
+
+    monkeypatch.setattr("app.services.rdagent_bridge.client.requests.request", fake_request)
+    client = RdAgentBridgeClient("http://127.0.0.1:19901", "token")
+    client.start_job(
+        "fin_factor",
+        loop_n=2,
+        resume_session_id="2026-08-04_04-24-44-347073",
+        checkout=True,
+    )
+    body = captured["kwargs"]["json"]
+    assert body["resume_session_id"] == "2026-08-04_04-24-44-347073"
+    assert body["checkout"] is True
+
+
 def test_unauthorized_maps_to_bridge_error(monkeypatch):
     monkeypatch.setattr(
         "app.services.rdagent_bridge.client.requests.request",
