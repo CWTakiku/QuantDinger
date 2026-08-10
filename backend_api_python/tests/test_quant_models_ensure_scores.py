@@ -90,7 +90,15 @@ def _patch_pit_coverage(monkeypatch, covered: set[str] | Callable[[str], bool]):
 
 
 def test_all_present_skips_infer(monkeypatch):
-    covered = {"2026-07-01", "2026-07-08", "2026-07-15"}
+    # Dense exact panel for the requested tip — no interior weekday holes.
+    covered = {
+        "2026-07-01",
+        "2026-07-02",
+        "2026-07-03",
+        "2026-07-06",
+        "2026-07-07",
+        "2026-07-08",
+    }
     qlib_calls: list = []
     _patch_qlib(monkeypatch, qlib_calls)
     _patch_pit_coverage(monkeypatch, covered)
@@ -260,6 +268,102 @@ def test_next_trading_day_after_panel_triggers_infer(monkeypatch):
     assert qlib_calls == [["2026-08-05"]]
 
 
+def test_jump_ahead_fills_intermediate_weekdays(monkeypatch):
+    """Requesting Fri after Tue tip must also infer Wed/Thu (no panel holes)."""
+    qlib_calls: list = []
+    _patch_qlib(monkeypatch, qlib_calls)
+    _patch_sync_ok(monkeypatch)
+    covered: set[str] = {"2026-08-04"}
+
+    def fake_load(as_of, **kwargs):
+        key = str(as_of)[:10]
+        # PIT would cover any day after an older tip — that must NOT hide holes.
+        tips = [d for d in covered if d <= key]
+        if tips:
+            return pd.Series({f"CNStock:60000{i}.SH": float(i) for i in range(15)})
+        return pd.Series(dtype=float)
+
+    monkeypatch.setattr(
+        "app.services.quant_models.ensure_scores.load_external_alpha_scores_as_of",
+        fake_load,
+    )
+    monkeypatch.setattr(
+        "app.services.quant_models.ensure_scores.list_external_alpha_as_ofs",
+        lambda **kwargs: sorted(covered),
+    )
+    infer_calls = []
+
+    def fake_infer(session_id, **kwargs):
+        infer_calls.append(kwargs)
+        covered.update(["2026-08-05", "2026-08-06", "2026-08-07"])
+        return {
+            "export_id": "fill",
+            "imported": True,
+            "as_of_min": "2026-08-05",
+            "as_of_max": "2026-08-07",
+        }
+
+    monkeypatch.setattr(
+        "app.services.quant_models.ensure_scores.infer_and_import_session_scores",
+        fake_infer,
+    )
+
+    out = ensure_quant_model_scores(_sample_model(), [date(2026, 8, 7)])
+    assert out["missing_before"] == ["2026-08-05", "2026-08-06", "2026-08-07"]
+    assert infer_calls[0]["start"] == "2026-08-05"
+    assert infer_calls[0]["end"] == "2026-08-07"
+    assert out["still_missing"] == []
+    assert out["inferred"] == 3
+    assert qlib_calls == [["2026-08-05", "2026-08-06", "2026-08-07"]]
+
+
+def test_interior_panel_hole_is_backfilled(monkeypatch):
+    """Exact panel has Tue+Fri but missing Wed → ensure Fri still fills Wed."""
+    qlib_calls: list = []
+    _patch_qlib(monkeypatch, qlib_calls)
+    _patch_sync_ok(monkeypatch)
+    covered: set[str] = {"2026-08-04", "2026-08-07"}
+
+    def fake_load(as_of, **kwargs):
+        key = str(as_of)[:10]
+        tips = [d for d in covered if d <= key]
+        if tips:
+            return pd.Series({f"CNStock:60000{i}.SH": float(i) for i in range(15)})
+        return pd.Series(dtype=float)
+
+    monkeypatch.setattr(
+        "app.services.quant_models.ensure_scores.load_external_alpha_scores_as_of",
+        fake_load,
+    )
+    monkeypatch.setattr(
+        "app.services.quant_models.ensure_scores.list_external_alpha_as_ofs",
+        lambda **kwargs: sorted(covered),
+    )
+    infer_calls = []
+
+    def fake_infer(session_id, **kwargs):
+        infer_calls.append(kwargs)
+        covered.update(["2026-08-05", "2026-08-06"])
+        return {
+            "export_id": "hole",
+            "imported": True,
+            "as_of_min": "2026-08-05",
+            "as_of_max": "2026-08-06",
+        }
+
+    monkeypatch.setattr(
+        "app.services.quant_models.ensure_scores.infer_and_import_session_scores",
+        fake_infer,
+    )
+
+    out = ensure_quant_model_scores(_sample_model(), [date(2026, 8, 7)])
+    assert out["missing_before"] == ["2026-08-05", "2026-08-06"]
+    assert infer_calls[0]["start"] == "2026-08-05"
+    assert infer_calls[0]["end"] == "2026-08-06"
+    assert out["still_missing"] == []
+    assert qlib_calls == [["2026-08-05", "2026-08-06"]]
+
+
 def test_missing_dates_triggers_qlib_then_infer(monkeypatch):
     model = _sample_model()
     requested = [date(2026, 7, 1), date(2026, 7, 8), date(2026, 7, 15)]
@@ -288,11 +392,25 @@ def test_missing_dates_triggers_qlib_then_infer(monkeypatch):
 
     def fake_infer(session_id, **kwargs):
         infer_calls.append((session_id, kwargs))
-        covered.update(["2026-07-08", "2026-07-15"])
+        # Fill the whole tip→target weekday span the ensure path expands to.
+        covered.update(
+            [
+                "2026-07-02",
+                "2026-07-03",
+                "2026-07-06",
+                "2026-07-07",
+                "2026-07-08",
+                "2026-07-09",
+                "2026-07-10",
+                "2026-07-13",
+                "2026-07-14",
+                "2026-07-15",
+            ]
+        )
         return {
             "export_id": "abc123",
             "row_count": 10,
-            "as_of_min": "2026-07-08",
+            "as_of_min": "2026-07-02",
             "as_of_max": "2026-07-15",
             "imported": True,
         }
@@ -304,15 +422,19 @@ def test_missing_dates_triggers_qlib_then_infer(monkeypatch):
 
     out = ensure_quant_model_scores(model, requested)
 
-    assert out["missing_before"] == ["2026-07-08", "2026-07-15"]
-    assert out["inferred"] == 2
+    assert out["missing_before"][0] == "2026-07-02"
+    assert out["missing_before"][-1] == "2026-07-15"
+    assert "2026-07-08" in out["missing_before"]
+    assert "2026-07-15" in out["missing_before"]
     assert out["still_missing"] == []
     assert out["export_meta"]["export_id"] == "abc123"
     assert out["qlib_update"]["target"] == "2026-07-15"
-    assert qlib_calls == [["2026-07-08", "2026-07-15"]]
+    assert qlib_calls[0][0] == "2026-07-02"
+    assert qlib_calls[0][-1] == "2026-07-15"
     assert infer_calls[0][0] == "2026-08-04_04-24-44-347073"
-    assert infer_calls[0][1]["start"] == "2026-07-08"
+    assert infer_calls[0][1]["start"] == "2026-07-02"
     assert infer_calls[0][1]["end"] == "2026-07-15"
+    assert out["inferred"] == len(out["missing_before"])
 
 
 def test_partial_infer_leaves_still_missing(monkeypatch):
@@ -349,9 +471,13 @@ def test_partial_infer_leaves_still_missing(monkeypatch):
         [date(2026, 7, 8), date(2026, 7, 15)],
     )
 
-    assert out["missing_before"] == ["2026-07-08", "2026-07-15"]
-    assert out["inferred"] == 2
+    assert out["missing_before"][0] == "2026-07-08"
+    assert out["missing_before"][-1] == "2026-07-15"
+    assert "2026-07-08" in out["missing_before"]
+    assert "2026-07-15" in out["missing_before"]
+    # Infer only landed 07-08; bridge snap credits days after as_of_max for this call.
     assert out["still_missing"] == []
+    assert out["inferred"] == len(out["missing_before"])
 
 
 def test_on_progress_called_when_missing(monkeypatch):

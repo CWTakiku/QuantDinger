@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import date
+from datetime import date, timedelta
 from typing import Any, Callable
 
 from app.services.external_alpha.store import (
@@ -49,6 +49,58 @@ def _as_of_covered(
     return series is not None and len(series) >= max(1, int(min_names))
 
 
+def _iter_weekdays(start: date, end: date) -> list[str]:
+    """Inclusive Mon–Fri ISO dates from *start* through *end*."""
+    if end < start:
+        return []
+    out: list[str] = []
+    cursor = start
+    while cursor <= end:
+        if cursor.weekday() < 5:
+            out.append(cursor.isoformat())
+        cursor += timedelta(days=1)
+    return out
+
+
+def _candidate_as_ofs(requested: list[str], panel: list[str]) -> list[str]:
+    """Expand *requested* so tip→target gaps and interior panel holes are included.
+
+    Stock-picker / ensure often asks for a single tip day. Without expansion,
+    jumping from 08-05 to 08-07 leaves 08-06 permanently missing (PIT then
+    hides the hole). Always fill weekday spans that belong to the request.
+    """
+    if not requested:
+        return []
+    want_hi = max(requested)
+    want_hi_d = date.fromisoformat(want_hi)
+    candidates: set[str] = set(requested)
+    panel_set = {d for d in panel if d}
+    max_panel = max(panel_set) if panel_set else ""
+
+    if max_panel:
+        tip = date.fromisoformat(max_panel)
+        if tip < want_hi_d:
+            candidates.update(_iter_weekdays(tip + timedelta(days=1), want_hi_d))
+    else:
+        want_lo_d = date.fromisoformat(min(requested))
+        candidates.update(_iter_weekdays(want_lo_d, want_hi_d))
+
+    # Interior holes: weekdays between consecutive exact panel days that sit
+    # at or before the requested tip (e.g. panel has 08-05 & 08-07).
+    sorted_panel = sorted(panel_set)
+    for left, right in zip(sorted_panel, sorted_panel[1:]):
+        left_d = date.fromisoformat(left)
+        right_d = date.fromisoformat(right)
+        if left_d >= want_hi_d:
+            break
+        gap_hi = min(right_d - timedelta(days=1), want_hi_d)
+        if gap_hi <= left_d:
+            continue
+        candidates.update(_iter_weekdays(left_d + timedelta(days=1), gap_hi))
+
+    return sorted(candidates)
+
+
 def _missing_as_ofs(
     requested: list[str],
     *,
@@ -58,36 +110,38 @@ def _missing_as_ofs(
 ) -> list[str]:
     """Dates that still need infer / import.
 
-    - Exact panel day with enough names → covered.
-    - Weekend/gap on or before the latest score day → PIT cover (strategy lag).
-    - Calendar day *after* the latest score day → missing (e.g. 08-05 after
-      08-04 scores), except Sat/Sun which stay PIT-covered until the next
-      trading-day refresh.
+    - Exact panel weekday with enough names → covered.
+    - Sat/Sun → PIT cover from prior trading-day scores (strategy lag).
+    - Weekday without an exact panel row → missing, even if PIT would fall
+      back to an older day (prevents permanent interior holes).
+    - Requesting a tip beyond the panel expands all intermediate weekdays.
     """
     panel = list_external_alpha_as_ofs(source=source, version=version)
     panel_set = set(panel)
     max_panel = max(panel) if panel else ""
     min_n = max(1, int(min_names))
     missing: list[str] = []
-    for d in requested:
+    for d in _candidate_as_ofs(requested, panel):
+        try:
+            weekday = date.fromisoformat(d).weekday()
+        except ValueError:
+            weekday = -1
+
         if d in panel_set and _as_of_covered(
             d, source=source, version=version, min_names=min_n
         ):
             continue
-        if max_panel and d <= max_panel and _as_of_covered(
-            d, source=source, version=version, min_names=min_n
-        ):
-            continue
-        if max_panel and d > max_panel and _as_of_covered(
-            d, source=source, version=version, min_names=min_n
-        ):
-            try:
-                weekday = date.fromisoformat(d).weekday()
-            except ValueError:
-                weekday = -1
-            # Sat/Sun after Friday scores: weekly lag, not a new session close.
-            if weekday >= 5:
+
+        if weekday >= 5:
+            # Weekend lag dates stay PIT-covered when prior scores exist.
+            if max_panel and _as_of_covered(
+                d, source=source, version=version, min_names=min_n
+            ):
                 continue
+            missing.append(d)
+            continue
+
+        # Weekday: require an exact panel cross-section (no PIT hide).
         missing.append(d)
     return missing
 
@@ -170,7 +224,7 @@ def ensure_quant_model_scores(
     )
 
     if not missing:
-        # PIT already covers request — still tell UI which exact panel days apply
+        # Exact panel covers request — still tell UI which exact panel days apply
         # so stock-picker can snap away from dates with no exact cross-section.
         panel = list_external_alpha_as_ofs(source=source, version=version)
         return {
@@ -193,12 +247,21 @@ def ensure_quant_model_scores(
 
     if not syncable:
         panel = list_external_alpha_as_ofs(source=source, version=version)
+        reason = block_reason or "not_syncable"
+        hint = None
+        if reason == "future":
+            tip_day = max(panel) if panel else None
+            hint = (
+                f"所选交易日尚未到来，不会生成未来日真实分数"
+                + (f"，将使用最近已有分数日 {tip_day}" if tip_day else "")
+            )
         return {
             "missing_before": missing,
             "inferred": 0,
             "still_missing": missing,
             "effective_as_ofs": _effective_as_ofs_for_requested(requested, panel),
-            "sync_reason": block_reason or "not_syncable",
+            "sync_reason": reason,
+            "user_hint": hint,
             "qlib_update": None,
         }
 
