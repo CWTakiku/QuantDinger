@@ -1798,6 +1798,8 @@ def _build_system_prompt(language: str, context: dict, intent: str, has_image: b
         context_bits.append(f"market={context.get('market')}")
     if context.get("strategy_id"):
         context_bits.append(f"strategy_id={context.get('strategy_id')}")
+    if context.get("page"):
+        context_bits.append(f"page={context.get('page')}")
     context_line = ", ".join(context_bits) or "no explicit selected symbol"
     image_line = "The user attached chart/K-line screenshots; analyze visible chart structure, indicators, labels and risk." if has_image else "No image is attached."
     base = (
@@ -1863,6 +1865,17 @@ def _build_system_prompt(language: str, context: dict, intent: str, has_image: b
         for item in memories[:12]:
             memory_lines.append(f"- {item.get('title')}: {item.get('content')}")
         base += "\n[User memory]\n" + "\n".join(memory_lines) + "\n"
+    strategy_source = context.get("strategy_source") or context.get("script_source") or ""
+    if strategy_source:
+        base += (
+            "\n[Current strategy script in Strategy IDE]\n```python\n"
+            + str(strategy_source)[:12000]
+            + "\n```\n"
+            "You are assisting with this specific QuantDinger Strategy API V2 script. "
+            "When the user asks to explain or discuss it, answer in natural language with concrete references to the code. "
+            "Only emit a full rewritten Python script when the user clearly asks to rewrite/modify/generate code; "
+            "otherwise do not replace the whole file in your answer.\n"
+        )
     calendar_context = context.get("economic_calendar_context")
     if isinstance(calendar_context, list) and calendar_context:
         base += "\n[Economic calendar context]\n" + _json_dumps(calendar_context[:30])[:5000] + "\n"
