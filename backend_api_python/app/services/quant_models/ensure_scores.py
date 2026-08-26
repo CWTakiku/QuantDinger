@@ -49,6 +49,12 @@ def _as_of_covered(
     return series is not None and len(series) >= max(1, int(min_names))
 
 
+# Densify tip→target / interior holes only near the request. Older panel gaps
+# (e.g. 2021 holes when ensuring a 2026 backtest window) stay untouched; PIT
+# still serves those historical dates if a strategy ever asks for them.
+ENSURE_SCORE_LOCAL_CATCHUP_DAYS = 30
+
+
 def _iter_weekdays(start: date, end: date) -> list[str]:
     """Inclusive Mon–Fri ISO dates from *start* through *end*."""
     if end < start:
@@ -63,41 +69,33 @@ def _iter_weekdays(start: date, end: date) -> list[str]:
 
 
 def _candidate_as_ofs(requested: list[str], panel: list[str]) -> list[str]:
-    """Expand *requested* so tip→target gaps and interior panel holes are included.
+    """Expand *requested* so nearby tip→target gaps and local holes are included.
 
     Stock-picker / ensure often asks for a single tip day. Without expansion,
     jumping from 08-05 to 08-07 leaves 08-06 permanently missing (PIT then
-    hides the hole). Always fill weekday spans that belong to the request.
+    hides the hole). Expansion is clamped to a short catch-up window around
+    the request so a stale panel tip or ancient interior holes cannot pull
+    years of weekday as_ofs into a short backtest ensure.
     """
     if not requested:
         return []
-    want_hi = max(requested)
-    want_hi_d = date.fromisoformat(want_hi)
+    want_lo_d = date.fromisoformat(min(requested))
+    want_hi_d = date.fromisoformat(max(requested))
     candidates: set[str] = set(requested)
     panel_set = {d for d in panel if d}
-    max_panel = max(panel_set) if panel_set else ""
 
-    if max_panel:
-        tip = date.fromisoformat(max_panel)
-        if tip < want_hi_d:
-            candidates.update(_iter_weekdays(tip + timedelta(days=1), want_hi_d))
-    else:
-        want_lo_d = date.fromisoformat(min(requested))
-        candidates.update(_iter_weekdays(want_lo_d, want_hi_d))
-
-    # Interior holes: weekdays between consecutive exact panel days that sit
-    # at or before the requested tip (e.g. panel has 08-05 & 08-07).
-    sorted_panel = sorted(panel_set)
-    for left, right in zip(sorted_panel, sorted_panel[1:]):
-        left_d = date.fromisoformat(left)
-        right_d = date.fromisoformat(right)
-        if left_d >= want_hi_d:
-            break
-        gap_hi = min(right_d - timedelta(days=1), want_hi_d)
-        if gap_hi <= left_d:
+    window_lo = want_lo_d
+    for raw in panel_set:
+        try:
+            day = date.fromisoformat(raw)
+        except ValueError:
             continue
-        candidates.update(_iter_weekdays(left_d + timedelta(days=1), gap_hi))
+        if day > want_hi_d:
+            continue
+        if (want_hi_d - day).days <= ENSURE_SCORE_LOCAL_CATCHUP_DAYS:
+            window_lo = min(window_lo, day)
 
+    candidates.update(_iter_weekdays(window_lo, want_hi_d))
     return sorted(candidates)
 
 
@@ -114,7 +112,8 @@ def _missing_as_ofs(
     - Sat/Sun → PIT cover from prior trading-day scores (strategy lag).
     - Weekday without an exact panel row → missing, even if PIT would fall
       back to an older day (prevents permanent interior holes).
-    - Requesting a tip beyond the panel expands all intermediate weekdays.
+    - Requesting a tip beyond a *nearby* panel tip expands local weekdays only
+      (see ``ENSURE_SCORE_LOCAL_CATCHUP_DAYS``).
     """
     panel = list_external_alpha_as_ofs(source=source, version=version)
     panel_set = set(panel)

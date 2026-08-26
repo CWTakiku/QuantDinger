@@ -364,6 +364,114 @@ def test_interior_panel_hole_is_backfilled(monkeypatch):
     assert qlib_calls == [["2026-08-05", "2026-08-06"]]
 
 
+def test_ancient_panel_holes_are_not_required_for_recent_request(monkeypatch):
+    """Backtest/ensure for 2026 must not pull missing as_ofs from 2021 panel gaps."""
+    from app.services.quant_models.ensure_scores import _candidate_as_ofs
+
+    panel = [
+        "2021-09-17",
+        "2021-09-22",  # hole: 2021-09-20, 2021-09-21
+        "2026-08-04",
+    ]
+    requested = ["2026-08-05", "2026-08-07"]
+    candidates = _candidate_as_ofs(requested, panel)
+    assert "2021-09-20" not in candidates
+    assert "2021-09-21" not in candidates
+    assert all(d.startswith("2026-") for d in candidates)
+
+    qlib_calls: list = []
+    _patch_qlib(monkeypatch, qlib_calls)
+    _patch_sync_ok(monkeypatch)
+    covered: set[str] = set(panel)
+
+    def fake_load(as_of, **kwargs):
+        key = str(as_of)[:10]
+        tips = [d for d in covered if d <= key]
+        if tips:
+            return pd.Series({f"CNStock:60000{i}.SH": float(i) for i in range(15)})
+        return pd.Series(dtype=float)
+
+    monkeypatch.setattr(
+        "app.services.quant_models.ensure_scores.load_external_alpha_scores_as_of",
+        fake_load,
+    )
+    monkeypatch.setattr(
+        "app.services.quant_models.ensure_scores.list_external_alpha_as_ofs",
+        lambda **kwargs: sorted(covered),
+    )
+
+    def fake_infer(session_id, **kwargs):
+        covered.update(["2026-08-05", "2026-08-06", "2026-08-07"])
+        return {
+            "export_id": "recent",
+            "imported": True,
+            "as_of_min": "2026-08-05",
+            "as_of_max": "2026-08-07",
+        }
+
+    monkeypatch.setattr(
+        "app.services.quant_models.ensure_scores.infer_and_import_session_scores",
+        fake_infer,
+    )
+
+    out = ensure_quant_model_scores(
+        _sample_model(),
+        [date(2026, 8, 5), date(2026, 8, 7)],
+    )
+    assert all(not d.startswith("2021-") for d in out["missing_before"])
+    assert out["missing_before"] == ["2026-08-05", "2026-08-06", "2026-08-07"]
+    assert out["still_missing"] == []
+
+
+def test_stale_panel_tip_does_not_catch_up_years(monkeypatch):
+    """If panel tip is years behind, only densify the requested window."""
+    from app.services.quant_models.ensure_scores import _candidate_as_ofs
+
+    panel = ["2021-10-05"]
+    requested = ["2026-08-07"]
+    candidates = _candidate_as_ofs(requested, panel)
+    assert candidates == ["2026-08-07"]
+
+    _patch_qlib(monkeypatch)
+    _patch_sync_ok(monkeypatch)
+    covered: set[str] = set(panel)
+
+    def fake_load(as_of, **kwargs):
+        key = str(as_of)[:10]
+        tips = [d for d in covered if d <= key]
+        if tips:
+            return pd.Series({f"CNStock:60000{i}.SH": float(i) for i in range(15)})
+        return pd.Series(dtype=float)
+
+    monkeypatch.setattr(
+        "app.services.quant_models.ensure_scores.load_external_alpha_scores_as_of",
+        fake_load,
+    )
+    monkeypatch.setattr(
+        "app.services.quant_models.ensure_scores.list_external_alpha_as_ofs",
+        lambda **kwargs: sorted(covered),
+    )
+
+    def fake_infer(session_id, **kwargs):
+        covered.add("2026-08-07")
+        return {
+            "export_id": "stale",
+            "imported": True,
+            "as_of_min": "2026-08-07",
+            "as_of_max": "2026-08-07",
+        }
+
+    monkeypatch.setattr(
+        "app.services.quant_models.ensure_scores.infer_and_import_session_scores",
+        fake_infer,
+    )
+
+    out = ensure_quant_model_scores(_sample_model(), [date(2026, 8, 7)])
+    assert out["missing_before"] == ["2026-08-07"]
+    assert len(out["missing_before"]) == 1
+    assert out["still_missing"] == []
+
+
 def test_missing_dates_triggers_qlib_then_infer(monkeypatch):
     model = _sample_model()
     requested = [date(2026, 7, 1), date(2026, 7, 8), date(2026, 7, 15)]
