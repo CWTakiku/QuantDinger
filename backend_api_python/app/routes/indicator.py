@@ -11,7 +11,6 @@ For local mode, we expose Python equivalents under `/api/indicator/*`.
 from __future__ import annotations
 
 import json
-import os
 import re
 import time
 import traceback
@@ -24,6 +23,18 @@ from app.utils.logger import get_logger
 from app.services.ai_generation_contracts import (
     INDICATOR_GENERATION_CONTRACT,
     INDICATOR_REPAIR_REQUIREMENTS,
+)
+from app.services.ai_copilot_context import fit_messages_to_budget
+from app.services.ai_authoring_intent import resolve_authoring_intent
+from app.services.indicator_ai_generation import generate_indicator_code_candidate
+from app.services.indicator_ai_workspace import (
+    begin_turn as begin_indicator_ai_turn,
+    classify_indicator_ai_intent,
+    clear_workspace as clear_indicator_ai_workspace,
+    complete_discussion_turn as complete_indicator_ai_discussion_turn,
+    complete_turn as complete_indicator_ai_turn,
+    get_workspace as get_indicator_ai_workspace,
+    set_change_status as set_indicator_ai_change_status,
 )
 from app.services.indicator_workspace import is_indicator_ide_listable
 from app.services.indicator_versions import (
@@ -49,6 +60,17 @@ import requests
 logger = get_logger(__name__)
 
 indicator_blp = Blueprint("indicator", __name__)
+
+
+INDICATOR_IDE_SYSTEM_PROMPT = """You write production-ready QuantDinger chart indicators.
+The runtime provides pandas as `pd`, numpy as `np`, an OHLCV DataFrame named `df`, and a `params` dict.
+Keep every generated file chart-only: no orders, positions, schedules, leverage, network, file I/O, reflection, or dynamic execution.
+Use pandas Series for rolling, fill, shift, ewm, iloc, and list conversion. Coerce numpy results with
+`pd.Series(value, index=df.index)` before pandas-only operations so DatetimeIndex alignment is preserved.
+Visual markers should normally be one-bar events. A safe edge pattern is:
+`previous = condition.shift(1, fill_value=False).astype(bool)` followed by `condition & ~previous`.
+Return one complete Python source file only, without markdown fences or surrounding prose.
+"""
 
 
 def _sse_json(value: Any) -> str:
@@ -154,8 +176,49 @@ def _indicator_ai_text(key: str, lang: str = "zh-CN") -> str:
     texts = {
         "prompt_required": "Prompt cannot be empty",
         "insufficient_credits": "Insufficient credits. Please top up and try again.",
+        "candidate_ready": "A candidate version is ready and has passed automatic code checks. Preview it before applying it to the editor.",
+        "candidate_needs_review": "A candidate is ready, but automatic checks found issues. Review the validation result before applying it.",
+        "no_declared_params": "no declared tunable parameters",
+        "no_standard_outputs": "no recognized standard output structure",
+        "discussion_summary": (
+            "The current indicator is {name}. Declared parameters: {params}. "
+            "Recognized outputs: {outputs}. You can ask about a variable, signal condition, or chart element. "
+            "This answer did not generate or modify code."
+        ),
     }
+    if _is_zh_lang(lang):
+        zh_texts = {
+            "prompt_required": "请输入指标修改需求",
+            "insufficient_credits": "积分不足，请充值后重试。",
+            "candidate_ready": "候选版本已生成并通过自动代码检查。请先预览，再决定是否应用到编辑器。",
+            "candidate_needs_review": "候选版本已生成，但自动检查发现问题。请先查看检查结果，不要直接应用。",
+            "no_declared_params": "未声明可调参数",
+            "no_standard_outputs": "尚未识别到标准输出结构",
+            "discussion_summary": (
+                "当前指标是「{name}」。代码声明的参数包括：{params}；输出结构包括：{outputs}。"
+                "你可以继续问具体变量、信号条件或图表含义。这次仅回答问题，没有生成或修改代码。"
+            ),
+        }
+        return zh_texts.get(key, texts.get(key, key))
     return texts.get(key, key)
+
+
+def _indicator_discussion_fallback(existing: str, context: Dict[str, Any], lang: str) -> str:
+    indicator_name = str(context.get("indicatorName") or "").strip() or "this indicator"
+    param_names = re.findall(r"^\s*#\s*@param\s+([A-Za-z_]\w*)", existing, flags=re.MULTILINE)
+    output_parts = [
+        key
+        for key in ("plots", "signals", "layers")
+        if re.search(rf"['\"]{key}['\"]\s*:", existing)
+    ]
+    separator = "、" if _is_zh_lang(lang) else ", "
+    params_text = separator.join(param_names[:8]) or _indicator_ai_text("no_declared_params", lang)
+    outputs_text = separator.join(output_parts) or _indicator_ai_text("no_standard_outputs", lang)
+    return _indicator_ai_text("discussion_summary", lang).format(
+        name=indicator_name,
+        params=params_text,
+        outputs=outputs_text,
+    )
 
 
 def _indicator_hint_to_text(hint_code: str, params: Dict[str, Any] | None = None, lang: str = "zh-CN") -> str:
@@ -326,6 +389,7 @@ def save_indicator():
         id: number (0 for create),
         name: string,
         code: string,
+        allowEmptyDraft?: boolean,
         description?: string,
         ...
       }
@@ -338,6 +402,10 @@ def save_indicator():
         name = (data.get("name") or "").strip()
         description = (data.get("description") or "").strip()
         publish_to_community = 1 if data.get("publishToCommunity") or data.get("publish_to_community") else 0
+        allow_empty_draft = (
+            data.get("allowEmptyDraft") is True
+            or data.get("allow_empty_draft") is True
+        )
         pricing_type = (data.get("pricingType") or data.get("pricing_type") or "free").strip() or "free"
         vip_free = bool(data.get("vipFree") or data.get("vip_free"))
         code_hidden = bool(data.get("hideCode") or data.get("hide_code") or data.get("codeHidden") or data.get("code_hidden"))
@@ -348,18 +416,20 @@ def save_indicator():
         preview_image = (data.get("previewImage") or data.get("preview_image") or "").strip()
         asset_type = "indicator"
 
-        if not code or not str(code).strip():
+        is_empty_code = not str(code).strip()
+        if is_empty_code and (not allow_empty_draft or publish_to_community):
             return jsonify({"code": 0, "msg": "code is required", "data": None}), 400
 
-        from app.utils.safe_exec import validate_code_safety
+        if not is_empty_code:
+            from app.utils.safe_exec import validate_code_safety
 
-        is_safe_code, unsafe_reason = validate_code_safety(code)
-        if not is_safe_code:
-            return jsonify({
-                "code": 0,
-                "msg": f"Unsafe indicator code: {unsafe_reason}",
-                "data": None,
-            }), 400
+            is_safe_code, unsafe_reason = validate_code_safety(code)
+            if not is_safe_code:
+                return jsonify({
+                    "code": 0,
+                    "msg": f"Unsafe indicator code: {unsafe_reason}",
+                    "data": None,
+                }), 400
 
         # Local dev UX: if name/description not provided, derive from code variables.
         if not name or not description:
@@ -682,6 +752,57 @@ def preview_indicator_chart():
         return jsonify({"code": 0, "msg": str(exc), "data": None}), 500
 
 
+@indicator_blp.route("/aiWorkspace/<int:indicator_id>", methods=["GET"])
+@login_required
+def indicator_ai_workspace(indicator_id: int):
+    """Load the bounded AI authoring workspace for one owned indicator."""
+    try:
+        data = get_indicator_ai_workspace(g.user_id, indicator_id)
+        return jsonify({"code": 1, "msg": "success", "data": data})
+    except LookupError as exc:
+        return jsonify({"code": 0, "msg": str(exc), "data": None}), 404
+    except PermissionError as exc:
+        return jsonify({"code": 0, "msg": str(exc), "data": None}), 403
+    except Exception as exc:
+        logger.error("indicator_ai_workspace failed: %s", exc, exc_info=True)
+        return jsonify({"code": 0, "msg": str(exc), "data": None}), 500
+
+
+@indicator_blp.route("/aiWorkspace/<int:indicator_id>", methods=["DELETE"])
+@login_required
+def delete_indicator_ai_workspace(indicator_id: int):
+    """Clear conversation and pending candidates without touching saved code."""
+    try:
+        data = clear_indicator_ai_workspace(g.user_id, indicator_id)
+        return jsonify({"code": 1, "msg": "success", "data": data})
+    except LookupError as exc:
+        return jsonify({"code": 0, "msg": str(exc), "data": None}), 404
+    except PermissionError as exc:
+        return jsonify({"code": 0, "msg": str(exc), "data": None}), 403
+    except Exception as exc:
+        logger.error("delete_indicator_ai_workspace failed: %s", exc, exc_info=True)
+        return jsonify({"code": 0, "msg": str(exc), "data": None}), 500
+
+
+@indicator_blp.route("/aiWorkspace/changes/<int:change_id>/status", methods=["POST"])
+@login_required
+def update_indicator_ai_change_status(change_id: int):
+    """Mark a generated candidate as applied or discarded."""
+    try:
+        status = str((request.get_json() or {}).get("status") or "").strip().lower()
+        data = set_indicator_ai_change_status(g.user_id, change_id, status)
+        return jsonify({"code": 1, "msg": "success", "data": data})
+    except ValueError as exc:
+        return jsonify({"code": 0, "msg": str(exc), "data": None}), 400
+    except LookupError as exc:
+        return jsonify({"code": 0, "msg": str(exc), "data": None}), 404
+    except PermissionError as exc:
+        return jsonify({"code": 0, "msg": str(exc), "data": None}), 403
+    except Exception as exc:
+        logger.error("update_indicator_ai_change_status failed: %s", exc, exc_info=True)
+        return jsonify({"code": 0, "msg": str(exc), "data": None}), 500
+
+
 @indicator_blp.route("/aiGenerate", methods=["POST"])
 @login_required
 def ai_generate():
@@ -698,8 +819,13 @@ def ai_generate():
     data = request.get_json() or {}
     lang = _request_lang()
     prompt = (data.get("prompt") or "").strip()
-    existing = (data.get("existingCode") or "").strip()
+    existing = str(data.get("existingCode") or "")
     context = data.get("context") if isinstance(data.get("context"), dict) else {}
+    source = str(data.get("source") or context.get("source") or "").strip()
+    indicator_id = context.get("indicatorId")
+    requested_interaction_mode = str(data.get("interactionMode") or "auto").strip().lower()
+    resolved_interaction_mode = "modify"
+    workspace_context: Dict[str, Any] | None = None
 
     if not prompt:
         # Keep SSE contract (match PHP behavior) so frontend doesn't look "stuck".
@@ -713,156 +839,89 @@ def ai_generate():
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
+    if source == "indicator_ide":
+        intent_messages: List[Dict[str, Any]] = []
+        if requested_interaction_mode == "auto" and indicator_id not in (None, ""):
+            try:
+                intent_workspace = get_indicator_ai_workspace(g.user_id, int(indicator_id))
+                intent_messages = list(intent_workspace.get("messages") or [])
+            except Exception as exc:
+                logger.info("indicator intent history unavailable; continuing without it: %s", exc)
+        intent_decision = resolve_authoring_intent(
+            prompt=prompt,
+            requested_mode=requested_interaction_mode,
+            asset_kind="chart_indicator",
+            existing_code=existing,
+            recent_messages=intent_messages,
+            fallback_classifier=classify_indicator_ai_intent,
+        )
+        resolved_interaction_mode = str(intent_decision["intent"])
+        logger.info(
+            "indicator authoring intent=%s source=%s confidence=%.2f",
+            resolved_interaction_mode,
+            intent_decision.get("source"),
+            float(intent_decision.get("confidence") or 0.0),
+        )
+
     # QuantDinger indicator IDE: chart render only; strategies are separate script assets.
-    SYSTEM_PROMPT = """# Role
+    # Marker edge contract: shift(1, fill_value=False).astype(bool)
+    system_prompt = INDICATOR_IDE_SYSTEM_PROMPT + "\n\n" + INDICATOR_GENERATION_CONTRACT
 
-You write production-ready **QuantDinger** chart indicator scripts: Python that runs in the Indicator IDE and renders overlays/markers on the K-line chart. Indicators are **not executable strategies**: they must not open, close, size, backtest, or live trade. If a user wants trading logic, keep this file as a visual indicator and let the Strategy API V2 workflow generate executable strategy code separately.
+    def _generate_discussion_via_llm() -> str:
+        """Answer a code question without returning replacement source."""
+        from app.services.llm import LLMService
 
-# Runtime (strict)
+        llm = LLMService()
+        if not llm.get_api_key():
+            return _indicator_discussion_fallback(existing, context, lang)
 
-- Environment: browser-side Pyodide-style sandbox **or** API verify sandbox: **no network**, no file I/O, no subprocess.
-- **`pd` and `np` are already available.** Do **not** write `import pandas` / `import numpy`. Avoid any `import` unless unavoidable; never import `os`, `sys`, `requests`, `socket`, `subprocess`, `threading`, `sqlite3`, `multiprocessing`, or other I/O/network modules.
-- Do **not** use: `eval`, `exec`, `compile`, `open`, `__import__`, `getattr`/`setattr`/`delattr` on untrusted names, `locals`, `globals`, `vars`, `dir`, or meta-programming to escape the sandbox.
-- Allowed imports only: `numpy`, `pandas`, `math`, `json`, `datetime`, `time`, `collections`, `functools`, `itertools`, `statistics`, `decimal`, `fractions`, `copy`. **Never** `import operator`.
-- Work **vectorized** with pandas on `df` where possible; avoid O(n) Python loops over every row for core series (rolling/ewm/shift are preferred).
+        discussion_system = """You are QuantDinger's indicator-code reviewer.
+Answer the user's question about the currently open indicator. Use the same language as the user.
+Explain concrete logic, parameters, plots, visual signals, edge cases, and limitations from the supplied source.
+Never claim that code was changed. Do not return a full replacement script and do not create a code candidate.
+When useful, cite short variable or function names from the source, but keep the answer concise and readable.
+Lead with the conclusion. By default use 4-8 short points and stay under 700 Chinese characters or 350 English words; only go deeper when the user explicitly asks for a detailed walkthrough.
+If the question actually requests a code modification, explain what should change and ask the user to state the desired change explicitly; do not write the replacement code in this discussion response."""
+        messages: List[Dict[str, str]] = [{"role": "system", "content": discussion_system}]
+        if workspace_context:
+            summary_text = json.dumps(workspace_context.get("summary") or {}, ensure_ascii=False, default=str)
+            messages.append({
+                "role": "system",
+                "content": "# Bounded indicator conversation memory\n" + summary_text[:4000],
+            })
+            for item in workspace_context.get("recent_messages") or []:
+                role = str(item.get("role") or "")
+                content_text = str(item.get("content") or "").strip()
+                if role in {"user", "assistant"} and content_text:
+                    messages.append({"role": role, "content": content_text[:2000]})
 
-# Series vs ndarray contract (critical - common AI bug source)
-
-This is the #1 reason hand/AI-translated Pine/TDX scripts crash at runtime ("AttributeError: 'numpy.ndarray' object has no attribute 'rolling' / 'fillna' / 'iloc' / 'shift' / 'ewm'"). Pine auto-coerces types; Python does not.
-
-Hard rules:
-
-- `np.where(...)`, `np.maximum(...)`, `np.minimum(...)`, `np.abs(...)` on a Series **may return either a Series or an ndarray** depending on numpy version. **Never chain pandas methods on their result without coercing.** Coerce explicitly: `pd.Series(arr, index=df.index)`.
-- A user-defined helper like `def safe_div(a, b): return np.where(b == 0, 0, a / b)` returns **ndarray**. If you want `.fillna` / `.rolling` / `.shift` / `.ewm` / `.tolist()` on it, wrap: `pd.Series(safe_div(a, b), index=df.index)`. Better: rewrite the helper to return a Series directly, e.g. `return (a / b.replace(0, np.nan)).fillna(0)`.
-- Any helper that uses `.iloc` (TDX-style `sma`, custom filters, etc.) **MUST receive a Series**. If you call it with `np.where(...)` output you will get AttributeError on the first iteration. Either coerce the argument or make the helper auto-coerce: `if not isinstance(src, pd.Series): src = pd.Series(np.asarray(src), index=df.index)`.
-- `pd.Series(some_ndarray)` defaults to a `RangeIndex 0..n-1`. If `df.index` is a `DatetimeIndex` (very common), the new Series will **silently misalign** with `df` columns in subsequent comparisons / `where` / arithmetic. **Always pass `index=df.index`** when wrapping an ndarray that is sized to `len(df)`.
-
-Prefer pandas-native operators that **stay in Series-land**:
-
-- `np.where(cond, a, b)`         -> `a.where(cond, b)`     (returns Series when `a` is Series; `cond` aligned to `a`)
-- `np.where(cond, X, 0)`         -> `X.where(cond, 0)` or `pd.Series(0, index=df.index).mask(cond, X)`
-- `np.maximum(s, 0)`             -> `s.clip(lower=0)`
-- `np.minimum(s, k)`             -> `s.clip(upper=k)`
-- `np.abs(s)`                    -> `s.abs()`
-- division-by-zero protection    -> `num / den.replace(0, np.nan)` then `.fillna(0)` (do NOT use `np.where(den == 0, ...)` if you need to chain pandas methods)
-
-Self-check before returning code: every place where you call `.rolling` / `.fillna` / `.shift` / `.ewm` / `.iloc` / `.tolist()` - trace back: is the left-hand side a **Series**? If it came from `np.where` / `np.maximum` / `np.minimum` / a custom helper, wrap it first.
-
-# Input: `df`
-
-- `df` is a pandas `DataFrame` aligned to K-line bars (one row per bar).
-- You **must** start mutating with: `df = df.copy()`
-- Expected columns (use `.get` or try/except only if you document optional columns): `open`, `high`, `low`, `close`, `volume`. A `time` column may exist; do not assume dtypes beyond numeric OHLCV.
-- Do not rename or drop required columns in a way that breaks length alignment.
-
-# Required globals (strict)
-
-1. `my_indicator_name = "..."` - short display name (can match `output['name']`).
-2. `my_indicator_description = "..."` - one line describing logic and parameters.
-
-# Execution boundary (strict)
-
-- Do **not** create or require execution columns such as `df['open_long']`, `df['close_long']`, `df['open_short']`, `df['close_short']`, `df['add_long']`, or `df['reduce_long']`.
-- Do **not** emit `# @strategy`, `# signal_form`, `# exit_owner`, `# flip_mode`, `# timeframe`, risk defaults, position sizing, stop-loss, take-profit, trailing-stop, leverage, or trade-direction settings.
-- `output['signals']` are visual chart markers only. They never place orders.
-- If the user asks for a strategy, still return a chart indicator here: plots and visual markers that express the idea. Executable strategy code belongs in Strategy API V2.
-
-# User intent handling
-
-- Treat the user's text as product requirements, not as literal code unless they paste code.
-- Infer sensible defaults when the request is incomplete, but keep the code simple, readable, and stable.
-- If the user mentions a well-known indicator family, implement the core concept and add useful visual context rather than overfitting to one screenshot.
-- Use English for identifiers, metadata, comments, `@param` descriptions, and default plot, signal, and layer labels. Localize display labels only when the user explicitly requests a target language.
-- The current chart symbol/timeframe may be provided as context. Use it to choose sensible examples only; do **not** hardcode symbol, exchange, timeframe, account, leverage, or risk into indicator code.
-
-# Chart output: `output` dict (strict)
-
-After computation, set:
-
-`output = { 'name': ..., 'plots': [...], 'signals': [...], 'layers': [...] }`  (use the same string keys as below; `layers` is optional)
-
-- **`name`**: str, usually `my_indicator_name`.
-- **`plots`**: list of dicts, each with:
-  - `name` (str), `data` (list, length **exactly** `len(df)`), `color` (`#RRGGBB`), `overlay` (bool).
-  - `type`: optional, e.g. `'line'`.
-  - Price-scale series (MA, Bollinger on price): `overlay: True`. Oscillators (RSI 0-100): `overlay: False`.
-- **`signals`**: optional list for markers; each item:
-  - `type`: `'buy'` or `'sell'` controls marker orientation only; it is not the signal name.
-  - `text`: a stable descriptive signal name. Optional `textData` may provide a different label for each bar. Signal names are dynamic and are not limited to `Buy`, `Sell`, `Long Entry`, or `Long Exit`.
-  - `color`, `data`: list length **`len(df)`**, value `None` or a float price for marker Y.
-  - Only a finite numeric value in `data[i]` activates the signal on bar `i`. Static `text` or `textData` is label content only and must never activate a signal.
-  - Signal markers must usually represent **events**, not continuous states. If a condition can stay true for many bars, mark only the transition bar with an edge/flip condition. This prevents noisy charts and repeated signal notifications.
-- **`layers`**: optional list for advanced K-line overlays. Do not add layers by default. Use layers only when the user explicitly asks for zones, channels, support/resistance, invalidation areas, or when one sparse annotation materially improves readability. Prefer plots and signals for normal indicators.
-  - Zone layer: `{ 'type': 'zone', 'startIndex': int, 'endIndex': int, 'top': float, 'bottom': float, 'text': str, 'fillColor': '#RRGGBB', 'borderColor': '#RRGGBB', 'opacity': 0.12 }`.
-  - Line layer: `{ 'type': 'line', 'startIndex': int, 'endIndex': int, 'price': float, 'text': str, 'color': '#RRGGBB', 'dashed': true }`; for sloped lines use `startPrice` and `endPrice`.
-  - Label layer: `{ 'type': 'label', 'index': int, 'price': float, 'text': str, 'color': '#RRGGBB', 'textColor': '#FFFFFF' }`.
-  - Prefer `startIndex` / `endIndex` / `index` for generated code because they are stable with the current `df`. `startTime` / `endTime` / `time` are also supported if they match K-line timestamps.
-  - Do not use layers as execution signals. Indicators are chart-only.
-- **`calculatedVars`**: optional dict for future UI; may be `{}` or omitted.
-
-**Length rule:** every `plot['data']` and every `signal['data']` list must have the **same length as `df`** (same as number of rows). Layer objects do not need per-bar arrays, but their indices/times and prices must be valid for the visible `df`.
-
-# Optional tunable parameters: `# @param`
-
-If the indicator has knobs (periods, thresholds), declare them **once per line** at the top after name/description:
-
-`# @param <name> <int|float|bool|str> <default> <short description>`
-
-Example: `# @param rsi_len int 14 RSI period`
-
-The runtime merges these with user-supplied params.
-
-**Critical:** `# @param` only declares parameters for the UI/runtime. It does **not**
-create Python variables automatically. If you declare:
-
-`# @param fast_period int 10 Fast MA period`
-
-you must read it explicitly in code, for example:
-
-`fast_period = params.get('fast_period', 10)`
-
-The fallback default in `params.get` must exactly match the declared `# @param`
-default after type conversion. Example: if you declare
-`# @param fast_period int 18 Fast MA period`, the code must read
-`fast_period = int(params.get('fast_period', 18))`; never use 10, 30, or any
-second hard-coded default for the same parameter.
-
-Never use declared parameter names directly unless you first assign them from `params`.
-
-# Strategy defaults
-
-Do not use `# @strategy` in indicator code. Strategy defaults belong in Strategy API V2 code, not chart indicators.
-
-# Quality bar
-
-- Prefer clear variable names, short comments only where non-obvious.
-- Ensure visual markers are useful but not noisy. Do not widen or replace the requested signal condition merely to create more markers.
-- Use unambiguous marker text such as `Long Entry`, `Long Exit`, `Short Entry`, `Short Exit`, or `Warning`; a generic bearish/sell marker must not imply a short entry when it only exits a long position.
-- For notification-safe markers, convert state signals into one-bar events by default:
-  - `def edge(s): s = s.fillna(False).astype(bool); previous = s.shift(1, fill_value=False).astype(bool); return s & ~previous`
-  - Use `edge(condition)` for `output['signals']` unless the user explicitly asks for every bar where a condition is true.
-  - If the user requests "confirmed next bar" behavior, compute the raw condition on closed bars and shift the event one bar forward for display/notification: `confirmed = edge(raw_condition).shift(1, fill_value=False).astype(bool)`.
-- For state/regime visuals that should persist across bars, use overlay/non-overlay plots, lamp belts, or sparse layers instead of repeating `output['signals']` markers every bar.
-- For signal markers, prefer explicit lists with `None` for empty bars:
-  - `buy_marks = [df['low'].iloc[i] * 0.995 if bool(buy_signal.iloc[i]) else None for i in range(len(df))]`
-  - `sell_marks = [df['high'].iloc[i] * 1.005 if bool(sell_signal.iloc[i]) else None for i in range(len(df))]`
-  - Avoid `series.where(mask, None).tolist()` for marker data because float series may still contain `NaN` instead of real `None`.
-- Default to `output['layers'] = []`. Use `output['layers']` only when explicitly requested or when one sparse annotation materially improves readability, for example supply/demand zones, premium/discount ranges, support/resistance lines, BOS/CHoCH labels, or invalidation levels. Do not flood every bar with labels or add large filled zones by habit.
-- If the user asks for multi-signal lights, lamp belts, resonance rows, or dashboard-style states, create named non-overlay plot rows that encode each state with stable per-bar arrays, and keep labels concise. Each row should have a clear `name` such as `MACD`, `KDJ`, or `RSI`; do not hardcode a renderer-specific layout unless the requested visual needs it.
-- Convert warm-up `NaN` values to either `None` (preferred for sparse/optional lines) or a sensible neutral value for bounded oscillators; avoid drawing misleading zero lines on price overlays.
-- Before returning code, self-check:
-  1. every declared `# @param` used in code is read via `params.get(...)`
-  2. every `params.get('name', fallback)` fallback exactly equals that parameter's declared `# @param` default
-  3. no execution columns or `# @strategy` annotations are emitted
-  4. every `plot['data']` and `signal['data']` length equals `len(df)`
-  5. `output` exists and is a dict
-  6. **type audit**: scan every `.rolling` / `.fillna` / `.shift` / `.ewm` / `.iloc` / `.tolist` call site; confirm its left-hand side is a Series. If it came from `np.where` / `np.maximum` / `np.minimum` / a custom helper returning ndarray, you MUST wrap with `pd.Series(arr, index=df.index)` first
-  7. **index audit**: any `pd.Series(arr)` where `arr` is ndarray sized `len(df)` MUST pass `index=df.index`, otherwise it will silently misalign with DatetimeIndex-based `df`
-
-# Output format for this chat turn
-
-Return **only** valid Python source: **no** markdown fences, **no** ` ``` `, **no** explanation before or after the code. First non-empty line should be `my_indicator_name` or `# @param` immediately followed by `my_indicator_name`.
-""" + "\n\n" + INDICATOR_GENERATION_CONTRACT
+        chart_context = {
+            "market": context.get("market"),
+            "symbol": context.get("symbol"),
+            "timeframe": context.get("timeframe"),
+            "indicator_name": context.get("indicatorName"),
+            "indicator_description": context.get("indicatorDescription"),
+        }
+        messages.append({
+            "role": "user",
+            "content": (
+                "# Current chart context\n"
+                + json.dumps(chart_context, ensure_ascii=False, default=str)
+                + "\n\n# Current indicator source (source of truth)\n```python\n"
+                + existing[:36000]
+                + "\n```\n\n# User question\n"
+                + prompt
+            ),
+        })
+        messages, budget_debug = fit_messages_to_budget(messages, max_tokens=32000)
+        logger.info("indicator discussion context budget=%s", _sse_json(budget_debug))
+        answer = llm.call_llm_api(
+            messages=messages,
+            model=llm.get_default_model(),
+            temperature=0.25,
+            use_json_mode=False,
+        )
+        return str(answer or "").strip() or _indicator_discussion_fallback(existing, context, lang)
 
     def _template_code() -> str:
         from app.services.indicator_default_template import build_default_indicator_template
@@ -878,94 +937,16 @@ Return **only** valid Python source: **no** markdown fences, **no** ` ``` `, **n
             code = "# Existing code was provided as context.\n" + code
         return code
 
-    def _generate_code_via_llm() -> str:
-        """Use unified LLMService to support all configured providers (OpenRouter, OpenAI, Grok, etc.)."""
-        from app.services.llm import LLMService
-        
-        llm = LLMService()
-        
-        # Get provider and model from env config (no frontend override)
-        current_provider = llm.provider
-        current_model = llm.get_code_generation_model()
-        current_api_key = llm.get_api_key()
-        base_url = llm.get_base_url()
-        
-        logger.info(f"AI Code Generation - Provider: {current_provider.value}, Model: {current_model}, Base URL: {base_url}, API Key configured: {bool(current_api_key)}")
-        
-        # Check if any LLM provider is configured
-        if not current_api_key:
-            logger.warning("No LLM API key configured, using template code")
-            return _template_code()
-
-        def _context_block() -> str:
-            if not context:
-                return ""
-            lines: List[str] = []
-            market = str(context.get("market") or "").strip()
-            symbol = str(context.get("symbol") or "").strip()
-            timeframe = str(context.get("timeframe") or "").strip()
-            indicator_name = str(context.get("indicatorName") or "").strip()
-            indicator_description = str(context.get("indicatorDescription") or "").strip()
-            param_defaults = context.get("paramDefaults")
-            if market or symbol or timeframe:
-                lines.append(f"- Current chart: market={market or 'unknown'}, symbol={symbol or 'unknown'}, timeframe={timeframe or 'unknown'}")
-            if indicator_name:
-                lines.append(f"- Current indicator name: {indicator_name}")
-            if indicator_description:
-                lines.append(f"- Current indicator description: {indicator_description[:300]}")
-            if isinstance(param_defaults, dict) and param_defaults:
-                try:
-                    lines.append("- Existing @param defaults: " + json.dumps(param_defaults, ensure_ascii=False)[:1200])
-                except Exception:
-                    pass
-            if not lines:
-                return ""
-            return (
-                "\n\n# Current IDE context (for intent only; do not hardcode symbol/timeframe/account settings)\n"
-                + "\n".join(lines)
-            )
-
-        # Build user prompt (match PHP behavior)
-        context_text = _context_block()
-        user_prompt = prompt + context_text
-        if existing:
-            user_prompt = (
-                "# Existing QuantDinger indicator code (migrate it to the chart-only indicator contract):\n\n```python\n"
-                + existing.strip()
-                + "\n```\n\n# Change request:\n\n"
-                + prompt
-                + context_text
-                + "\n\nReturn one full replacement indicator: my_indicator_name/description, df = df.copy(), declared @param values must be read via params.get(...), output dict with layers defaulting to [], list lengths == len(df). "
-                "Do not emit execution columns, # @strategy, risk, sizing, timeframe, or trade-direction settings. "
-                "For visual signals, output one-bar event markers by default; do not repeat markers on every bar while a condition remains true. "
-                "For every declared @param, the params.get fallback default must exactly match the declared default. "
-                "Python only - no markdown, no prose outside the code."
-            )
-
-        temperature = float(os.getenv("OPENROUTER_TEMPERATURE", "0.7") or 0.7)
-        
-        # Call LLM using the unified API (auto-selects provider based on LLM_PROVIDER env)
-        # use_json_mode=False because we want raw Python code output
-        content = llm.call_llm_api(
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
-            model=current_model,
-            temperature=temperature,
-            use_json_mode=False  # Code generation doesn't need JSON mode
+    def _generate_code_via_llm() -> tuple[str, Dict[str, Any]]:
+        return generate_indicator_code_candidate(
+            prompt=prompt,
+            existing=existing,
+            context=context,
+            system_prompt=system_prompt,
+            workspace_context=workspace_context,
+            template_factory=_template_code,
+            logger=logger,
         )
-        
-        # Clean up markdown code blocks if present
-        content = content.strip()
-        if content.startswith("```python"):
-            content = content[9:]
-        elif content.startswith("```"):
-            content = content[3:]
-        if content.endswith("```"):
-            content = content[:-3]
-        
-        return content.strip() or _template_code()
 
     AUTO_FIX_HINT_CODES = {
         "DECLARED_PARAMS_NOT_READ_VIA_PARAMS_GET",
@@ -1026,7 +1007,7 @@ Return **only** valid Python source: **no** markdown fences, **no** ` ``` `, **n
 
         content = llm.call_llm_api(
             messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": repair_prompt},
             ],
             model=current_model,
@@ -1043,12 +1024,13 @@ Return **only** valid Python source: **no** markdown fences, **no** ` ``` `, **n
             content = content[:-3]
         return content.strip() or bad_code
 
-    def _generate_final_code() -> tuple[str, Dict[str, Any]]:
+    def _generate_final_code() -> tuple[str, Dict[str, Any], Dict[str, Any]]:
         try:
-            code_text = _generate_code_via_llm()
+            code_text, edit_plan = _generate_code_via_llm()
         except Exception as e:
             logger.error(f"ai_generate LLM failed, fallback to template. Error: {type(e).__name__}: {e}")
             code_text = _template_code()
+            edit_plan = {"executor": "template", "operation": "generate_candidate", "error": str(e)}
 
         validation = _validate_indicator_code_internal(code_text)
         if not _needs_auto_fix(validation):
@@ -1063,7 +1045,7 @@ Return **only** valid Python source: **no** markdown fences, **no** ` ``` `, **n
                 validation, validation, False, False, "initial", lang=lang
             )
             logger.info("ai_generate debug=%s", _sse_json(debug))
-            return code_text, debug
+            return code_text, debug, edit_plan
 
         logger.warning("ai_generate produced code needing auto-fix: %s", _format_validation_issues(validation))
         try:
@@ -1084,7 +1066,7 @@ Return **only** valid Python source: **no** markdown fences, **no** ` ``` `, **n
                 validation, fallback_validation, True, False, "template", lang=lang
             )
             logger.info("ai_generate debug=%s", _sse_json(debug))
-            return fallback_code, debug
+            return fallback_code, debug, {"executor": "template", "operation": "repair_fallback"}
 
         repaired_validation = _validate_indicator_code_internal(repaired)
         if repaired_validation.get("success") and not _needs_auto_fix(repaired_validation):
@@ -1100,7 +1082,7 @@ Return **only** valid Python source: **no** markdown fences, **no** ` ``` `, **n
                 validation, repaired_validation, True, True, "repaired", lang=lang
             )
             logger.info("ai_generate debug=%s", _sse_json(debug))
-            return repaired, debug
+            return repaired, debug, {"executor": "model_repair", "operation": "generate_candidate"}
 
         repaired_hint_codes = {h.get("code") for h in repaired_validation.get("hints", [])}
         if repaired_validation.get("success"):
@@ -1116,7 +1098,7 @@ Return **only** valid Python source: **no** markdown fences, **no** ` ``` `, **n
                 validation, repaired_validation, True, True, "repaired", lang=lang
             )
             logger.info("ai_generate debug=%s", _sse_json(debug))
-            return repaired, debug
+            return repaired, debug, {"executor": "model_repair", "operation": "generate_candidate"}
 
         if repaired_hint_codes.intersection(AUTO_FIX_HINT_CODES):
             logger.warning("ai_generate auto-fix still has blocking issues, returning safe template")
@@ -1133,7 +1115,7 @@ Return **only** valid Python source: **no** markdown fences, **no** ` ``` `, **n
                 validation, fallback_validation, True, False, "template", lang=lang
             )
             logger.info("ai_generate debug=%s", _sse_json(debug))
-            return fallback_code, debug
+            return fallback_code, debug, {"executor": "template", "operation": "repair_fallback"}
 
         debug = {
             "auto_fix_applied": True,
@@ -1146,17 +1128,19 @@ Return **only** valid Python source: **no** markdown fences, **no** ` ``` `, **n
             validation, repaired_validation, True, False, "repaired", lang=lang
         )
         logger.info("ai_generate debug=%s", _sse_json(debug))
-        return repaired, debug
+        return repaired, debug, {"executor": "model_repair", "operation": "generate_candidate"}
 
     # Capture user_id before generator runs (generator executes outside request context)
     user_id = g.user_id
     def stream():
+        nonlocal workspace_context
         from app.services.billing_service import get_billing_service
         billing = get_billing_service()
+        billing_feature = "ai_copilot_chat" if resolved_interaction_mode == "discussion" else "ai_code_gen"
         ok, msg = billing.check_and_consume(
             user_id=user_id,
-            feature='ai_code_gen',
-            reference_id=f"ai_code_gen_{user_id}_{int(time.time())}"
+            feature=billing_feature,
+            reference_id=f"{billing_feature}_{user_id}_{int(time.time())}"
         )
         if not ok:
             error_msg = f"Insufficient credits: {msg}" if msg else _indicator_ai_text("insufficient_credits", lang)
@@ -1164,7 +1148,68 @@ Return **only** valid Python source: **no** markdown fences, **no** ` ``` `, **n
             yield "data: [DONE]\n\n"
             return
 
-        code_text, debug_info = _generate_final_code()
+        if source == "indicator_ide" and indicator_id not in (None, ""):
+            try:
+                workspace_context = begin_indicator_ai_turn(
+                    user_id,
+                    int(indicator_id),
+                    prompt,
+                    intent=resolved_interaction_mode,
+                )
+            except (LookupError, PermissionError, ValueError) as exc:
+                yield "data: " + _sse_json({"error": str(exc)}) + "\n\n"
+                yield "data: [DONE]\n\n"
+                return
+            except Exception as exc:
+                logger.error("begin indicator AI turn failed: %s", exc, exc_info=True)
+                yield "data: " + _sse_json({"error": "indicator_ai_workspace_unavailable"}) + "\n\n"
+                yield "data: [DONE]\n\n"
+                return
+
+        if workspace_context and resolved_interaction_mode == "discussion":
+            try:
+                discussion_text = _generate_discussion_via_llm()
+                workspace_result = complete_indicator_ai_discussion_turn(
+                    user_id=user_id,
+                    workspace=workspace_context,
+                    answer=discussion_text,
+                )
+                yield "data: " + _sse_json({"workspace": workspace_result}) + "\n\n"
+                chunk_size = 240
+                for i in range(0, len(discussion_text), chunk_size):
+                    yield "data: " + _sse_json({"content": discussion_text[i : i + chunk_size]}) + "\n\n"
+                yield "data: [DONE]\n\n"
+                return
+            except Exception as exc:
+                logger.error("indicator AI discussion failed: %s", exc, exc_info=True)
+                yield "data: " + _sse_json({"error": "indicator_ai_discussion_failed"}) + "\n\n"
+                yield "data: [DONE]\n\n"
+                return
+
+        code_text, debug_info, edit_plan = _generate_final_code()
+
+        if workspace_context:
+            validation = _validate_indicator_code_internal(code_text)
+            validation["edit_plan"] = edit_plan
+            assistant_text = _indicator_ai_text("candidate_ready", lang)
+            if not validation.get("success"):
+                assistant_text = _indicator_ai_text("candidate_needs_review", lang)
+            try:
+                workspace_result = complete_indicator_ai_turn(
+                    user_id=user_id,
+                    workspace=workspace_context,
+                    prompt=prompt,
+                    base_code=existing,
+                    candidate_code=code_text,
+                    validation=validation,
+                    assistant_text=assistant_text,
+                )
+                yield "data: " + _sse_json({"workspace": workspace_result}) + "\n\n"
+            except Exception as exc:
+                logger.error("complete indicator AI turn failed: %s", exc, exc_info=True)
+                yield "data: " + _sse_json({"error": "indicator_ai_workspace_save_failed"}) + "\n\n"
+                yield "data: [DONE]\n\n"
+                return
 
         yield "data: " + _sse_json({"debug": debug_info}) + "\n\n"
 

@@ -431,7 +431,7 @@ class LLMService:
             if "openrouter" in (base_url or "").lower():
                 from app.config.api_keys import APIKeys
                 if not APIKeys.OPENROUTER_API_KEY:
-                    error_msg += ". OPENROUTER_API_KEY 未配置，请在 backend_api_python/.env 中设置"
+                    error_msg += ". OPENROUTER_API_KEY is not configured in the project-root .env"
                 elif response.status_code == 403:
                     error_msg += ". 可能原因：API 密钥无效/过期、余额不足、或无模型权限。请检查 https://openrouter.ai/keys"
                 elif response.status_code == 404:
@@ -1096,7 +1096,8 @@ class LLMService:
 
     def call_llm_api(self, messages: list, model: str = None, temperature: float = 0.7, 
                      use_fallback: bool = True, provider: LLMProvider = None,
-                     use_json_mode: bool = True, try_alternative_providers: bool = True) -> str:
+                     use_json_mode: bool = True, try_alternative_providers: bool = True,
+                     timeout_seconds: float | None = None) -> str:
         """
         Call LLM API with the specified or default provider.
         
@@ -1185,6 +1186,8 @@ class LLMService:
         
         config = load_addon_config()
         timeout = int(config.get(p.value, {}).get('timeout', 120))
+        if timeout_seconds is not None:
+            timeout = max(1, min(timeout, float(timeout_seconds)))
         
         # Build model candidates
         models_to_try = [model]

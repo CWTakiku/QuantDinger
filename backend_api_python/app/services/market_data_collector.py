@@ -14,9 +14,13 @@
 - 基本面: Finnhub (美股) / 固定描述 (加密)
 """
 
+import copy
+import os
+import tempfile
+import threading
 import time
 from typing import Dict, List, Any, Optional
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
 
 import yfinance as yf
@@ -58,7 +62,31 @@ class MarketDataCollector:
         self._finnhub_client = None
         self._ak = None
         self._crypto_metric_cache: Dict[str, Dict[str, Any]] = {}
+        self._fundamental_cache: Dict[str, Dict[str, Any]] = {}
+        self._fundamental_cache_lock = threading.RLock()
+        self._configure_yfinance_cache()
         self._init_clients()
+
+    @staticmethod
+    def _configure_yfinance_cache() -> None:
+        """Point yfinance at a writable cache directory inside containers.
+
+        yfinance caches cookies and timezone metadata.  Its platform default may
+        resolve to a read-only home directory for the unprivileged API user,
+        which turns every analysis into a cold request and can push financial
+        statements past the collection deadline.
+        """
+        cache_dir = os.getenv("YFINANCE_CACHE_DIR") or os.path.join(
+            tempfile.gettempdir(), "quantdinger-yfinance"
+        )
+        try:
+            os.makedirs(cache_dir, mode=0o700, exist_ok=True)
+            os.environ.setdefault("XDG_CACHE_HOME", cache_dir)
+            set_tz_cache_location = getattr(yf, "set_tz_cache_location", None)
+            if callable(set_tz_cache_location):
+                set_tz_cache_location(cache_dir)
+        except Exception as exc:
+            logger.debug("Unable to configure yfinance cache at %s: %s", cache_dir, exc)
     
     def _init_clients(self):
         """初始化外部API客户端"""
@@ -107,7 +135,10 @@ class MarketDataCollector:
             "market": market,
             "symbol": symbol,
             "timeframe": timeframe,
-            "collected_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            # Evidence timestamps are instants, not server-local wall clocks.
+            # A timezone-less value was previously interpreted as UTC later in
+            # the report pipeline, shifting Asia deployments by eight hours.
+            "collected_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             "price": None,
             "kline": None,
             "indicators": {},
@@ -117,6 +148,19 @@ class MarketDataCollector:
             "macro": {},
             "news": [],
             "sentiment": {},
+            # Optional market-specific evidence. These keys stay empty when a
+            # provider is unavailable; the report then exposes the exact gap.
+            "hk_security_profile": {},
+            "sec_filings": [],
+            "hkex_announcements": [],
+            "southbound_flow": {},
+            "short_selling": {},
+            "ccass": {},
+            "ah_premium": {},
+            "analyst_expectations": {},
+            "options": {},
+            "short_interest": {},
+            "insider_activity": {},
             "_meta": {
                 "success_items": [],
                 "failed_items": [],
@@ -124,7 +168,7 @@ class MarketDataCollector:
             }
         }
         
-        with NonBlockingThreadPoolExecutor(max_workers=4) as executor:
+        with NonBlockingThreadPoolExecutor(max_workers=5 if market in {'USStock', 'HKStock'} else 4) as executor:
             core_futures = {
                 executor.submit(self._get_price, market, symbol): "price",
                 executor.submit(self._get_kline, market, symbol, timeframe, 60): "kline",
@@ -133,24 +177,85 @@ class MarketDataCollector:
             if market in ('USStock', 'CNStock', 'HKStock'):
                 core_futures[executor.submit(self._get_fundamental, market, symbol)] = "fundamental"
                 core_futures[executor.submit(self._get_company, market, symbol)] = "company"
+                if market == 'USStock':
+                    core_futures[executor.submit(self._get_us_research, symbol)] = "us_research"
+                if market == 'HKStock':
+                    core_futures[executor.submit(self._get_hk_research, symbol)] = "hk_research"
             elif market == 'Crypto':
                 core_futures[executor.submit(self._get_crypto_info, symbol)] = "fundamental"
             
-            try:
-                for future in as_completed(core_futures, timeout=15):
-                    key = core_futures[future]
-                    try:
-                        result = future.result(timeout=3)
-                        if result:
-                            data[key] = result
-                            data["_meta"]["success_items"].append(key)
+            completed_futures = set()
+
+            def record_core_result(future) -> None:
+                key = core_futures[future]
+                completed_futures.add(future)
+                try:
+                    result = future.result()
+                    if result:
+                        if key in {"us_research", "hk_research"}:
+                            research_keys = (
+                                (
+                                    "sec_filings", "analyst_expectations", "options",
+                                    "short_interest", "insider_activity",
+                                )
+                                if key == "us_research" else
+                                (
+                                    "hk_security_profile", "southbound_flow",
+                                    "analyst_expectations", "hk_macro",
+                                )
+                            )
+                            for research_key in research_keys:
+                                if result.get(research_key):
+                                    data[research_key] = result[research_key]
+                            status_key = "us_provider_status" if key == "us_research" else "hk_provider_status"
+                            data["_meta"][status_key] = result.get("_provider_status") or {}
                         else:
-                            data["_meta"]["failed_items"].append(key)
-                    except Exception as e:
-                        logger.warning(f"Core data fetch failed ({key}): {e}")
+                            data[key] = result
+                        if key not in data["_meta"]["success_items"]:
+                            data["_meta"]["success_items"].append(key)
+                    elif key not in data["_meta"]["failed_items"]:
                         data["_meta"]["failed_items"].append(key)
+                except Exception as e:
+                    logger.warning(f"Core data fetch failed ({key}): {e}")
+                    if key not in data["_meta"]["failed_items"]:
+                        data["_meta"]["failed_items"].append(key)
+
+            try:
+                requested_timeout = float(timeout)
+            except (TypeError, ValueError):
+                requested_timeout = 30.0
+            # Fundamental statements are slower than quotes/K-lines on a cold
+            # cache. Honour the caller's deadline instead of truncating every
+            # core collection to the previous hard-coded 15 seconds.
+            core_timeout = max(15.0, min(45.0, requested_timeout))
+
+            try:
+                for future in as_completed(core_futures, timeout=core_timeout):
+                    record_core_result(future)
             except TimeoutError:
-                logger.warning(f"Core data fetch timed out for {market}:{symbol}")
+                pending_keys = [
+                    key for future, key in core_futures.items()
+                    if future not in completed_futures and not future.done()
+                ]
+                logger.warning(
+                    "Core data fetch timed out for %s:%s after %.1fs; pending=%s",
+                    market,
+                    symbol,
+                    core_timeout,
+                    pending_keys,
+                )
+            finally:
+                # Capture futures that completed on the timeout boundary, and
+                # explicitly mark truly unfinished items for quality reporting.
+                for future, key in core_futures.items():
+                    if future in completed_futures:
+                        continue
+                    if future.done():
+                        record_core_result(future)
+                    else:
+                        future.cancel()
+                        if key not in data["_meta"]["failed_items"]:
+                            data["_meta"]["failed_items"].append(key)
         
         if data.get("kline"):
             data["indicators"] = self._calculate_indicators(data["kline"])
@@ -174,6 +279,8 @@ class MarketDataCollector:
         if include_macro:
             try:
                 data["macro"] = self._get_macro_data(market, timeout=10)
+                if data.get("hk_macro"):
+                    data["macro"]["HKMA"] = data.pop("hk_macro")
                 if data["macro"]:
                     data["_meta"]["success_items"].append("macro")
             except Exception as e:
@@ -196,12 +303,36 @@ class MarketDataCollector:
                 logger.warning(f"News fetch failed: {e}")
                 data["_meta"]["failed_items"].append("news")
         
+        # The evidence snapshot's retrieval timestamp represents completion,
+        # so provider observations collected during this run can never appear
+        # to come from the future relative to the snapshot itself.
+        data["collected_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         data["_meta"]["duration_ms"] = int((time.time() - start_time) * 1000)
         logger.info(f"Market data collection completed for {market}:{symbol} in {data['_meta']['duration_ms']}ms")
         logger.info(f"  Success: {data['_meta']['success_items']}")
         logger.info(f"  Failed: {data['_meta']['failed_items']}")
         
         return data
+
+    def _get_us_research(self, symbol: str) -> Dict[str, Any]:
+        """Collect free US-specific evidence behind a bounded, cached adapter."""
+        try:
+            from app.data_providers.us_research import collect_us_research
+
+            return collect_us_research(symbol)
+        except Exception as exc:
+            logger.info("US research enrichment unavailable for %s: %s", symbol, exc)
+            return {}
+
+    def _get_hk_research(self, symbol: str) -> Dict[str, Any]:
+        """Collect free HK-specific evidence behind a bounded, cached adapter."""
+        try:
+            from app.data_providers.hk_research import collect_hk_research
+
+            return collect_hk_research(symbol)
+        except Exception as exc:
+            logger.info("HK research enrichment unavailable for %s: %s", symbol, exc)
+            return {}
     
     
     def _get_price(self, market: str, symbol: str) -> Optional[Dict[str, Any]]:
@@ -282,8 +413,158 @@ class MarketDataCollector:
             return {}
     
     
+    @staticmethod
+    def _merge_fundamental_payloads(
+        persisted: Optional[Dict[str, Any]],
+        provider: Optional[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        """Merge provider evidence over a persisted fallback without losing valid fields."""
+        if not persisted and not provider:
+            return None
+        merged = copy.deepcopy(persisted or {})
+        for key, value in (provider or {}).items():
+            if value in (None, ""):
+                continue
+            if key in {"field_metadata", "data_quality", "identity"} and isinstance(value, dict):
+                current = merged.get(key) if isinstance(merged.get(key), dict) else {}
+                merged[key] = {**current, **copy.deepcopy(value)}
+                continue
+            merged[key] = copy.deepcopy(value)
+        return merged
+
+    @staticmethod
+    def _fundamental_db_ttl_seconds() -> int:
+        try:
+            return max(300, int(os.getenv("AI_FUNDAMENTAL_DB_TTL_SEC", "86400")))
+        except (TypeError, ValueError):
+            return 86_400
+
+    def _load_persisted_fundamental(self, market: str, symbol: str) -> Optional[Dict[str, Any]]:
+        """Load the latest point-in-time snapshot without making provider requests."""
+        from app.services.fundamental_data import get_fundamental_data_service
+
+        return get_fundamental_data_service().latest_for_analysis(
+            market=market,
+            symbol=symbol,
+            max_age_seconds=self._fundamental_db_ttl_seconds(),
+        )
+
+    @staticmethod
+    def _persist_fundamental_payload(market: str, symbol: str, payload: Dict[str, Any]) -> None:
+        """Write provider evidence back to the shared point-in-time store."""
+        from app.services.fundamental_data import get_fundamental_data_service
+
+        get_fundamental_data_service().persist_analysis_payload(
+            market=market,
+            symbol=symbol,
+            raw=payload,
+        )
+
+    @staticmethod
+    def _mark_fundamental_storage(
+        payload: Dict[str, Any],
+        *,
+        served_from: str,
+        writeback: Optional[str] = None,
+        refresh_failed: bool = False,
+    ) -> None:
+        data_quality = payload.get("data_quality") if isinstance(payload.get("data_quality"), dict) else {}
+        storage = data_quality.get("storage") if isinstance(data_quality.get("storage"), dict) else {}
+        storage["served_from"] = served_from
+        if writeback:
+            storage["writeback"] = writeback
+        if refresh_failed:
+            storage["refresh_failed"] = True
+        data_quality["storage"] = storage
+        payload["data_quality"] = data_quality
+
     def _get_fundamental(self, market: str, symbol: str) -> Optional[Dict[str, Any]]:
-        """获取基本面数据"""
+        """Get fundamentals from memory, persisted snapshots, then providers.
+
+        The database is the cross-process cache used by professional analysis.
+        Provider calls are reserved for missing or stale snapshots and their
+        results are written back with the richer statement and earnings payload.
+        """
+        cache = getattr(self, "_fundamental_cache", None)
+        if cache is None:
+            cache = {}
+            self._fundamental_cache = cache
+        lock = getattr(self, "_fundamental_cache_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._fundamental_cache_lock = lock
+
+        normalized_symbol = str(symbol or "").strip().upper()
+        cache_key = f"{market}:{normalized_symbol}"
+        now = time.time()
+        with lock:
+            cached = cache.get(cache_key)
+            if cached and float(cached.get("expires_at") or 0) > now:
+                return copy.deepcopy(cached.get("value"))
+
+        persisted_state: Optional[Dict[str, Any]] = None
+        try:
+            persisted_state = self._load_persisted_fundamental(market, normalized_symbol)
+        except Exception as exc:
+            logger.warning(
+                "Persisted fundamental load failed for %s:%s: %s",
+                market,
+                normalized_symbol,
+                exc,
+            )
+        persisted = (
+            persisted_state.get("payload")
+            if isinstance(persisted_state, dict) and isinstance(persisted_state.get("payload"), dict)
+            else None
+        )
+        persisted_is_complete = bool(
+            persisted
+            and not persisted_state.get("refresh_required", not persisted_state.get("fresh"))
+            and persisted_state.get("has_provider_payload")
+        )
+        if persisted_is_complete:
+            result = copy.deepcopy(persisted)
+            self._mark_fundamental_storage(result, served_from="database")
+        else:
+            provider = self._fetch_fundamental_uncached(market, normalized_symbol)
+            result = self._merge_fundamental_payloads(persisted, provider)
+            if provider and result:
+                writeback = "success"
+                try:
+                    self._persist_fundamental_payload(market, normalized_symbol, result)
+                except Exception as exc:
+                    writeback = "failed"
+                    logger.warning(
+                        "Fundamental writeback failed for %s:%s: %s",
+                        market,
+                        normalized_symbol,
+                        exc,
+                    )
+                self._mark_fundamental_storage(
+                    result,
+                    served_from="provider_refresh",
+                    writeback=writeback,
+                )
+            elif result:
+                self._mark_fundamental_storage(
+                    result,
+                    served_from="database_fallback",
+                    refresh_failed=True,
+                )
+        if result:
+            try:
+                ttl_seconds = max(60, int(os.getenv("AI_FUNDAMENTAL_CACHE_TTL_SEC", "1800")))
+            except (TypeError, ValueError):
+                ttl_seconds = 1800
+            with lock:
+                cache[cache_key] = {
+                    "expires_at": now + ttl_seconds,
+                    "value": copy.deepcopy(result),
+                }
+        return result
+
+    def _fetch_fundamental_uncached(self, market: str, symbol: str) -> Optional[Dict[str, Any]]:
+        """Fetch fundamentals from providers without consulting the cache."""
         try:
             if market == 'USStock':
                 return self._get_us_fundamental(symbol)
@@ -296,10 +577,10 @@ class MarketDataCollector:
     def _get_cn_hk_fundamental(self, market: str, symbol: str) -> Optional[Dict[str, Any]]:
         """
         CN/HK fundamentals — multi-tier:
-          Tier 1: Twelve Data /statistics (globally stable, paid)
-          Tier 2: AkShare / Eastmoney (fragile overseas)
-          Tier 3: AkShare financial statements (revenue growth, debt, FCF)
-          + Tencent quote for live price fields
+          - Tencent quote for current price fields
+          - Twelve Data for licensed global statistics and statements when configured
+          - AkShare/Eastmoney for domestic valuation and financial statements
+          - Yahoo Finance to fill remaining canonical fields and rich analysis data
         """
         try:
             from app.data_sources.tencent import (
@@ -447,11 +728,18 @@ class MarketDataCollector:
                 except Exception as e:
                     logger.debug("TwelveData earnings failed %s:%s: %s", market, symbol, e)
 
+            self._enrich_cn_hk_fundamental_with_yfinance(result, code, is_hk=is_hk)
+
             # Fallback: build earnings from financial_statements if /earnings failed
             if "earnings" not in result and "financial_statements" in result:
                 result["earnings"] = self._build_earnings_from_statements(result["financial_statements"])
 
-            if not parts and not td and not has_valuation:
+            usable = any(
+                value not in (None, "", {}, [])
+                for key, value in result.items()
+                if key != "source"
+            )
+            if not usable:
                 return None
             return result
         except Exception as e:
@@ -497,150 +785,542 @@ class MarketDataCollector:
 
         return earnings if earnings else {}
 
+    def _enrich_cn_hk_fundamental_with_yfinance(
+        self,
+        result: Dict[str, Any],
+        code: str,
+        *,
+        is_hk: bool,
+    ) -> None:
+        """Fill missing CN/HK metrics and rich statements through Yahoo Finance."""
+        from app.data_sources.asia_stock_kline import yf_symbol_from_tencent
+
+        yahoo_symbol = yf_symbol_from_tencent(code, is_hk)
+        provider_source = "yfinance_hk" if is_hk else "yfinance_cn"
+        market_label = "HK" if is_hk else "CN"
+        try:
+            ticker = yf.Ticker(yahoo_symbol)
+            info = ticker.info or {}
+        except Exception as exc:
+            logger.debug("%s yfinance info failed %s: %s", market_label, yahoo_symbol, exc)
+            return
+
+        reported_symbol = str(info.get("symbol") or "").strip().upper()
+        if reported_symbol and reported_symbol != yahoo_symbol.upper():
+            logger.warning(
+                "Rejected mismatched %s yfinance fundamentals requested=%s reported=%s",
+                market_label,
+                yahoo_symbol,
+                reported_symbol,
+            )
+            return
+
+        field_metadata = result.get("field_metadata")
+        if not isinstance(field_metadata, dict):
+            field_metadata = {}
+            result["field_metadata"] = field_metadata
+        filled = False
+
+        def fill(key: str, value: Any, *, unit: str, period_type: str, transform=None) -> None:
+            nonlocal filled
+            if result.get(key) is not None or value in (None, ""):
+                return
+            try:
+                clean = transform(value) if transform else float(value)
+            except (TypeError, ValueError, OverflowError):
+                return
+            if pd.isna(clean):
+                return
+            result[key] = clean
+            field_metadata[key] = {
+                "source": provider_source,
+                "unit": unit,
+                "period_type": period_type,
+            }
+            filled = True
+
+        for key, info_key, unit, period_type, transform in (
+            ("market_cap", "marketCap", "currency", "current", None),
+            ("pe_ratio", "trailingPE", "multiple", "ttm", None),
+            ("pb_ratio", "priceToBook", "multiple", "current", None),
+            ("roe", "returnOnEquity", "percent", "ttm", lambda value: float(value) * 100.0),
+            ("revenue_growth", "revenueGrowth", "percent", "ttm_yoy", lambda value: float(value) * 100.0),
+            ("debt_to_equity", "debtToEquity", "multiple", "latest_quarter", lambda value: float(value) / 100.0),
+            ("revenue", "totalRevenue", "currency", "ttm", None),
+            ("net_income", "netIncomeToCommon", "currency", "ttm", None),
+            ("net_income_ttm", "netIncomeToCommon", "currency", "ttm", None),
+            ("book_value", "bookValue", "currency_per_share", "latest_quarter", None),
+            ("total_debt", "totalDebt", "currency", "latest_quarter", None),
+            ("free_cash_flow", "freeCashflow", "currency", "ttm", None),
+            ("shares_outstanding", "sharesOutstanding", "shares", "current", None),
+            ("dividend_yield", "dividendYield", "percent", "annualized", lambda value: float(value) * 100.0),
+            ("eps", "trailingEps", "currency_per_share", "ttm", None),
+        ):
+            fill(key, info.get(info_key), unit=unit, period_type=period_type, transform=transform)
+
+        fast_info: Any = {}
+        try:
+            fast_info = ticker.fast_info or {}
+        except Exception as exc:
+            logger.debug("%s yfinance fast info failed %s: %s", market_label, yahoo_symbol, exc)
+        fill(
+            "shares_outstanding",
+            fast_info.get("shares"),
+            unit="shares",
+            period_type="current",
+        )
+        if result.get("market_cap") is None:
+            shares = result.get("shares_outstanding")
+            price = (
+                info.get("currentPrice")
+                or info.get("regularMarketPrice")
+                or result.get("last")
+                or fast_info.get("last_price")
+            )
+            if shares is not None and price is not None:
+                fill(
+                    "market_cap",
+                    float(shares) * float(price),
+                    unit="currency",
+                    period_type="current_derived",
+                )
+
+        if result.get("shareholder_equity") is None:
+            book_value = result.get("book_value")
+            shares = result.get("shares_outstanding")
+            if book_value is not None and shares is not None:
+                fill(
+                    "shareholder_equity",
+                    float(book_value) * float(shares),
+                    unit="currency",
+                    period_type="latest_quarter",
+                )
+
+        statements = self._get_financial_statements(
+            yahoo_symbol,
+            ticker=ticker,
+            currency=info.get("financialCurrency") or info.get("currency") or ("HKD" if is_hk else "CNY"),
+        )
+        if statements:
+            yahoo_period = ((statements.get("latest_quarter") or {}).get("period_end"))
+            local_period = ((result.get("financial_statements") or {}).get("latest_quarter") or {}).get("period_end")
+            if yahoo_period or not local_period:
+                result["financial_statements"] = statements
+            latest_quarter = statements.get("latest_quarter") or {}
+            latest_income = latest_quarter.get("income_statement") or statements.get("income_statement") or {}
+            latest_balance = latest_quarter.get("balance_sheet") or statements.get("balance_sheet") or {}
+            ttm = statements.get("ttm") or {}
+            ttm_income = ttm.get("income_statement") or {}
+            cash_flow_candidates = (
+                latest_quarter.get("cash_flow") or {},
+                ttm.get("cash_flow") or {},
+                statements.get("cash_flow") or {},
+                (statements.get("latest_annual") or {}).get("cash_flow") or {},
+            )
+            cash_flow = next(
+                (candidate for candidate in cash_flow_candidates if candidate.get("free_cash_flow") is not None),
+                {},
+            )
+            derived = latest_quarter.get("derived") or {}
+            fill("revenue", latest_income.get("total_revenue"), unit="currency", period_type="latest_quarter")
+            fill("net_income", latest_income.get("net_income"), unit="currency", period_type="latest_quarter")
+            fill("net_income_ttm", ttm_income.get("net_income"), unit="currency", period_type="ttm")
+            fill("shareholder_equity", latest_balance.get("total_equity"), unit="currency", period_type="latest_quarter")
+            fill("total_debt", latest_balance.get("debt"), unit="currency", period_type="latest_quarter")
+            fill(
+                "free_cash_flow",
+                cash_flow.get("free_cash_flow"),
+                unit="currency",
+                period_type=str(cash_flow.get("period_type") or "latest_available"),
+            )
+            fill("revenue_growth", derived.get("revenue_growth"), unit="percent", period_type="latest_quarter_yoy")
+            filled = True
+        if result.get("debt_to_equity") is None:
+            debt = result.get("total_debt")
+            equity = result.get("shareholder_equity")
+            if debt is not None and equity not in (None, 0):
+                fill(
+                    "debt_to_equity",
+                    float(debt) / float(equity),
+                    unit="multiple",
+                    period_type="latest_quarter",
+                )
+        earnings = self._get_earnings_data(yahoo_symbol, ticker=ticker)
+        if earnings:
+            result["earnings"] = earnings
+            filled = True
+
+        result["identity"] = {
+            "requested_symbol": yahoo_symbol,
+            "reported_symbol": reported_symbol or None,
+            "company_name": info.get("longName") or info.get("shortName"),
+            "industry": info.get("industry"),
+            "sector": info.get("sector"),
+            "country": info.get("country"),
+            "exchange": info.get("exchange") or info.get("fullExchangeName"),
+            "quote_type": info.get("quoteType"),
+            "verified": bool(reported_symbol and reported_symbol == yahoo_symbol.upper()),
+        }
+        if filled and provider_source not in str(result.get("source") or ""):
+            result["source"] = "+".join(filter(None, (str(result.get("source") or ""), provider_source)))
+
+    def _enrich_hk_fundamental_with_yfinance(self, result: Dict[str, Any], code: str) -> None:
+        """Backward-compatible wrapper for HK-specific callers and tests."""
+        self._enrich_cn_hk_fundamental_with_yfinance(result, code, is_hk=True)
+
     def _get_us_fundamental(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """Collect US equity fundamentals with explicit units and reporting periods.
+
+        Canonical units used by the analysis layer:
+        - market cap / statement values: absolute reporting-currency amounts
+        - ROE, margins, growth and dividend yield: percentage points
+        - debt-to-equity and liquidity ratios: ratio multiples
         """
-        美股基本面 - Finnhub + yfinance
-        包括：基础财务指标 + 财报数据（资产负债表、利润表、现金流量表）
-        """
-        result = {}
-        
+        result: Dict[str, Any] = {
+            "source": "",
+            "field_metadata": {},
+        }
+
+        def set_metric(
+            key: str,
+            value: Any,
+            *,
+            source: str,
+            unit: str,
+            period_type: str,
+            transform=None,
+            replace: bool = False,
+        ) -> None:
+            if value is None or value == "" or (not replace and result.get(key) is not None):
+                return
+            try:
+                clean = transform(value) if transform else float(value)
+            except (TypeError, ValueError, OverflowError):
+                return
+            if pd.isna(clean):
+                return
+            result[key] = clean
+            result["field_metadata"][key] = {
+                "source": source,
+                "unit": unit,
+                "period_type": period_type,
+            }
+
+        source_parts: List[str] = []
         if self._finnhub_client:
             try:
                 metrics = self._finnhub_client.company_basic_financials(symbol, 'all')
                 if metrics and metrics.get('metric'):
                     m = metrics['metric']
-                    result.update({
-                        'pe_ratio': m.get('peBasicExclExtraTTM'),
-                        'pb_ratio': m.get('pbQuarterly'),
-                        'ps_ratio': m.get('psTTM'),
-                        'market_cap': m.get('marketCapitalization'),
-                        'dividend_yield': m.get('dividendYieldIndicatedAnnual'),
-                        'beta': m.get('beta'),
-                        '52w_high': m.get('52WeekHigh'),
-                        '52w_low': m.get('52WeekLow'),
-                        'roe': m.get('roeTTM'),
-                        'eps': m.get('epsBasicExclExtraItemsTTM'),
-                        'revenue_growth': m.get('revenueGrowthTTMYoy'),
-                        'profit_margin': m.get('netProfitMarginTTM'),
-                        'debt_to_equity': m.get('totalDebtToEquityQuarterly'),
-                        'current_ratio': m.get('currentRatioQuarterly'),
-                        'quick_ratio': m.get('quickRatioQuarterly'),
-                    })
+                    source_parts.append("finnhub")
+                    set_metric('pe_ratio', m.get('peBasicExclExtraTTM'), source="finnhub", unit="multiple", period_type="ttm")
+                    set_metric('pb_ratio', m.get('pbQuarterly'), source="finnhub", unit="multiple", period_type="latest_quarter")
+                    set_metric('ps_ratio', m.get('psTTM'), source="finnhub", unit="multiple", period_type="ttm")
+                    # Finnhub documents marketCapitalization in millions.
+                    set_metric('market_cap', m.get('marketCapitalization'), source="finnhub", unit="currency", period_type="current", transform=lambda v: float(v) * 1_000_000)
+                    set_metric('dividend_yield', m.get('dividendYieldIndicatedAnnual'), source="finnhub", unit="percent", period_type="annualized")
+                    set_metric('beta', m.get('beta'), source="finnhub", unit="multiple", period_type="current")
+                    set_metric('52w_high', m.get('52WeekHigh'), source="finnhub", unit="currency_per_share", period_type="52_week")
+                    set_metric('52w_low', m.get('52WeekLow'), source="finnhub", unit="currency_per_share", period_type="52_week")
+                    set_metric('roe', m.get('roeTTM'), source="finnhub", unit="percent", period_type="ttm")
+                    set_metric('eps', m.get('epsBasicExclExtraItemsTTM'), source="finnhub", unit="currency_per_share", period_type="ttm")
+                    set_metric('revenue_growth', m.get('revenueGrowthTTMYoy'), source="finnhub", unit="percent", period_type="ttm_yoy")
+                    set_metric('profit_margin', m.get('netProfitMarginTTM'), source="finnhub", unit="percent", period_type="ttm")
+                    set_metric('debt_to_equity', m.get('totalDebtToEquityQuarterly'), source="finnhub", unit="multiple", period_type="latest_quarter", transform=lambda v: float(v) / 100.0)
+                    set_metric('current_ratio', m.get('currentRatioQuarterly'), source="finnhub", unit="multiple", period_type="latest_quarter")
+                    set_metric('quick_ratio', m.get('quickRatioQuarterly'), source="finnhub", unit="multiple", period_type="latest_quarter")
             except Exception as e:
                 logger.debug(f"Finnhub fundamental failed for {symbol}: {e}")
-        
+
+        ticker = None
+        info: Dict[str, Any] = {}
+        identity_rejected = False
         try:
             ticker = yf.Ticker(symbol)
             info = ticker.info or {}
-            
-            if not result.get('pe_ratio'):
-                result['pe_ratio'] = info.get('trailingPE') or info.get('forwardPE')
-            if not result.get('pb_ratio'):
-                result['pb_ratio'] = info.get('priceToBook')
-            if not result.get('market_cap'):
-                result['market_cap'] = info.get('marketCap')
-            if not result.get('dividend_yield'):
-                result['dividend_yield'] = info.get('dividendYield')
-            if not result.get('beta'):
-                result['beta'] = info.get('beta')
-            if not result.get('52w_high'):
-                result['52w_high'] = info.get('fiftyTwoWeekHigh')
-            if not result.get('52w_low'):
-                result['52w_low'] = info.get('fiftyTwoWeekLow')
-            if not result.get('roe'):
-                result['roe'] = info.get('returnOnEquity')
-            if not result.get('eps'):
-                result['eps'] = info.get('trailingEps')
-            
-            result.update({
-                'revenue': info.get('totalRevenue'),
-                'gross_profit': info.get('grossProfits'),
-                'operating_margin': info.get('operatingMargins'),
-                'profit_margin': result.get('profit_margin') or info.get('profitMargins'),
-                'ebitda': info.get('ebitda'),
-                'debt': info.get('totalDebt'),
-                'cash': info.get('totalCash'),
-                'free_cash_flow': info.get('freeCashflow'),
-                'operating_cash_flow': info.get('operatingCashflow'),
-                'book_value': info.get('bookValue'),
-                'enterprise_value': info.get('enterpriseValue'),
-            })
+
+            reported_symbol = str(info.get("symbol") or "").strip().upper()
+            expected_symbol = str(symbol or "").strip().upper()
+            identity_match = not reported_symbol or reported_symbol == expected_symbol
+            result["identity"] = {
+                "requested_symbol": expected_symbol,
+                "reported_symbol": reported_symbol or None,
+                "company_name": info.get("longName") or info.get("shortName"),
+                "industry": info.get("industry"),
+                "sector": info.get("sector"),
+                "country": info.get("country"),
+                "exchange": info.get("exchange") or info.get("fullExchangeName"),
+                "quote_type": info.get("quoteType"),
+                "verified": bool(identity_match and reported_symbol),
+            }
+            if not identity_match:
+                logger.warning("Rejected mismatched yfinance fundamentals requested=%s reported=%s", expected_symbol, reported_symbol)
+                identity_rejected = True
+                ticker = None
+                info = {}
+            else:
+                source_parts.append("yfinance")
+                set_metric('pe_ratio', info.get('trailingPE') or info.get('forwardPE'), source="yfinance", unit="multiple", period_type="ttm")
+                set_metric('pb_ratio', info.get('priceToBook'), source="yfinance", unit="multiple", period_type="current")
+                set_metric('market_cap', info.get('marketCap'), source="yfinance", unit="currency", period_type="current")
+                set_metric('dividend_yield', info.get('dividendYield'), source="yfinance", unit="percent", period_type="annualized", transform=lambda v: float(v) * 100.0)
+                set_metric('beta', info.get('beta'), source="yfinance", unit="multiple", period_type="current")
+                set_metric('52w_high', info.get('fiftyTwoWeekHigh'), source="yfinance", unit="currency_per_share", period_type="52_week")
+                set_metric('52w_low', info.get('fiftyTwoWeekLow'), source="yfinance", unit="currency_per_share", period_type="52_week")
+                set_metric('roe', info.get('returnOnEquity'), source="yfinance", unit="percent", period_type="ttm", transform=lambda v: float(v) * 100.0)
+                set_metric('eps', info.get('trailingEps'), source="yfinance", unit="currency_per_share", period_type="ttm")
+                set_metric('revenue_growth', info.get('revenueGrowth'), source="yfinance", unit="percent", period_type="ttm_yoy", transform=lambda v: float(v) * 100.0)
+                set_metric('operating_margin', info.get('operatingMargins'), source="yfinance", unit="percent", period_type="ttm", transform=lambda v: float(v) * 100.0)
+                set_metric('profit_margin', info.get('profitMargins'), source="yfinance", unit="percent", period_type="ttm", transform=lambda v: float(v) * 100.0)
+                set_metric('debt_to_equity', info.get('debtToEquity'), source="yfinance", unit="multiple", period_type="latest_quarter", transform=lambda v: float(v) / 100.0)
+                set_metric('current_ratio', info.get('currentRatio'), source="yfinance", unit="multiple", period_type="latest_quarter")
+                set_metric('quick_ratio', info.get('quickRatio'), source="yfinance", unit="multiple", period_type="latest_quarter")
+                for key, value, unit, period_type in (
+                    ('revenue', info.get('totalRevenue'), 'currency', 'ttm'),
+                    ('gross_profit', info.get('grossProfits'), 'currency', 'ttm'),
+                    ('ebitda', info.get('ebitda'), 'currency', 'ttm'),
+                    ('debt', info.get('totalDebt'), 'currency', 'latest_quarter'),
+                    ('cash', info.get('totalCash'), 'currency', 'latest_quarter'),
+                    ('free_cash_flow', info.get('freeCashflow'), 'currency', 'ttm'),
+                    ('operating_cash_flow', info.get('operatingCashflow'), 'currency', 'ttm'),
+                    ('book_value', info.get('bookValue'), 'currency_per_share', 'latest_quarter'),
+                    ('enterprise_value', info.get('enterpriseValue'), 'currency', 'current'),
+                    ('shares_outstanding', info.get('sharesOutstanding'), 'shares', 'current'),
+                ):
+                    set_metric(key, value, source="yfinance", unit=unit, period_type=period_type)
         except Exception as e:
             logger.debug(f"yfinance fundamental failed for {symbol}: {e}")
-        
-        financial_statements = self._get_financial_statements(symbol)
+
+        financial_statements = None if identity_rejected else self._get_financial_statements(
+            symbol,
+            ticker=ticker,
+            currency=info.get("financialCurrency") or info.get("currency") or "USD",
+        )
         if financial_statements:
             result['financial_statements'] = financial_statements
-        
-        earnings_data = self._get_earnings_data(symbol)
+            source_parts.append("yfinance_statements")
+            latest_q = financial_statements.get("latest_quarter") or {}
+            derived = latest_q.get("derived") or {}
+            for key, unit in (
+                ("revenue_growth", "percent"),
+                ("profit_margin", "percent"),
+                ("current_ratio", "multiple"),
+                ("debt_to_equity", "multiple"),
+                ("roe", "percent"),
+            ):
+                set_metric(
+                    key,
+                    derived.get(key),
+                    source="yfinance_statements",
+                    unit=unit,
+                    period_type="latest_quarter",
+                )
+
+        earnings_data = None if identity_rejected else self._get_earnings_data(symbol, ticker=ticker)
         if earnings_data:
             result['earnings'] = earnings_data
-        
-        return result if result else None
+        result["source"] = "+".join(dict.fromkeys(source_parts))
+        result["data_quality"] = {
+            "preferred_basis": "latest_reported_quarter",
+            "valuation_basis": "current_or_ttm",
+            "statement_source": "yfinance",
+            "periods_separated": bool(financial_statements),
+            "identity_verified": bool((result.get("identity") or {}).get("verified")),
+        }
+        usable_keys = [key for key in result if key not in {"source", "field_metadata", "data_quality", "identity"}]
+        return result if usable_keys else None
     
-    def _get_financial_statements(self, symbol: str) -> Optional[Dict[str, Any]]:
+    def _get_financial_statements(
+        self,
+        symbol: str,
+        *,
+        ticker=None,
+        currency: str = "USD",
+    ) -> Optional[Dict[str, Any]]:
         """
         获取财务报表数据（资产负债表、利润表、现金流量表）
         
-        使用 yfinance 获取，包含最近几个季度的数据
+        使用 yfinance 获取，明确区分最新季报、TTM 与最新年报。
         """
+        def pick(frame: pd.DataFrame, names: tuple, column) -> Optional[float]:
+            if frame is None or frame.empty or column is None:
+                return None
+            for name in names:
+                if name not in frame.index:
+                    continue
+                try:
+                    value = float(frame.loc[name, column])
+                except (TypeError, ValueError):
+                    continue
+                if not pd.isna(value):
+                    return value
+            return None
+
+        def columns(frame: pd.DataFrame) -> List[Any]:
+            if frame is None or frame.empty:
+                return []
+            return sorted(list(frame.columns), key=lambda value: pd.Timestamp(value), reverse=True)
+
+        def statement(frame: pd.DataFrame, field_map: Dict[str, tuple], period_type: str) -> Dict[str, Any]:
+            cols = columns(frame)
+            if not cols:
+                return {}
+            col = cols[0]
+            payload: Dict[str, Any] = {
+                "latest_date": str(pd.Timestamp(col).date()),
+                "period_end": str(pd.Timestamp(col).date()),
+                "period_type": period_type,
+                "currency": currency,
+                "source": "yfinance",
+            }
+            for field, names in field_map.items():
+                payload[field] = pick(frame, names, col)
+            return payload
+
+        def sum_latest(frame: pd.DataFrame, names: tuple, count: int = 4) -> Optional[float]:
+            cols = columns(frame)[:count]
+            values = [pick(frame, names, col) for col in cols]
+            clean = [value for value in values if value is not None]
+            return sum(clean) if len(clean) == count else None
+
+        balance_fields = {
+            "total_assets": ("Total Assets",),
+            "total_liabilities": ("Total Liabilities Net Minority Interest", "Total Liab"),
+            "total_equity": ("Stockholders Equity", "Common Stock Equity", "Total Equity Gross Minority Interest"),
+            "cash": ("Cash Cash Equivalents And Short Term Investments", "Cash And Cash Equivalents", "Cash"),
+            "debt": ("Total Debt",),
+            "current_assets": ("Current Assets", "Total Current Assets"),
+            "current_liabilities": ("Current Liabilities", "Total Current Liabilities"),
+        }
+        income_fields = {
+            "total_revenue": ("Total Revenue", "Revenue", "Net Sales"),
+            "gross_profit": ("Gross Profit",),
+            "operating_income": ("Operating Income",),
+            "net_income": ("Net Income", "Net Income Common Stockholders", "Net Income Continuous Operations"),
+            "eps": ("Diluted EPS", "Basic EPS"),
+        }
+        cash_flow_fields = {
+            "operating_cash_flow": ("Operating Cash Flow", "Total Cash From Operating Activities"),
+            "capital_expenditure": ("Capital Expenditure", "Capital Expenditures"),
+            "financing_cash_flow": ("Financing Cash Flow", "Total Cash From Financing Activities"),
+            "free_cash_flow": ("Free Cash Flow",),
+        }
+
         try:
-            ticker = yf.Ticker(symbol)
-            statements = {}
-            
-            try:
-                balance_sheet = ticker.balance_sheet
-                if balance_sheet is not None and not balance_sheet.empty:
-                    latest_quarters = balance_sheet.columns[:4] if len(balance_sheet.columns) >= 4 else balance_sheet.columns
-                    statements['balance_sheet'] = {
-                        'latest_date': str(latest_quarters[0]) if len(latest_quarters) > 0 else None,
-                        'total_assets': float(balance_sheet.loc['Total Assets', latest_quarters[0]]) if 'Total Assets' in balance_sheet.index and len(latest_quarters) > 0 else None,
-                        'total_liabilities': float(balance_sheet.loc['Total Liab', latest_quarters[0]]) if 'Total Liab' in balance_sheet.index and len(latest_quarters) > 0 else None,
-                        'total_equity': float(balance_sheet.loc['Stockholders Equity', latest_quarters[0]]) if 'Stockholders Equity' in balance_sheet.index and len(latest_quarters) > 0 else None,
-                        'cash': float(balance_sheet.loc['Cash', latest_quarters[0]]) if 'Cash' in balance_sheet.index and len(latest_quarters) > 0 else None,
-                        'debt': float(balance_sheet.loc['Total Debt', latest_quarters[0]]) if 'Total Debt' in balance_sheet.index and len(latest_quarters) > 0 else None,
-                        'current_assets': float(balance_sheet.loc['Current Assets', latest_quarters[0]]) if 'Current Assets' in balance_sheet.index and len(latest_quarters) > 0 else None,
-                        'current_liabilities': float(balance_sheet.loc['Current Liabilities', latest_quarters[0]]) if 'Current Liabilities' in balance_sheet.index and len(latest_quarters) > 0 else None,
-                    }
-            except Exception as e:
-                logger.debug(f"Balance sheet fetch failed for {symbol}: {e}")
-            
-            try:
-                income_stmt = ticker.financials
-                if income_stmt is not None and not income_stmt.empty:
-                    latest_quarters = income_stmt.columns[:4] if len(income_stmt.columns) >= 4 else income_stmt.columns
-                    statements['income_statement'] = {
-                        'latest_date': str(latest_quarters[0]) if len(latest_quarters) > 0 else None,
-                        'total_revenue': float(income_stmt.loc['Total Revenue', latest_quarters[0]]) if 'Total Revenue' in income_stmt.index and len(latest_quarters) > 0 else None,
-                        'gross_profit': float(income_stmt.loc['Gross Profit', latest_quarters[0]]) if 'Gross Profit' in income_stmt.index and len(latest_quarters) > 0 else None,
-                        'operating_income': float(income_stmt.loc['Operating Income', latest_quarters[0]]) if 'Operating Income' in income_stmt.index and len(latest_quarters) > 0 else None,
-                        'net_income': float(income_stmt.loc['Net Income', latest_quarters[0]]) if 'Net Income' in income_stmt.index and len(latest_quarters) > 0 else None,
-                        'eps': float(income_stmt.loc['Basic EPS', latest_quarters[0]]) if 'Basic EPS' in income_stmt.index and len(latest_quarters) > 0 else None,
-                    }
-            except Exception as e:
-                logger.debug(f"Income statement fetch failed for {symbol}: {e}")
-            
-            try:
-                cashflow = ticker.cashflow
-                if cashflow is not None and not cashflow.empty:
-                    latest_quarters = cashflow.columns[:4] if len(cashflow.columns) >= 4 else cashflow.columns
-                    statements['cash_flow'] = {
-                        'latest_date': str(latest_quarters[0]) if len(latest_quarters) > 0 else None,
-                        'operating_cash_flow': float(cashflow.loc['Operating Cash Flow', latest_quarters[0]]) if 'Operating Cash Flow' in cashflow.index and len(latest_quarters) > 0 else None,
-                        'investing_cash_flow': float(cashflow.loc['Capital Expenditure', latest_quarters[0]]) if 'Capital Expenditure' in cashflow.index and len(latest_quarters) > 0 else None,
-                        'financing_cash_flow': float(cashflow.loc['Financing Cash Flow', latest_quarters[0]]) if 'Financing Cash Flow' in cashflow.index and len(latest_quarters) > 0 else None,
-                        'free_cash_flow': float(cashflow.loc['Free Cash Flow', latest_quarters[0]]) if 'Free Cash Flow' in cashflow.index and len(latest_quarters) > 0 else None,
-                    }
-            except Exception as e:
-                logger.debug(f"Cash flow statement fetch failed for {symbol}: {e}")
-            
-            return statements if statements else None
+            ticker = ticker or yf.Ticker(symbol)
+            q_bs = getattr(ticker, "quarterly_balance_sheet", pd.DataFrame())
+            q_inc = getattr(ticker, "quarterly_income_stmt", pd.DataFrame())
+            q_cf = getattr(ticker, "quarterly_cash_flow", pd.DataFrame())
+            a_bs = getattr(ticker, "balance_sheet", pd.DataFrame())
+            a_inc = getattr(ticker, "financials", pd.DataFrame())
+            a_cf = getattr(ticker, "cashflow", pd.DataFrame())
+
+            latest_q_bs = statement(q_bs, balance_fields, "quarterly")
+            latest_q_inc = statement(q_inc, income_fields, "quarterly")
+            latest_q_cf = statement(q_cf, cash_flow_fields, "quarterly")
+            quarter_dates = [
+                payload.get("period_end")
+                for payload in (latest_q_bs, latest_q_inc, latest_q_cf)
+                if payload.get("period_end")
+            ]
+            latest_quarter: Dict[str, Any] = {
+                "period_end": max(quarter_dates) if quarter_dates else None,
+                "period_type": "quarterly",
+                "currency": currency,
+                "source": "yfinance",
+                "balance_sheet": latest_q_bs,
+                "income_statement": latest_q_inc,
+                "cash_flow": latest_q_cf,
+            }
+
+            q_inc_cols = columns(q_inc)
+            derived: Dict[str, Any] = {}
+            if len(q_inc_cols) >= 5:
+                latest_revenue = pick(q_inc, income_fields["total_revenue"], q_inc_cols[0])
+                prior_year_revenue = pick(q_inc, income_fields["total_revenue"], q_inc_cols[4])
+                if latest_revenue is not None and prior_year_revenue not in (None, 0):
+                    derived["revenue_growth"] = (latest_revenue / prior_year_revenue - 1.0) * 100.0
+                    derived["revenue_growth_basis"] = "latest_quarter_yoy"
+            q_revenue = latest_q_inc.get("total_revenue")
+            q_net_income = latest_q_inc.get("net_income")
+            if q_revenue not in (None, 0) and q_net_income is not None:
+                derived["profit_margin"] = q_net_income / q_revenue * 100.0
+            equity = latest_q_bs.get("total_equity")
+            debt = latest_q_bs.get("debt")
+            if equity not in (None, 0) and debt is not None:
+                derived["debt_to_equity"] = debt / equity
+            current_assets = latest_q_bs.get("current_assets")
+            current_liabilities = latest_q_bs.get("current_liabilities")
+            if current_assets is not None and current_liabilities not in (None, 0):
+                derived["current_ratio"] = current_assets / current_liabilities
+            latest_quarter["derived"] = derived
+
+            ttm_income = {
+                "total_revenue": sum_latest(q_inc, income_fields["total_revenue"]),
+                "gross_profit": sum_latest(q_inc, income_fields["gross_profit"]),
+                "operating_income": sum_latest(q_inc, income_fields["operating_income"]),
+                "net_income": sum_latest(q_inc, income_fields["net_income"]),
+            }
+            ttm_cash = {
+                "operating_cash_flow": sum_latest(q_cf, cash_flow_fields["operating_cash_flow"]),
+                "capital_expenditure": sum_latest(q_cf, cash_flow_fields["capital_expenditure"]),
+                "financing_cash_flow": sum_latest(q_cf, cash_flow_fields["financing_cash_flow"]),
+                "free_cash_flow": sum_latest(q_cf, cash_flow_fields["free_cash_flow"]),
+            }
+            ttm_derived: Dict[str, Any] = {}
+            if ttm_income.get("total_revenue") not in (None, 0) and ttm_income.get("net_income") is not None:
+                ttm_derived["profit_margin"] = ttm_income["net_income"] / ttm_income["total_revenue"] * 100.0
+            if equity not in (None, 0) and ttm_income.get("net_income") is not None:
+                ttm_derived["roe"] = ttm_income["net_income"] / equity * 100.0
+            ttm = {
+                "period_end": latest_quarter.get("period_end"),
+                "period_type": "ttm",
+                "currency": currency,
+                "source": "yfinance_derived_from_quarters",
+                "income_statement": ttm_income,
+                "cash_flow": ttm_cash,
+                "derived": ttm_derived,
+                "complete_quarters": min(len(columns(q_inc)), len(columns(q_cf)), 4),
+            }
+
+            annual_bs = statement(a_bs, balance_fields, "annual")
+            annual_inc = statement(a_inc, income_fields, "annual")
+            annual_cf = statement(a_cf, cash_flow_fields, "annual")
+            annual_dates = [payload.get("period_end") for payload in (annual_bs, annual_inc, annual_cf) if payload.get("period_end")]
+            latest_annual = {
+                "period_end": max(annual_dates) if annual_dates else None,
+                "period_type": "annual",
+                "currency": currency,
+                "source": "yfinance",
+                "balance_sheet": annual_bs,
+                "income_statement": annual_inc,
+                "cash_flow": annual_cf,
+            }
+
+            if not quarter_dates and not annual_dates:
+                return None
+
+            # Compatibility aliases now intentionally point to the latest reported quarter.
+            return {
+                "latest_quarter": latest_quarter,
+                "ttm": ttm,
+                "latest_annual": latest_annual,
+                "balance_sheet": latest_q_bs or annual_bs,
+                "income_statement": latest_q_inc or annual_inc,
+                "cash_flow": latest_q_cf or annual_cf,
+                "_meta": {
+                    "preferred_basis": "latest_reported_quarter",
+                    "periods_separated": True,
+                    "source": "yfinance",
+                    "currency": currency,
+                },
+            }
             
         except Exception as e:
             logger.debug(f"Financial statements fetch failed for {symbol}: {e}")
             return None
     
-    def _get_earnings_data(self, symbol: str) -> Optional[Dict[str, Any]]:
+    def _get_earnings_data(self, symbol: str, *, ticker=None) -> Optional[Dict[str, Any]]:
         """
         获取盈利报告数据（Earnings）
 
@@ -660,7 +1340,7 @@ class MarketDataCollector:
             return None
 
         try:
-            ticker = yf.Ticker(symbol)
+            ticker = ticker or yf.Ticker(symbol)
             earnings_data: Dict[str, Any] = {}
 
             try:
@@ -809,7 +1489,9 @@ class MarketDataCollector:
             "symbol": base_symbol,
             "volume_24h": volume_24h,
             "volume_change_24h": volume_change_24h,
+            "volume_to_market_cap_pct": market_structure.get("volume_to_market_cap_pct"),
             "funding_rate": funding_rate,
+            "funding_rate_decimal": derivatives.get("funding_rate_decimal"),
             "open_interest": derivatives.get("open_interest"),
             "open_interest_change_24h": oi_change,
             "long_short_ratio": long_short_ratio,
@@ -821,7 +1503,12 @@ class MarketDataCollector:
                 "market_structure": market_structure.get("source"),
                 "derivatives": derivatives.get("source"),
                 "capital_flow": capital_flow.get("source"),
-            }
+            },
+            "metric_metadata": {
+                **(market_structure.get("field_metadata") or {}),
+                **(derivatives.get("field_metadata") or {}),
+                **(capital_flow.get("field_metadata") or {}),
+            },
         }
 
     def _normalize_crypto_base_symbol(self, symbol: str) -> str:
@@ -953,12 +1640,21 @@ class MarketDataCollector:
         out = {
             "volume_24h": None,
             "volume_change_24h": None,
+            "volume_to_market_cap_pct": None,
             "source": "price+kline",
+            "field_metadata": {},
         }
         try:
             quote_volume = self._safe_num(price_data.get("quoteVolume"))
             if quote_volume is not None:
                 out["volume_24h"] = quote_volume
+                out["field_metadata"]["volume_24h"] = {
+                    "unit": "quote_asset",
+                    "currency": price_data.get("quoteCurrency") or price_data.get("quote_currency"),
+                    "provider": price_data.get("source") or "price_provider",
+                    "venue": price_data.get("exchange") or price_data.get("venue"),
+                    "product_type": price_data.get("market_type") or "spot",
+                }
         except Exception:
             pass
 
@@ -968,6 +1664,12 @@ class MarketDataCollector:
                 prev_vol = self._safe_num(kline_data[-2].get("volume"), 0.0) or 0.0
                 if prev_vol > 0:
                     out["volume_change_24h"] = ((latest_vol - prev_vol) / prev_vol) * 100.0
+                    out["field_metadata"]["volume_change_24h"] = {
+                        "unit": "percent",
+                        "provider": "kline",
+                        "venue": price_data.get("exchange") or price_data.get("venue"),
+                        "product_type": price_data.get("market_type") or "spot",
+                    }
         except Exception:
             pass
 
@@ -998,21 +1700,39 @@ class MarketDataCollector:
                 out["volume_24h"] = self._safe_num(coin.get("total_volume"))
                 if out["volume_24h"] is not None:
                     out["source"] = "coingecko"
+                    out["field_metadata"]["volume_24h"] = {
+                        "unit": "usd",
+                        "currency": "USD",
+                        "provider": "coingecko",
+                        "venue": "aggregate",
+                        "product_type": "spot",
+                    }
             if out["volume_change_24h"] is None:
                 market_cap = self._safe_num(coin.get("market_cap"))
                 total_volume = self._safe_num(coin.get("total_volume"))
                 if total_volume is not None and market_cap and market_cap > 0:
-                    out["volume_change_24h"] = (total_volume / market_cap) * 100.0
+                    # This is turnover, not a change through time.  Keeping it
+                    # separate prevents the scoring layer from interpreting a
+                    # 20% volume/market-cap ratio as +20% volume growth.
+                    out["volume_to_market_cap_pct"] = (total_volume / market_cap) * 100.0
                     out["source"] = "coingecko+proxy"
+                    out["field_metadata"]["volume_to_market_cap_pct"] = {
+                        "unit": "percent",
+                        "provider": "coingecko",
+                        "venue": "aggregate",
+                        "product_type": "spot",
+                    }
         return out
 
     def _get_crypto_derivatives_metrics(self, symbol: str) -> Dict[str, Any]:
         result = {
             "funding_rate": None,
+            "funding_rate_decimal": None,
             "open_interest": None,
             "open_interest_change_24h": None,
             "long_short_ratio": None,
             "source": "",
+            "field_metadata": {},
         }
 
         payload = self._coinglass_get("/api/futures/fundingRate/exchange-list", {"symbol": symbol}, ttl_sec=90)
@@ -1020,6 +1740,13 @@ class MarketDataCollector:
         result["funding_rate"] = self._pick_number(latest or payload, "oi_weighted_funding_rate", "funding_rate", "fundingRate")
         if result["funding_rate"] is not None:
             result["source"] = "coinglass"
+            result["funding_rate_decimal"] = result["funding_rate"] / 100.0
+            result["field_metadata"]["funding_rate"] = {
+                "unit": "percent",
+                "provider": "coinglass",
+                "venue": "aggregate",
+                "product_type": "perpetual",
+            }
 
         payload = self._coinglass_get("/api/futures/open-interest/exchange-list", {"symbol": symbol}, ttl_sec=90)
         latest = self._pick_latest_item(payload)
@@ -1039,6 +1766,20 @@ class MarketDataCollector:
         )
         if result["open_interest"] is not None:
             result["source"] = "coinglass"
+            result["field_metadata"]["open_interest"] = {
+                "unit": "usd",
+                "currency": "USD",
+                "provider": "coinglass",
+                "venue": "aggregate",
+                "product_type": "perpetual",
+            }
+        if result["open_interest_change_24h"] is not None:
+            result["field_metadata"]["open_interest_change_24h"] = {
+                "unit": "percent",
+                "provider": "coinglass",
+                "venue": "aggregate",
+                "product_type": "perpetual",
+            }
 
         payload = self._coinglass_get(
             "/api/futures/global-long-short-account-ratio/history",
@@ -1054,10 +1795,171 @@ class MarketDataCollector:
         )
         if result["long_short_ratio"] is not None:
             result["source"] = "coinglass"
+            result["field_metadata"]["long_short_ratio"] = {
+                "unit": "ratio",
+                "provider": "coinglass",
+                "venue": "aggregate",
+                "product_type": "perpetual",
+            }
 
-        if result["funding_rate"] is None or result["open_interest"] is None or result["long_short_ratio"] is None:
-            pair = f"{symbol}USDT"
-            result = self._fill_crypto_derivatives_from_binance(pair, result)
+        # Never fill individual fields from unrelated venues.  A funding rate
+        # from one exchange and OI from another is not a coherent snapshot.
+        # Prefer a complete aggregate CoinGlass snapshot; otherwise choose one
+        # venue-specific public snapshot as a unit.
+        if result["funding_rate"] is not None and result["open_interest"] is not None:
+            return result
+
+        candidates = [result]
+        pair_gate = f"{symbol}_USDT"
+        gate = self._get_gate_public_derivatives(pair_gate)
+        candidates.append(gate)
+        if gate.get("funding_rate") is not None and gate.get("open_interest") is not None:
+            return gate
+
+        pair_okx = f"{symbol}-USDT-SWAP"
+        okx = self._get_okx_public_derivatives(pair_okx)
+        candidates.append(okx)
+        if okx.get("funding_rate") is not None and okx.get("open_interest") is not None:
+            return okx
+
+        pair_binance = f"{symbol}USDT"
+        empty = {
+            "funding_rate": None, "funding_rate_decimal": None,
+            "open_interest": None, "open_interest_change_24h": None,
+            "long_short_ratio": None, "source": "", "field_metadata": {},
+        }
+        candidates.append(self._fill_crypto_derivatives_from_binance(pair_binance, empty))
+        return max(
+            candidates,
+            key=lambda item: sum(
+                item.get(key) is not None
+                for key in ("funding_rate", "open_interest", "open_interest_change_24h", "long_short_ratio")
+            ),
+        )
+
+    def _get_gate_public_derivatives(self, contract: str) -> Dict[str, Any]:
+        """Fetch one coherent Gate USDT perpetual snapshot without credentials."""
+        cache_key = f"gate_public_derivatives|{contract}"
+        cached = self._cache_get(cache_key)
+        if isinstance(cached, dict):
+            return cached
+        result: Dict[str, Any] = {
+            "funding_rate": None, "funding_rate_decimal": None,
+            "open_interest": None, "open_interest_change_24h": None,
+            "long_short_ratio": None, "source": "", "field_metadata": {},
+        }
+        try:
+            contract_response = requests.get(
+                f"https://api.gateio.ws/api/v4/futures/usdt/contracts/{contract}",
+                headers={"Accept": "application/json"},
+                timeout=6,
+            )
+            contract_response.raise_for_status()
+            contract_payload = contract_response.json() or {}
+            decimal_rate = self._safe_num(
+                contract_payload.get("funding_rate")
+                or contract_payload.get("funding_rate_indicative")
+            )
+            if decimal_rate is not None:
+                result["funding_rate_decimal"] = decimal_rate
+                result["funding_rate"] = decimal_rate * 100.0
+                result["field_metadata"]["funding_rate"] = {
+                    "unit": "percent", "source_unit": "decimal",
+                    "provider": "gate_public", "venue": "gate",
+                    "product_type": "perpetual",
+                }
+        except Exception as exc:
+            logger.debug("Gate public funding failed for %s: %s", contract, exc)
+
+        try:
+            stats_response = requests.get(
+                "https://api.gateio.ws/api/v4/futures/usdt/contract_stats",
+                params={"contract": contract, "interval": "1d", "limit": 2},
+                headers={"Accept": "application/json"},
+                timeout=6,
+            )
+            stats_response.raise_for_status()
+            stats = stats_response.json() or []
+            if stats:
+                latest = stats[-1]
+                result["open_interest"] = self._safe_num(latest.get("open_interest_usd"))
+                result["long_short_ratio"] = self._safe_num(latest.get("lsr_account"))
+                if len(stats) >= 2:
+                    previous_oi = self._safe_num(stats[-2].get("open_interest_usd"))
+                    latest_oi = result["open_interest"]
+                    if previous_oi and latest_oi is not None:
+                        result["open_interest_change_24h"] = (latest_oi - previous_oi) / previous_oi * 100.0
+                for key, unit in (
+                    ("open_interest", "usd"),
+                    ("open_interest_change_24h", "percent"),
+                    ("long_short_ratio", "ratio"),
+                ):
+                    if result.get(key) is not None:
+                        result["field_metadata"][key] = {
+                            "unit": unit,
+                            "currency": "USD" if unit == "usd" else None,
+                            "provider": "gate_public", "venue": "gate",
+                            "product_type": "perpetual",
+                        }
+        except Exception as exc:
+            logger.debug("Gate public derivatives failed for %s: %s", contract, exc)
+        if any(result.get(key) is not None for key in ("funding_rate", "open_interest", "long_short_ratio")):
+            result["source"] = "gate_public"
+            self._cache_set(cache_key, result, 120)
+        return result
+
+    def _get_okx_public_derivatives(self, instrument: str) -> Dict[str, Any]:
+        """Fetch one coherent OKX USDT perpetual snapshot without credentials."""
+        cache_key = f"okx_public_derivatives|{instrument}"
+        cached = self._cache_get(cache_key)
+        if isinstance(cached, dict):
+            return cached
+        result: Dict[str, Any] = {
+            "funding_rate": None, "funding_rate_decimal": None,
+            "open_interest": None, "open_interest_change_24h": None,
+            "long_short_ratio": None, "source": "", "field_metadata": {},
+        }
+        try:
+            funding_response = requests.get(
+                "https://www.okx.com/api/v5/public/funding-rate-history",
+                params={"instId": instrument, "limit": 2},
+                timeout=6,
+            )
+            funding_response.raise_for_status()
+            rows = (funding_response.json() or {}).get("data") or []
+            if rows:
+                decimal_rate = self._safe_num(rows[0].get("realizedRate") or rows[0].get("fundingRate"))
+                if decimal_rate is not None:
+                    result["funding_rate_decimal"] = decimal_rate
+                    result["funding_rate"] = decimal_rate * 100.0
+                    result["field_metadata"]["funding_rate"] = {
+                        "unit": "percent", "source_unit": "decimal",
+                        "provider": "okx_public", "venue": "okx",
+                        "product_type": "perpetual",
+                    }
+        except Exception as exc:
+            logger.debug("OKX public funding failed for %s: %s", instrument, exc)
+        try:
+            oi_response = requests.get(
+                "https://www.okx.com/api/v5/public/open-interest",
+                params={"instType": "SWAP", "instId": instrument},
+                timeout=6,
+            )
+            oi_response.raise_for_status()
+            rows = (oi_response.json() or {}).get("data") or []
+            if rows:
+                result["open_interest"] = self._safe_num(rows[0].get("oiUsd"))
+                if result["open_interest"] is not None:
+                    result["field_metadata"]["open_interest"] = {
+                        "unit": "usd", "currency": "USD",
+                        "provider": "okx_public", "venue": "okx",
+                        "product_type": "perpetual",
+                    }
+        except Exception as exc:
+            logger.debug("OKX public open interest failed for %s: %s", instrument, exc)
+        if result.get("funding_rate") is not None or result.get("open_interest") is not None:
+            result["source"] = "okx_public"
+            self._cache_set(cache_key, result, 120)
         return result
 
     def _fill_crypto_derivatives_from_binance(self, pair: str, result: Dict[str, Any]) -> Dict[str, Any]:
@@ -1065,14 +1967,24 @@ class MarketDataCollector:
         cached = self._cache_get(cache_key)
         if isinstance(cached, dict):
             merged = dict(result)
+            filled_fields = set()
             for k, v in cached.items():
+                if k == "field_metadata":
+                    continue
                 if merged.get(k) is None and v is not None:
                     merged[k] = v
+                    filled_fields.add(k)
+            cached_metadata = cached.get("field_metadata") or {}
+            merged.setdefault("field_metadata", {}).update({
+                key: cached_metadata[key]
+                for key in filled_fields
+                if key in cached_metadata
+            })
             if any(merged.get(k) is not None for k in ("funding_rate", "open_interest", "long_short_ratio")) and not merged.get("source"):
                 merged["source"] = "binance_public"
             return merged
 
-        fallback = {}
+        fallback = {"field_metadata": {}}
         try:
             funding_resp = requests.get(
                 "https://fapi.binance.com/fapi/v1/fundingRate",
@@ -1082,7 +1994,17 @@ class MarketDataCollector:
             funding_resp.raise_for_status()
             items = funding_resp.json() or []
             if items:
-                fallback["funding_rate"] = self._safe_num(items[-1].get("fundingRate"))
+                decimal_rate = self._safe_num(items[-1].get("fundingRate"))
+                if decimal_rate is not None:
+                    fallback["funding_rate_decimal"] = decimal_rate
+                    fallback["funding_rate"] = decimal_rate * 100.0
+                    fallback["field_metadata"]["funding_rate"] = {
+                        "unit": "percent",
+                        "source_unit": "decimal",
+                        "provider": "binance_public",
+                        "venue": "binance",
+                        "product_type": "perpetual",
+                    }
         except Exception as e:
             logger.debug(f"Binance funding fallback failed for {pair}: {e}")
 
@@ -1097,11 +2019,24 @@ class MarketDataCollector:
             if items:
                 latest = items[-1]
                 fallback["open_interest"] = self._safe_num(latest.get("sumOpenInterestValue"))
+                fallback["field_metadata"]["open_interest"] = {
+                    "unit": "usd",
+                    "currency": "USD",
+                    "provider": "binance_public",
+                    "venue": "binance",
+                    "product_type": "perpetual",
+                }
                 if len(items) >= 2:
                     prev = self._safe_num(items[-2].get("sumOpenInterestValue"), 0.0) or 0.0
                     curr = self._safe_num(latest.get("sumOpenInterestValue"), 0.0) or 0.0
                     if prev > 0:
                         fallback["open_interest_change_24h"] = ((curr - prev) / prev) * 100.0
+                        fallback["field_metadata"]["open_interest_change_24h"] = {
+                            "unit": "percent",
+                            "provider": "binance_public",
+                            "venue": "binance",
+                            "product_type": "perpetual",
+                        }
         except Exception as e:
             logger.debug(f"Binance open interest fallback failed for {pair}: {e}")
 
@@ -1115,14 +2050,30 @@ class MarketDataCollector:
             items = ratio_resp.json() or []
             if items:
                 fallback["long_short_ratio"] = self._safe_num(items[-1].get("longShortRatio"))
+                fallback["field_metadata"]["long_short_ratio"] = {
+                    "unit": "ratio",
+                    "provider": "binance_public",
+                    "venue": "binance",
+                    "product_type": "perpetual",
+                }
         except Exception as e:
             logger.debug(f"Binance long/short fallback failed for {pair}: {e}")
 
         self._cache_set(cache_key, fallback, 120)
         merged = dict(result)
+        filled_fields = set()
         for k, v in fallback.items():
+            if k == "field_metadata":
+                continue
             if merged.get(k) is None and v is not None:
                 merged[k] = v
+                filled_fields.add(k)
+        fallback_metadata = fallback.get("field_metadata") or {}
+        merged.setdefault("field_metadata", {}).update({
+            key: fallback_metadata[key]
+            for key in filled_fields
+            if key in fallback_metadata
+        })
         if any(merged.get(k) is not None for k in ("funding_rate", "open_interest", "long_short_ratio")) and not merged.get("source"):
             merged["source"] = "binance_public"
         return merged
@@ -1132,6 +2083,7 @@ class MarketDataCollector:
             "exchange_netflow": None,
             "stablecoin_netflow": None,
             "source": "",
+            "field_metadata": {},
         }
 
         payload = self._coinglass_get("/api/futures/coin/netflow", {"symbol": symbol}, ttl_sec=180)
@@ -1145,6 +2097,14 @@ class MarketDataCollector:
             result["exchange_netflow"] = self._pick_number(latest or payload, "netflow", "netFlow", "net_flow")
             if result["exchange_netflow"] is not None:
                 result["source"] = "coinglass"
+        if result["exchange_netflow"] is not None:
+            result["field_metadata"]["exchange_netflow"] = {
+                "unit": "usd",
+                "currency": "USD",
+                "provider": "coinglass",
+                "venue": "aggregate",
+                "product_type": "spot",
+            }
 
         payload = self._cryptoquant_get(
             "/v1/stablecoin/exchange-flows/netflow",
@@ -1161,6 +2121,13 @@ class MarketDataCollector:
         )
         if result["stablecoin_netflow"] is not None:
             result["source"] = (result["source"] + "+cryptoquant").strip("+")
+            result["field_metadata"]["stablecoin_netflow"] = {
+                "unit": "usd",
+                "currency": "USD",
+                "provider": "cryptoquant",
+                "venue": "aggregate",
+                "product_type": "spot",
+            }
 
         return result
 
@@ -1531,8 +2498,22 @@ class MarketDataCollector:
                     for item in raw_news[:10]:
                         if not item.get('headline'):
                             continue
+                        published_at = ""
+                        try:
+                            # Finnhub timestamps are Unix instants in UTC.  A
+                            # timezone-naive ``fromtimestamp`` converts them
+                            # through the container's local timezone (normally
+                            # Asia/Shanghai) and the evidence layer then reads
+                            # that wall clock as UTC, making recent news appear
+                            # eight hours in the future.
+                            published_at = datetime.fromtimestamp(
+                                float(item.get('datetime') or 0),
+                                tz=timezone.utc,
+                            ).isoformat().replace("+00:00", "Z")
+                        except (TypeError, ValueError, OverflowError, OSError):
+                            published_at = ""
                         news_list.append({
-                            "datetime": datetime.fromtimestamp(item.get('datetime', 0)).strftime('%Y-%m-%d %H:%M'),
+                            "datetime": published_at,
                             "headline": item.get('headline', ''),
                             "summary": item.get('summary', '')[:300] if item.get('summary') else '',
                             "source": item.get('source', 'Finnhub'),
@@ -1561,10 +2542,16 @@ class MarketDataCollector:
             search_news = self._get_news_from_search(market, symbol, company_name)
             news_list.extend(search_news)
         
-        global_events = self._get_global_major_events()
-        if global_events:
-            news_list.extend(global_events)
-            logger.info(f"Added {len(global_events)} global major events to news list")
+        # Broad global headlines are disabled by default. They are useful as
+        # background context, but injecting them into every asset report made
+        # unrelated conflicts look like target-specific bearish evidence.
+        if os.getenv("FAST_ANALYSIS_INCLUDE_GLOBAL_NEWS", "false").lower() == "true":
+            global_events = self._get_global_major_events()
+            for item in global_events:
+                item["asset_relevance"] = "background"
+            if global_events:
+                news_list.extend(global_events)
+                logger.info(f"Added {len(global_events)} background global events to news list")
         
         seen_titles = set()
         unique_news = []

@@ -24,10 +24,32 @@ settings_blp = Blueprint('settings', __name__)
 # the settings UI, but applying them to only one Gunicorn worker would make
 # authentication or credential decryption inconsistent until every worker has
 # restarted.
+STRATEGY_RUNTIME_SETTINGS = {
+    'STRATEGY_MAX_ACTIVE',
+    'STRATEGY_EVALUATOR_THREADS',
+    'SHARED_PUBLIC_MARKET_FEED_ENABLED',
+    'SHARED_PUBLIC_MARKET_FALLBACK_TTL_SEC',
+    'BAR_CLOSE_EVENT_SCHEDULER_ENABLED',
+    'BAR_CLOSE_EVENT_GRACE_SEC',
+    'BAR_EVENT_FALLBACK_WAKE_SEC',
+    'KAFKA_EVENT_PUBLISH_ENABLED',
+    'STRATEGY_SHARD_COUNT',
+    'STRATEGY_EVALUATION_BATCH_SIZE',
+    'STRATEGY_EVALUATOR_MODE',
+    'STRATEGY_DISTRIBUTED_BAR_ENABLED',
+    'STRATEGY_EVALUATOR_LEASE_SEC',
+    'STRATEGY_EVALUATOR_MAX_ATTEMPTS',
+    'STRATEGY_EVALUATOR_BATCH_WORKERS',
+    'STRATEGY_EVALUATION_TIMEOUT_SEC',
+    'KAFKA_MAX_POLL_INTERVAL_MS',
+    'BAR_IDLE_SCHEDULER_ENABLED',
+    'BAR_IDLE_WAKE_INTERVAL_SEC',
+}
+
 RESTART_REQUIRED_SETTINGS = {
     'SECRET_KEY',
     'CREDENTIAL_ENCRYPTION_KEY',
-}
+} | STRATEGY_RUNTIME_SETTINGS
 
 # ---------------------------------------------------------------
 # ---------------------------------------------------------------
@@ -37,14 +59,21 @@ RESTART_REQUIRED_SETTINGS = {
 # intentional — only put truly rarely changed knobs here so the basic tab stays
 # useful for day-to-day operators.
 ADVANCED_KEYS = {
+    # Bootstrap compatibility
+    'ADMIN_USER', 'ADMIN_PASSWORD',
     # AI tuning
     'OPENROUTER_TEMPERATURE',
+    'LLM_MAX_TOKENS',
     'AI_ANALYSIS_CONSENSUS_TIMEFRAMES', 'SEARCH_MAX_RESULTS',
+    'FAST_ANALYSIS_INCLUDE_GLOBAL_NEWS',
     'SEARCH_GOOGLE_API_KEY', 'SEARCH_GOOGLE_CX', 'SEARCH_BING_API_KEY', 'SERPAPI_KEYS',
     'SEARCH_SEARXNG_ENGINES', 'SEARCH_SEARXNG_CATEGORIES', 'SEARCH_SEARXNG_LANGUAGE', 'SEARCH_SEARXNG_TIMEOUT',
     'GDELT_BASE_URL', 'GDELT_TIMEOUT', 'GDELT_MAX_RESULTS',
     'ALPHA_VANTAGE_API_KEY', 'ALPHA_VANTAGE_BASE_URL', 'ALPHA_VANTAGE_TIMEOUT', 'ALPHA_VANTAGE_NEWS_LIMIT',
     'AI_CODE_GEN_MODEL', 'LLM_PROXY_URL', 'LLM_USE_SYSTEM_PROXY',
+    'JEV_BASE_URL', 'JEV_MODEL', 'JEV_TIMEOUT_SECONDS', 'JEV_MIN_CONFIDENCE', 'AI_DECISION_TIMEOUT_SECONDS',
+    'EVENT_RADAR_JEV_MIN_CONFIDENCE', 'EVENT_RADAR_NEWS_LOOKBACK_DAYS', 'EVENT_RADAR_MAX_EVENTS',
+    'SEC_EDGAR_USER_AGENT',
     'OPENAI_BASE_URL', 'DEEPSEEK_BASE_URL', 'GROK_BASE_URL', 'ATLASCLOUD_BASE_URL', 'MINIMAX_BASE_URL',
     # Trading internals
     'ORDER_MODE', 'MAKER_WAIT_SEC',
@@ -56,6 +85,13 @@ ADVANCED_KEYS = {
     # Agent gateway (operator-level)
     'AGENT_JOBS_MAX_WORKERS',
     'ENABLE_PENDING_ORDER_WORKER', 'DISABLE_RESTORE_RUNNING_STRATEGIES',
+    # Distributed strategy runtime tuning
+    'SHARED_PUBLIC_MARKET_FALLBACK_TTL_SEC',
+    'BAR_CLOSE_EVENT_GRACE_SEC', 'BAR_EVENT_FALLBACK_WAKE_SEC',
+    'STRATEGY_SHARD_COUNT', 'STRATEGY_EVALUATION_BATCH_SIZE',
+    'STRATEGY_EVALUATOR_LEASE_SEC', 'STRATEGY_EVALUATOR_MAX_ATTEMPTS',
+    'STRATEGY_EVALUATOR_BATCH_WORKERS', 'STRATEGY_EVALUATION_TIMEOUT_SEC',
+    'KAFKA_MAX_POLL_INTERVAL_MS', 'BAR_IDLE_WAKE_INTERVAL_SEC',
     # OAuth advanced
     'OAUTH_ALLOWED_REDIRECTS', 'OAUTH_STATE_TTL_MINUTES',
     'GOOGLE_REDIRECT_URI', 'GITHUB_REDIRECT_URI',
@@ -69,8 +105,9 @@ ADVANCED_KEYS = {
     # AI reflection / calibration
     'REFLECTION_WORKER_INTERVAL_SEC', 'REFLECTION_MIN_AGE_DAYS', 'REFLECTION_VALIDATE_LIMIT',
     'AI_CALIBRATION_MARKETS', 'AI_CALIBRATION_LOOKBACK_DAYS', 'AI_CALIBRATION_MIN_SAMPLES',
-    # USDT pay internals
+    # Stablecoin pay internals
     'USDT_TRC20_CONTRACT', 'USDT_BEP20_CONTRACT', 'USDT_ERC20_CONTRACT', 'USDT_SOL_MINT',
+    'USDC_ERC20_CONTRACT', 'USDC_SOL_MINT',
     'TRONGRID_BASE_URL', 'ETHERSCAN_V2_BASE_URL', 'BSC_RPC_URLS', 'ETH_RPC_URLS',
     'SOLANA_RPC_URL', 'BEP20_PREFER_EXPLORER', 'ERC20_PREFER_EXPLORER',
     'USDT_PAY_CONFIRM_SECONDS', 'USDT_PAY_EXPIRE_MINUTES',
@@ -310,6 +347,107 @@ CONFIG_SCHEMA = {
         'icon': 'robot',
         'order': 2,
         'items': [
+            {
+                'key': 'JEV_API_KEY',
+                'label': 'settings.field.JEV_API_KEY',
+                'type': 'password',
+                'required': False,
+                'link': 'https://console.typesafe.ai/',
+                'link_text': 'settings.link.getApiKey',
+                'description': 'settings.desc.JEV_API_KEY'
+            },
+            {
+                'key': 'JEV_BASE_URL',
+                'label': 'settings.field.JEV_BASE_URL',
+                'type': 'text',
+                'default': 'https://api.typesafe.ai/v1',
+                'description': 'settings.desc.JEV_BASE_URL'
+            },
+            {
+                'key': 'JEV_MODEL',
+                'label': 'settings.field.JEV_MODEL',
+                'type': 'text',
+                'default': 'jev-latest',
+                'description': 'settings.desc.JEV_MODEL'
+            },
+            {
+                'key': 'JEV_TIMEOUT_SECONDS',
+                'label': 'settings.field.JEV_TIMEOUT_SECONDS',
+                'type': 'number',
+                'default': 8,
+                'description': 'settings.desc.JEV_TIMEOUT_SECONDS'
+            },
+            {
+                'key': 'AI_DECISION_TIMEOUT_SECONDS',
+                'label': 'settings.field.AI_DECISION_TIMEOUT_SECONDS',
+                'type': 'number',
+                'default': 10,
+                'description': 'settings.desc.AI_DECISION_TIMEOUT_SECONDS'
+            },
+            {
+                'key': 'JEV_MIN_CONFIDENCE',
+                'label': 'settings.field.JEV_MIN_CONFIDENCE',
+                'type': 'number',
+                'default': 0.55,
+                'description': 'settings.desc.JEV_MIN_CONFIDENCE'
+            },
+            {
+                'key': 'EVENT_RADAR_ENABLED',
+                'label': 'settings.field.EVENT_RADAR_ENABLED',
+                'type': 'boolean',
+                'default': 'True',
+                'description': 'settings.desc.EVENT_RADAR_ENABLED'
+            },
+            {
+                'key': 'EVENT_RADAR_JEV_MIN_CONFIDENCE',
+                'label': 'settings.field.EVENT_RADAR_JEV_MIN_CONFIDENCE',
+                'type': 'number',
+                'default': 0.65,
+                'description': 'settings.desc.EVENT_RADAR_JEV_MIN_CONFIDENCE'
+            },
+            {
+                'key': 'EVENT_RADAR_NEWS_LOOKBACK_DAYS',
+                'label': 'settings.field.EVENT_RADAR_NEWS_LOOKBACK_DAYS',
+                'type': 'number',
+                'default': 2,
+                'description': 'settings.desc.EVENT_RADAR_NEWS_LOOKBACK_DAYS'
+            },
+            {
+                'key': 'EVENT_RADAR_MAX_EVENTS',
+                'label': 'settings.field.EVENT_RADAR_MAX_EVENTS',
+                'type': 'number',
+                'default': 8,
+                'description': 'settings.desc.EVENT_RADAR_MAX_EVENTS'
+            },
+            {
+                'key': 'EVENT_RADAR_CRYPTO_RSS_ENABLED',
+                'label': 'settings.field.EVENT_RADAR_CRYPTO_RSS_ENABLED',
+                'type': 'boolean',
+                'default': 'True',
+                'description': 'settings.desc.EVENT_RADAR_CRYPTO_RSS_ENABLED'
+            },
+            {
+                'key': 'EVENT_RADAR_YAHOO_FINANCE_RSS_ENABLED',
+                'label': 'settings.field.EVENT_RADAR_YAHOO_FINANCE_RSS_ENABLED',
+                'type': 'boolean',
+                'default': 'True',
+                'description': 'settings.desc.EVENT_RADAR_YAHOO_FINANCE_RSS_ENABLED'
+            },
+            {
+                'key': 'EVENT_RADAR_SEC_EDGAR_ENABLED',
+                'label': 'settings.field.EVENT_RADAR_SEC_EDGAR_ENABLED',
+                'type': 'boolean',
+                'default': 'True',
+                'description': 'settings.desc.EVENT_RADAR_SEC_EDGAR_ENABLED'
+            },
+            {
+                'key': 'SEC_EDGAR_USER_AGENT',
+                'label': 'settings.field.SEC_EDGAR_USER_AGENT',
+                'type': 'text',
+                'default': '',
+                'required': False,
+                'description': 'settings.desc.SEC_EDGAR_USER_AGENT'
+            },
             {
                 'key': 'LLM_PROVIDER',
                 'label': 'LLM Provider',
@@ -606,6 +744,13 @@ CONFIG_SCHEMA = {
                 'description': 'Model creativity (0-1). Lower = more deterministic'
             },
             {
+                'key': 'LLM_MAX_TOKENS',
+                'label': 'settings.field.LLM_MAX_TOKENS',
+                'type': 'number',
+                'default': 16384,
+                'description': 'settings.desc.LLM_MAX_TOKENS'
+            },
+            {
                 'key': 'AI_ANALYSIS_CONSENSUS_TIMEFRAMES',
                 'label': 'Consensus Timeframes',
                 'type': 'text',
@@ -689,6 +834,56 @@ CONFIG_SCHEMA = {
         ]
     },
 
+    'strategy_runtime': {
+        'title': 'settings.group.strategy_runtime',
+        'icon': 'cluster',
+        'order': 3.25,
+        'items': [
+            {
+                'key': 'STRATEGY_MAX_ACTIVE',
+                'label': 'settings.field.STRATEGY_MAX_ACTIVE',
+                'type': 'number',
+                'default': '100000',
+                'description': 'settings.desc.STRATEGY_MAX_ACTIVE',
+            },
+            {
+                'key': 'STRATEGY_EVALUATOR_THREADS',
+                'label': 'settings.field.STRATEGY_EVALUATOR_THREADS',
+                'type': 'number',
+                'default': '16',
+                'description': 'settings.desc.STRATEGY_EVALUATOR_THREADS',
+            },
+            {
+                'key': 'STRATEGY_EVALUATION_BATCH_SIZE',
+                'label': 'settings.field.STRATEGY_EVALUATION_BATCH_SIZE',
+                'type': 'number',
+                'default': '250',
+                'description': 'settings.desc.STRATEGY_EVALUATION_BATCH_SIZE',
+            },
+            {
+                'key': 'STRATEGY_EVALUATOR_BATCH_WORKERS',
+                'label': 'settings.field.STRATEGY_EVALUATOR_BATCH_WORKERS',
+                'type': 'number',
+                'default': '16',
+                'description': 'settings.desc.STRATEGY_EVALUATOR_BATCH_WORKERS',
+            },
+            {
+                'key': 'STRATEGY_EVALUATION_TIMEOUT_SEC',
+                'label': 'settings.field.STRATEGY_EVALUATION_TIMEOUT_SEC',
+                'type': 'number',
+                'default': '90',
+                'description': 'settings.desc.STRATEGY_EVALUATION_TIMEOUT_SEC',
+            },
+            {
+                'key': 'BAR_CLOSE_EVENT_GRACE_SEC',
+                'label': 'settings.field.BAR_CLOSE_EVENT_GRACE_SEC',
+                'type': 'number',
+                'default': '0.5',
+                'description': 'settings.desc.BAR_CLOSE_EVENT_GRACE_SEC',
+            },
+        ]
+    },
+
     'market_modules': {
         'title': 'Market Modules',
         'icon': 'appstore',
@@ -711,12 +906,35 @@ CONFIG_SCHEMA = {
         'order': 4,
         'items': [
             {
-                'key': 'CCXT_DEFAULT_EXCHANGE',
+                'key': 'PROFESSIONAL_REPORT_DATA_TIER',
+                'label': 'Professional Report Data Tier',
+                'type': 'select',
+                'default': 'community',
+                'options': [
+                    {'value': 'community', 'label': 'Community / low-cost'},
+                    {'value': 'professional', 'label': 'Professional'},
+                ],
+                'description': 'Select the source tier declared in professional reports. Community remains the safe default and still uses every configured active fallback.'
+            },
+            {
+                'key': 'PROFESSIONAL_REPORT_RISK_BUDGET_PCT',
+                'label': 'Risk Budget per Trade (%)',
+                'type': 'number',
+                'default': '1.0',
+                'description': 'Account risk budget used to calculate the report position-size ceiling. This is not the target position percentage.'
+            },
+            {
+                'key': 'FAST_ANALYSIS_INCLUDE_GLOBAL_NEWS',
+                'label': 'Include Broad Global Headlines',
+                'type': 'boolean',
+                'default': 'False',
+                'description': 'Add broad global-event headlines to each asset report. Keep disabled unless this background context is explicitly needed.'
+            },
+            {
+                'key': 'CRYPTO_PUBLIC_DEFAULT_EXCHANGE',
                 'label': 'Default Crypto Exchange',
                 'type': 'text',
                 'default': 'binance',
-                'link': 'https://github.com/ccxt/ccxt#supported-cryptocurrency-exchange-markets',
-                'link_text': 'settings.link.supportedExchanges',
                 'description': 'Default crypto market-data exchange: binance, bitget, bybit, okx, gate, or htx'
             },
             {
@@ -1517,50 +1735,6 @@ CONFIG_SCHEMA = {
                 'description': 'Enable billing system. Users need credits to use certain features'
             },
 
-            # ===== Membership Plans (3 tiers) =====
-            {
-                'key': 'MEMBERSHIP_MONTHLY_PRICE_USD',
-                'label': 'Monthly Membership Price (USD)',
-                'type': 'number',
-                'default': '19.9',
-                'description': 'Monthly membership price in USD (USDT checkout uses equivalent amount in USDT)'
-            },
-            {
-                'key': 'MEMBERSHIP_MONTHLY_CREDITS',
-                'label': 'Monthly Membership Bonus Credits',
-                'type': 'number',
-                'default': '500',
-                'description': 'Credits granted immediately after purchasing monthly membership'
-            },
-            {
-                'key': 'MEMBERSHIP_YEARLY_PRICE_USD',
-                'label': 'Yearly Membership Price (USD)',
-                'type': 'number',
-                'default': '199',
-                'description': 'Yearly membership price in USD (USDT checkout uses equivalent amount in USDT)'
-            },
-            {
-                'key': 'MEMBERSHIP_YEARLY_CREDITS',
-                'label': 'Yearly Membership Bonus Credits',
-                'type': 'number',
-                'default': '8000',
-                'description': 'Credits granted immediately after purchasing yearly membership'
-            },
-            {
-                'key': 'MEMBERSHIP_LIFETIME_PRICE_USD',
-                'label': 'Lifetime Membership Price (USD)',
-                'type': 'number',
-                'default': '499',
-                'description': 'Lifetime membership price in USD (USDT checkout uses equivalent amount in USDT)'
-            },
-            {
-                'key': 'MEMBERSHIP_LIFETIME_MONTHLY_CREDITS',
-                'label': 'Lifetime Membership Monthly Credits',
-                'type': 'number',
-                'default': '800',
-                'description': 'Credits granted every 30 days for lifetime members'
-            },
-
             # ===== USDT Pay (v3.0.6+: one fixed address per chain + amount-suffix matching) =====
             # Model: each chain has a single receiving address. Orders are
             # disambiguated by a unique amount suffix in the low decimals
@@ -1610,11 +1784,137 @@ CONFIG_SCHEMA = {
                 'description': 'Your Solana wallet address (base58). The SPL USDT mint ATA is derived on-chain by the sender wallet.'
             },
             {
+                'key': 'USDT_TRC20_CONTRACT',
+                'label': 'USDT TRC20 Contract',
+                'type': 'text',
+                'default': 'TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t',
+                'required': False,
+                'description': 'Advanced: USDT token contract on TRON. Keep the default unless the network changes.'
+            },
+            {
+                'key': 'USDT_BEP20_CONTRACT',
+                'label': 'USDT BEP20 Contract',
+                'type': 'text',
+                'default': '0x55d398326f99059fF775485246999027B3197955',
+                'required': False,
+                'description': 'Advanced: USDT token contract on BSC.'
+            },
+            {
+                'key': 'USDT_ERC20_CONTRACT',
+                'label': 'USDT ERC20 Contract',
+                'type': 'text',
+                'default': '0xdAC17F958D2ee523a2206206994597C13D831ec7',
+                'required': False,
+                'description': 'Advanced: USDT token contract on Ethereum.'
+            },
+            {
+                'key': 'USDT_SOL_MINT',
+                'label': 'USDT Solana Mint',
+                'type': 'text',
+                'default': 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB',
+                'required': False,
+                'description': 'Advanced: SPL USDT mint on Solana.'
+            },
+            {
+                'key': 'USDC_PAY_ENABLED',
+                'label': 'Enable USDC Pay',
+                'type': 'boolean',
+                'default': 'False',
+                'description': 'Enable Circle-issued native USDC checkout on Ethereum and Solana.'
+            },
+            {
+                'key': 'USDC_PAY_ENABLED_CHAINS',
+                'label': 'USDC Enabled Chains',
+                'type': 'text',
+                'default': 'ERC20,SOL',
+                'description': 'Comma-separated official USDC chain whitelist: ERC20 / SOL.'
+            },
+            {
+                'key': 'USDC_ERC20_ADDRESS',
+                'label': 'USDC ERC20 Receiving Address',
+                'type': 'text',
+                'required': False,
+                'description': 'Optional dedicated USDC address. Leave blank to reuse the USDT ERC20 receiving address.'
+            },
+            {
+                'key': 'USDC_SOL_ADDRESS',
+                'label': 'USDC Solana Receiving Address',
+                'type': 'text',
+                'required': False,
+                'description': 'Optional dedicated USDC address. Leave blank to reuse the USDT Solana receiving address.'
+            },
+            {
+                'key': 'USDC_ERC20_CONTRACT',
+                'label': 'USDC ERC20 Contract',
+                'type': 'text',
+                'default': '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48',
+                'required': False,
+                'description': 'Advanced: USDC token contract on Ethereum.'
+            },
+            {
+                'key': 'USDC_SOL_MINT',
+                'label': 'USDC Solana Mint',
+                'type': 'text',
+                'default': 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
+                'required': False,
+                'description': 'Advanced: SPL USDC mint on Solana.'
+            },
+            {
+                'key': 'STRIPE_PAY_ENABLED',
+                'label': 'Enable Stripe Pay',
+                'type': 'boolean',
+                'default': 'False',
+                'description': 'Enable card checkout through server-created Stripe Checkout Sessions.'
+            },
+            {
+                'key': 'STRIPE_SECRET_KEY',
+                'label': 'Stripe Secret Key',
+                'type': 'password',
+                'required': False,
+                'description': 'Get the sk_live_... or sk_test_... key from Stripe Dashboard > Developers > API keys. The current server-side Checkout flow does not need the pk_ public key.'
+            },
+            {
+                'key': 'STRIPE_WEBHOOK_SECRET',
+                'label': 'Stripe Webhook Signing Secret',
+                'type': 'password',
+                'required': False,
+                'description': 'Create a Stripe Webhook endpoint for POST /api/billing/stripe/webhook, then reveal and paste its whsec_... signing secret. This value is not shown on the API keys page.'
+            },
+            {
+                'key': 'STRIPE_PRODUCT_TAX_CODE',
+                'label': 'Stripe Product Tax Code',
+                'type': 'text',
+                'default': 'txcd_10103000',
+                'required': False,
+                'description': 'Stripe product tax category used for inline Checkout products. Defaults to SaaS for personal use (txcd_10103000).'
+            },
+            {
+                'key': 'STRIPE_SUCCESS_URL',
+                'label': 'Stripe Success URL',
+                'type': 'text',
+                'required': False,
+                'description': 'Optional Checkout success URL. Leave blank to use FRONTEND_URL/billing automatically.'
+            },
+            {
+                'key': 'STRIPE_CANCEL_URL',
+                'label': 'Stripe Cancel URL',
+                'type': 'text',
+                'required': False,
+                'description': 'Optional Checkout cancel URL. Leave blank to return to the billing page automatically.'
+            },
+            {
                 'key': 'TRONGRID_API_KEY',
                 'label': 'TronGrid API Key',
                 'type': 'password',
                 'required': False,
                 'description': 'Optional. Higher TronGrid rate-limit / stability for TRC20 reconciliation. Get one at https://www.trongrid.io.'
+            },
+            {
+                'key': 'TRONGRID_BASE_URL',
+                'label': 'settings.field.TRONGRID_BASE_URL',
+                'type': 'text',
+                'default': 'https://api.trongrid.io',
+                'description': 'settings.desc.TRONGRID_BASE_URL'
             },
             {
                 'key': 'ETHERSCAN_API_KEY',
@@ -1624,11 +1924,53 @@ CONFIG_SCHEMA = {
                 'description': 'Optional. Used for ERC20 reconciliation via Etherscan V2 (free plan covers Ethereum mainnet). BEP20 uses BSC RPC unless you explicitly enable explorer mode. Get a key at https://etherscan.io/myapikey.'
             },
             {
+                'key': 'ETHERSCAN_V2_BASE_URL',
+                'label': 'settings.field.ETHERSCAN_V2_BASE_URL',
+                'type': 'text',
+                'default': 'https://api.etherscan.io/v2/api',
+                'description': 'settings.desc.ETHERSCAN_V2_BASE_URL'
+            },
+            {
                 'key': 'BSC_RPC_URLS',
                 'label': 'BSC RPC URLs',
                 'type': 'text',
                 'required': False,
                 'description': 'Optional comma-separated BSC JSON-RPC endpoints for BEP20 reconciliation. Use provider URLs with API keys here if public RPCs are unstable.'
+            },
+            {
+                'key': 'ETH_RPC_URLS',
+                'label': 'settings.field.ETH_RPC_URLS',
+                'type': 'text',
+                'required': False,
+                'description': 'settings.desc.ETH_RPC_URLS'
+            },
+            {
+                'key': 'SOLANA_RPC_URL',
+                'label': 'settings.field.SOLANA_RPC_URL',
+                'type': 'text',
+                'default': 'https://api.mainnet-beta.solana.com',
+                'description': 'settings.desc.SOLANA_RPC_URL'
+            },
+            {
+                'key': 'BEP20_PREFER_EXPLORER',
+                'label': 'settings.field.BEP20_PREFER_EXPLORER',
+                'type': 'boolean',
+                'default': 'False',
+                'description': 'settings.desc.BEP20_PREFER_EXPLORER'
+            },
+            {
+                'key': 'ERC20_PREFER_EXPLORER',
+                'label': 'settings.field.ERC20_PREFER_EXPLORER',
+                'type': 'boolean',
+                'default': 'True',
+                'description': 'settings.desc.ERC20_PREFER_EXPLORER'
+            },
+            {
+                'key': 'USDT_AMOUNT_SUFFIX_DECIMALS',
+                'label': 'settings.field.USDT_AMOUNT_SUFFIX_DECIMALS',
+                'type': 'number',
+                'default': 6,
+                'description': 'settings.desc.USDT_AMOUNT_SUFFIX_DECIMALS'
             },
             {
                 'key': 'USDT_PAY_CONFIRM_SECONDS',
@@ -1680,20 +2022,6 @@ CONFIG_SCHEMA = {
                 'description': 'Credits per AI strategy/indicator code generation (higher token usage)'
             },
             {
-                'key': 'BILLING_COST_AI_INDICATOR_TO_STRATEGY',
-                'label': 'AI Indicator-to-Strategy Cost',
-                'type': 'number',
-                'default': '30',
-                'description': 'Credits per AI conversion from a chart-only indicator into an executable script strategy'
-            },
-            {
-                'key': 'BILLING_COST_AI_TUNING',
-                'label': 'AI Parameter Tuning Cost',
-                'type': 'number',
-                'default': '50',
-                'description': 'Credits per AI parameter tuning run (multi-round model calls plus backtests)'
-            },
-            {
                 'key': 'BILLING_COST_AI_COPILOT_CHAT',
                 'label': 'AI Copilot Chat Cost',
                 'type': 'number',
@@ -1708,11 +2036,18 @@ CONFIG_SCHEMA = {
                 'description': 'Extra credits charged when a Copilot message includes chart images'
             },
             {
-                'key': 'BILLING_COST_AI_COPILOT_RADAR',
-                'label': 'AI Copilot Radar Cost',
+                'key': 'BILLING_COST_AI_DECISION_FILTER',
+                'label': 'settings.field.BILLING_COST_AI_DECISION_FILTER',
                 'type': 'number',
-                'default': '20',
-                'description': 'Credits per AI opportunity radar / market scan request'
+                'default': '1',
+                'description': 'settings.desc.BILLING_COST_AI_DECISION_FILTER'
+            },
+            {
+                'key': 'BILLING_COST_EVENT_RADAR',
+                'label': 'settings.field.BILLING_COST_EVENT_RADAR',
+                'type': 'number',
+                'default': '5',
+                'description': 'settings.desc.BILLING_COST_EVENT_RADAR'
             },
             {
                 'key': 'MARKETPLACE_PLATFORM_FEE_RATE',
@@ -1735,6 +2070,41 @@ CONFIG_SCHEMA = {
                 'default': '50',
                 'description': 'Credits awarded to referrer for each signup'
             },
+            {
+                'key': 'FREE_USER_STRATEGY_LIMIT',
+                'label': 'settings.field.FREE_USER_STRATEGY_LIMIT',
+                'type': 'number',
+                'default': '5',
+                'description': 'settings.desc.FREE_USER_STRATEGY_LIMIT'
+            },
+            {
+                'key': 'REFERRAL_PROGRAM_ENABLED',
+                'label': 'settings.field.REFERRAL_PROGRAM_ENABLED',
+                'type': 'boolean',
+                'default': False,
+                'description': 'settings.desc.REFERRAL_PROGRAM_ENABLED'
+            },
+            {
+                'key': 'REFERRAL_REWARD_RATES',
+                'label': 'settings.field.REFERRAL_REWARD_RATES',
+                'type': 'text',
+                'default': '10,5,3',
+                'description': 'settings.desc.REFERRAL_REWARD_RATES'
+            },
+            {
+                'key': 'REFERRAL_REWARD_HOLD_DAYS',
+                'label': 'settings.field.REFERRAL_REWARD_HOLD_DAYS',
+                'type': 'number',
+                'default': '7',
+                'description': 'settings.desc.REFERRAL_REWARD_HOLD_DAYS'
+            },
+            {
+                'key': 'REFERRAL_MIN_WITHDRAWAL_USD',
+                'label': 'settings.field.REFERRAL_MIN_WITHDRAWAL_USD',
+                'type': 'number',
+                'default': '10',
+                'description': 'settings.desc.REFERRAL_MIN_WITHDRAWAL_USD'
+            },
         ]
     },
 
@@ -1756,6 +2126,16 @@ def _schema_with_advanced_flags():
     return annotated
 
 
+def _effective_schema(env_values=None):
+    """Return only operator-safe settings curated for the admin UI.
+
+    Deployment, database, container, and observability variables remain in the
+    dotenv file because changing them from a running application cannot be
+    applied safely or atomically.
+    """
+    return _schema_with_advanced_flags()
+
+
 @settings_blp.route('/schema', methods=['GET'])
 @login_required
 @admin_required
@@ -1764,7 +2144,7 @@ def get_settings_schema():
     return jsonify({
         'code': 1,
         'msg': 'success',
-        'data': _schema_with_advanced_flags()
+        'data': _effective_schema()
     })
 
 
@@ -1772,11 +2152,11 @@ def get_settings_schema():
 @login_required
 def get_public_config():
     """Return non-sensitive config values needed by frontend widgets."""
-    from app.config.data_sources import CCXTConfig
+    from app.config.data_sources import CryptoPublicConfig
     return jsonify({
         'code': 1,
         'data': {
-            'ccxt_default_exchange': (CCXTConfig.DEFAULT_EXCHANGE or 'binance').lower(),
+            'crypto_public_default_exchange': (CryptoPublicConfig.DEFAULT_EXCHANGE or 'binance').lower(),
         }
     })
 
@@ -1824,8 +2204,9 @@ def get_settings_values():
         clear_config_cache()
         reload_runtime_env()
 
+    schema = _effective_schema(env_values)
     result = {}
-    for group_key, group in CONFIG_SCHEMA.items():
+    for group_key, group in schema.items():
         result[group_key] = {}
         for item in group['items']:
             key = item['key']
@@ -1909,13 +2290,14 @@ def save_settings():
             return jsonify({'code': 0, 'msg': 'Invalid request payload'})
         
         current_env = read_env_file()
+        effective_schema = _effective_schema(current_env)
         
         updates = {}
         for group_key, group_values in data.items():
-            if group_key not in CONFIG_SCHEMA:
+            if group_key not in effective_schema:
                 continue
             
-            for item in CONFIG_SCHEMA[group_key]['items']:
+            for item in effective_schema[group_key]['items']:
                 key = item['key']
                 if key in group_values:
                     new_value = group_values[key]
@@ -1925,6 +2307,29 @@ def save_settings():
                             updates[key] = ''
                     else:
                         updates[key] = str(new_value)
+
+        if 'REFERRAL_REWARD_RATES' in updates:
+            try:
+                rate_tokens = [token for token in re.split(r'[,，;；\s]+', updates['REFERRAL_REWARD_RATES']) if token]
+                rates = [float(token.rstrip('%')) for token in rate_tokens]
+                if not rates or len(rates) > 3 or any(rate < 0 or rate > 100 for rate in rates) or sum(rates) > 100:
+                    raise ValueError
+            except (TypeError, ValueError):
+                return jsonify({'code': 0, 'msg': 'settings.invalidReferralRewardRates'}), 400
+        for positive_key in ('FREE_USER_STRATEGY_LIMIT', 'REFERRAL_MIN_WITHDRAWAL_USD'):
+            if positive_key in updates:
+                try:
+                    if float(updates[positive_key]) <= 0:
+                        raise ValueError
+                except (TypeError, ValueError):
+                    return jsonify({'code': 0, 'msg': 'settings.invalidPositiveValue'}), 400
+        if 'REFERRAL_REWARD_HOLD_DAYS' in updates:
+            try:
+                hold_days = int(float(updates['REFERRAL_REWARD_HOLD_DAYS']))
+                if hold_days < 0 or hold_days > 365:
+                    raise ValueError
+            except (TypeError, ValueError):
+                return jsonify({'code': 0, 'msg': 'settings.invalidRewardHoldDays'}), 400
 
         admin_email_sync = None
         if 'ADMIN_EMAIL' in updates:
@@ -1963,11 +2368,31 @@ def save_settings():
         from app.services.settings.custom_llm_profiles import reconcile_on_save
 
         updates = reconcile_on_save(current_env, updates)
+        updates = {
+            key: value
+            for key, value in updates.items()
+            if str(current_env.get(key, '')) != str(value)
+        }
+
+        if not updates:
+            return jsonify({
+                'code': 1,
+                'msg': 'settings.alreadyUpToDate',
+                'data': {
+                    'updated_keys': [],
+                    'restart_required_keys': [],
+                    'hot_reloaded_keys': [],
+                    'requires_restart': False,
+                    'hot_reloaded': False,
+                    'services_refreshed': False,
+                }
+            })
+
         current_env.update(updates)
         
         if write_env_file(current_env):
             restart_keys = sorted(RESTART_REQUIRED_SETTINGS.intersection(updates))
-            hot_reload_keys = sorted(set(updates) - RESTART_REQUIRED_SETTINGS)
+            hot_reload_keys = sorted(set(updates) - set(restart_keys))
 
             # Runtime reload preserves process-group security roots. Skip the
             # reload entirely when every changed value requires a restart.

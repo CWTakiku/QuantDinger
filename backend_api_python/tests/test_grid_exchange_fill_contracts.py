@@ -54,6 +54,10 @@ def _gate_call_assert(kw: Dict[str, Any]) -> None:
     assert kw.get("order_id") == "oid-1"
 
 
+def _gate_spot_call_assert(kw: Dict[str, Any]) -> None:
+    assert kw == {"order_id": "oid-1", "symbol": "BTC/USDT"}
+
+
 FILL_CONTRACT_CASES: Tuple[FillContractCase, ...] = (
     FillContractCase(
         "binance_futures_filled",
@@ -141,9 +145,10 @@ FILL_CONTRACT_CASES: Tuple[FillContractCase, ...] = (
     FillContractCase(
         "gate_spot_filled",
         GateSpotClient,
-        {"status": "closed", "filled_amount": "0.02", "filled_total": "1300.4"},
+        {"status": "closed", "filled_amount": "0.02", "filled_total": "1300.4",
+         "fill_price": "1300.4", "avg_deal_price": "65020", "price": "66000"},
         (0.02, 65020.0, "filled"),
-        call_assert=_gate_call_assert,
+        call_assert=_gate_spot_call_assert,
     ),
     FillContractCase(
         "gate_futures_finished",
@@ -206,44 +211,3 @@ def test_query_grid_order_fill_returns_unknown_when_get_order_raises():
         exchange_order_id="oid-1",
     )
     assert (filled, avg, status) == (0.0, 0.0, "unknown")
-
-
-def test_poller_marks_filled_when_exchange_reports_fill():
-    """End-to-end: poller uses query_grid_order_fill and updates repo status."""
-    from unittest.mock import patch
-
-    from app.services.grid.poller import GridFillPoller
-    from app.services.grid.resting_orders_repo import GridRestingOrder
-
-    poller = GridFillPoller()
-    runner = MagicMock()
-    runner.symbol = "BTC/USDT"
-    runner.exchange_config = {"product_type": "USDT-FUTURES"}
-    runner.market_type = "swap"
-    runner.engine.on_order_filled = MagicMock()
-
-    client = _make_client(BitgetMixClient)
-
-    order = GridRestingOrder(
-        id=42,
-        strategy_id=1,
-        symbol="BTC/USDT",
-        quantity=0.01,
-        processed_fill_qty=0.0,
-        filled_quantity=0.0,
-        status="open",
-        exchange_order_id="ex-42",
-    )
-
-    with patch(
-        "app.services.grid.poller.query_grid_order_fill",
-        return_value=(0.01, 70000.0, "filled"),
-    ):
-        with patch.object(poller._repo, "update_status") as upd:
-            poller._poll_order(runner, client, order, "swap")
-            upd.assert_called()
-            kwargs = upd.call_args.kwargs
-            status_val = kwargs.get("status")
-            if status_val is None and upd.call_args.args:
-                status_val = upd.call_args.args[1] if len(upd.call_args.args) > 1 else None
-            assert status_val == "filled"

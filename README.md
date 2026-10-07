@@ -12,7 +12,7 @@
   <p>
     <a href="README.md"><strong>English</strong></a>
     ·
-    <a href="docs/README_CN.md"><strong>简体中文</strong></a>
+    <a href="README_CN.md"><strong>简体中文</strong></a>
     ·
     <a href="docs/api/README.md"><strong>API</strong></a>
     ·
@@ -24,7 +24,7 @@
     ·
     <a href="https://www.quantdinger.com"><strong>Website</strong></a>
     ·
-    <a href="https://www.youtube.com/watch?v=tNAZ9uMiUUw"><strong>Video Demo</strong></a>
+    <a href="#watch-quantdinger-in-action"><strong>Video Demo</strong></a>
     ·
     <a href="mailto:support@quantdinger.com"><strong>Official Support Email</strong></a>
   </p>
@@ -41,8 +41,14 @@
     <img src="docs/badges/python-3.12.svg" alt="Python 3.12">
     <img src="https://img.shields.io/badge/PostgreSQL-18-4169E1?style=flat-square&logo=postgresql&logoColor=white" alt="PostgreSQL 18">
     <img src="https://img.shields.io/badge/Redis-8-DC382D?style=flat-square&logo=redis&logoColor=white" alt="Redis 8">
+    <a href="#jev-powered-pre-trade-decisions"><img src="https://img.shields.io/badge/JEV-Pre--trade%20Decisions-7C3AED?style=flat-square" alt="JEV pre-trade decisions"></a>
     <img src="docs/badges/docker-compose.svg" alt="Docker Compose">
     <a href="https://github.com/OpenByteInc/QuantDinger/releases/latest"><img src="docs/badges/latest-release.svg" alt="Latest release"></a>
+  </p>
+
+  <p>
+    <a href="https://github.com/orgs/OpenByteInc/projects/1"><img src="https://img.shields.io/github/issues/OpenByteInc/QuantDinger/roadmap?style=flat-square&label=Roadmap%20items&color=5319E7" alt="Open roadmap items"></a>
+    <a href="https://github.com/orgs/OpenByteInc/projects/1/views/4"><img src="https://img.shields.io/github/issues/OpenByteInc/QuantDinger/ready%20for%20contributors?style=flat-square&label=Ready%20tasks&color=0E8A16" alt="Tasks ready for contributors"></a>
   </p>
 
   <p><sub>SUPPORTED BY</sub></p>
@@ -63,10 +69,20 @@
   </p>
 </div>
 
+> **Want to contribute?** Explore the
+> [public roadmap](https://github.com/orgs/OpenByteInc/projects/1) or claim a
+> scoped task from [Ready for contributors](https://github.com/orgs/OpenByteInc/projects/1/views/4).
+
 > QuantDinger can submit real orders when live trading is explicitly enabled.
 > Start with paper trading, use restricted API keys, and review the risk and
 > compliance requirements for your jurisdiction. This project does not provide
 > investment advice.
+
+## Watch QuantDinger in action
+
+<p align="center">
+  <img src="docs/screenshots/quantdinger-v5-2x.gif" alt="QuantDinger product demo at 2× speed" width="800">
+</p>
 
 ## What QuantDinger is
 
@@ -86,6 +102,20 @@ The project combines:
 
 It is not a black-box signal service. Strategy code, risk settings, credentials,
 and deployment remain under the operator's control.
+
+### Strategy evolution and signal-only virtual accounts
+
+- **Strategy evolution** searches declared tunable parameters with random,
+  grid, or TPE optimization, using bar-count walk-forward validation and a final
+  blind holdout. Jobs run asynchronously with per-strategy history, automatic
+  pruning, composite scoring, PBO, Deflated Sharpe, block-bootstrap Monte Carlo,
+  and transaction-cost stress tests. Results compare parameter robustness; they
+  do not forecast future returns.
+- **Signal-only virtual accounts** turn notification-mode signals into internal
+  virtual orders, fills, positions, trade records, PnL, and an equity curve. They
+  never connect to a broker or submit live orders. Each fill uses a fixed 0.05%
+  commission on executed notional and 0.05% adverse slippage; leverage is not
+  charged a second time in the commission calculation.
 
 ## What changed in v5
 
@@ -110,13 +140,13 @@ same semantic version with a leading `v`, for example `v5.0.1`.
 ## Architecture
 
 <p align="center">
-  <img src="docs/screenshots/architecture-v5.png" alt="QuantDinger v5 architecture covering clients, Agent Gateway, core platform, workers, infrastructure, observability, and the closed-loop trading workflow" width="100%">
+  <img src="docs/screenshots/architecture-v5.png" alt="QuantDinger v5 architecture covering clients, Agent Gateway, core platform, distributed runtime workers, Kafka, infrastructure, observability, and the closed-loop trading workflow" width="100%">
 </p>
 
-<p align="center"><sub>The editable source is available as <a href="docs/screenshots/architecture-v5.svg">architecture-v5.svg</a>.</sub></p>
+<p align="center"><sub>The editable source is <a href="docs/screenshots/architecture-v5.svg">architecture-v5.svg</a>; the Mermaid topology below is the detailed runtime source of truth.</sub></p>
 
-The diagram above shows the complete product and process architecture. The
-runtime topology below focuses on container-to-container ownership and data flow.
+The static diagram above is the product-level view. The runtime topology below
+is the current source of truth for container ownership and event/data flow.
 
 ```mermaid
 flowchart TB
@@ -126,7 +156,11 @@ flowchart TB
     PG[("PostgreSQL")]
     CACHE[("Redis cache")]
     JOBS[("Redis jobs")]
-    TW["Trading worker"]
+    KAFKA[("Kafka event backbone")]
+    TW["Trading workers\ncontrol, realtime, execution, grid actors"]
+    DISPATCH["Strategy dispatcher workers"]
+    EVAL["Strategy evaluator workers\nhot bar runtimes"]
+    AUDIT["Kafka audit worker"]
     SW["Scheduler worker"]
     CW["Celery worker"]
     BEAT["Celery beat"]
@@ -138,7 +172,13 @@ flowchart TB
     API --> PG
     API --> CACHE
     API -->|"durable commands"| PG
-    TW -->|"leases, orders, heartbeats"| PG
+    TW -->|"leases, order intents, fills, grid actor state"| PG
+    TW -->|"closed bars and lifecycle events"| KAFKA
+    KAFKA --> DISPATCH --> KAFKA
+    KAFKA --> EVAL
+    EVAL -->|"inbox, leases, checkpoints, order intents"| PG
+    KAFKA --> AUDIT --> PG
+    PG -->|"owned pending orders"| TW
     SW -->|"schedules, monitoring, heartbeats"| PG
     API -->|"finite async jobs"| JOBS
     BEAT --> JOBS --> CW
@@ -156,8 +196,12 @@ One backend image is reused by several containers with different commands:
 | Process | Responsibility |
 | --- | --- |
 | `migration` | Applies the database schema and exits before application services start. |
+| `kafka-init` | Creates the versioned runtime topics and exits before event consumers start. |
 | `backend` | Handles HTTP, authentication, validation, and durable command submission. |
-| `trading-worker` | Owns strategy runtimes, pending orders, broker sessions, and reconciliation. |
+| `trading-worker` | Owns control/realtime runtimes, exchange sessions, the fenced order gateway, reconciliation, and durable grid actors. |
+| `strategy-dispatcher-worker` | Converts closed-bar events into stable strategy-shard evaluation batches. |
+| `strategy-evaluator-worker` | Owns hot distributed bar runtimes and evaluates fenced strategy inbox events. |
+| `kafka-audit-worker` | Validates and records the versioned event stream independently of execution. |
 | `scheduler-worker` | Runs portfolio, deployment, payment, and signal schedules. |
 | `celery-worker` | Executes finite AI, backtest, experiment, report, and maintenance jobs. |
 | `celery-beat` | Dispatches periodic Celery tasks. |
@@ -165,6 +209,8 @@ One backend image is reused by several containers with different commands:
 See [Backend process roles](docs/architecture/PROCESS_ROLES_AND_TASKS.md),
 [architecture](docs/architecture/ARCHITECTURE.md), and
 [concurrency model](docs/architecture/CONCURRENCY_MODEL.md) for the ownership rules.
+Use the [distributed runtime deployment and scaling guide](docs/deployment/DISTRIBUTED_RUNTIME_SCALING.md)
+before changing replica counts or moving the stack to multiple hosts.
 
 ## Quick start
 
@@ -213,9 +259,8 @@ credential is not suitable for an internet-facing deployment; change it before
 first start or immediately after the first login. The one-command installer does
 not accept `123456` as the chosen password.
 
-The Settings UI writes runtime configuration to `/app/.env`. In the GHCR stack
-this is the host `backend.env`; in a source deployment it is
-`backend_api_python/.env`. Current backend images automatically give runtime UID
+The Settings UI writes runtime configuration to `/app/.env`, which is the
+project-root `.env` on the host for both GHCR and source deployments. Current backend images automatically give runtime UID
 `10001` ownership and keep mode `600`. Do not use `chmod 755` or recursive `777`:
 these files contain passwords and API keys, and `755` still does not grant write
 access to UID `10001` when root owns the file.
@@ -239,16 +284,28 @@ legacy-image recovery and rootless/NFS notes.
 ```bash
 git clone https://github.com/OpenByteInc/QuantDinger.git
 cd QuantDinger
-cp backend_api_python/env.example backend_api_python/.env
 cp .env.example .env
 ```
 
-Before the first start, replace the example values in both environment files:
+Before the first start, replace the example values in the unified environment file:
 
 | File | Required production values |
 | --- | --- |
-| `backend_api_python/.env` | `SECRET_KEY`, `CREDENTIAL_ENCRYPTION_KEY`, `ADMIN_USER`, `ADMIN_PASSWORD` |
-| `.env` | `POSTGRES_PASSWORD`, `REDIS_PASSWORD`, `CELERY_REDIS_PASSWORD`, `GRAFANA_ADMIN_PASSWORD` |
+| `.env` | `SECRET_KEY`, `CREDENTIAL_ENCRYPTION_KEY`, administrator, PostgreSQL, Redis, and Grafana credentials |
+
+After an update, `docker compose up` runs the one-shot `env-sync` service before
+database and Kafka initialization. It appends newly introduced settings, imports
+missing values from the legacy backend env files, preserves existing values and
+comments, and creates a timestamped backup only when the unified file changes.
+The command below remains available for a manual preview or maintenance run:
+
+```bash
+python scripts/sync_env.py --env-file .env --template .env.example --backup
+```
+
+For a manual one-time migration from older releases, add
+`--legacy backend_api_python/.env` (source deployment) or `--legacy backend.env`
+(old GHCR deployment). The old file is not deleted.
 
 Generate independent secrets with:
 
@@ -277,8 +334,7 @@ Validate secrets before starting a production stack:
 
 ```bash
 python backend_api_python/scripts/check_production_config.py \
-  --env-file .env \
-  --env-file backend_api_python/.env
+  --env-file .env
 ```
 
 Start the hardened runtime with optional observability:
@@ -375,6 +431,92 @@ Start with the [Indicator guide](docs/trading/INDICATOR_DEV_GUIDE.md),
 [Strategy guide](docs/trading/STRATEGY_DEV_GUIDE.md), and
 [Extension guide](docs/architecture/EXTENSION_GUIDE.md).
 
+## JEV-powered pre-trade decisions
+
+QuantDinger can place a structured AI decision gate directly in front of live
+entry orders. Enable **AI Decision Filter** when creating a regular live
+strategy, or turn it on in Quick Trade. Before an entry reaches the exchange,
+QuantDinger sends the order, strategy context, exposure, positions, and budget
+state to [TypeSafe Jev](https://docs.typesafe.ai/introduction). Jev returns typed
+Choice results, probabilities, and confidence instead of prose that must be
+parsed. The app shows the provider, checks, result, confidence, latency, and
+reason in an auditable decision timeline.
+
+| Previous LLM-only gate | JEV decision gate |
+| --- | --- |
+| Generate prose or JSON and recover a decision through parsing | Receive a typed Choice with the selected outcome, full probabilities, and confidence |
+| One opaque answer is difficult to inspect after execution | Independent entry and risk checks are stored with the order context and latency |
+| Provider failure can accidentally block position management | Provider failure is audited and fails open, while every exit bypasses AI |
+
+The execution policy stays in QuantDinger code: rejected entries never reach
+the exchange; exits, stop-loss, take-profit, and emergency actions bypass the
+filter. Grid, DCA, and martingale runtimes are excluded from this first version.
+When Jev is not configured, QuantDinger tries the configured LLM. If no AI
+provider is available, the order is allowed and the fail-open result is logged,
+so an AI outage cannot trap an existing position.
+
+### Decision flow
+
+```mermaid
+flowchart TD
+    A["Strategy signal / Quick Trade instruction"] --> B["Deterministic risk and order budget checks"]
+    B -->|"Basic checks fail"| R["Reject order"]
+    B -->|"Basic checks pass"| C["Build Decision Context V2"]
+
+    C --> C1["Strategy parameters and signal rationale"]
+    C --> C2["Multi-timeframe market data and indicators"]
+    C --> C3["Positions, exposure, equity, and drawdown"]
+    C --> C4["Recent PnL and consecutive losses"]
+    C --> C5["Take-profit, stop-loss, and execution conditions"]
+
+    C1 --> D
+    C2 --> D
+    C3 --> D
+    C4 --> D
+    C5 --> D
+
+    D{"JEV configured?"}
+
+    D -->|"Yes"| E["JEV System One"]
+    E --> E1["Evidence quality"]
+    E --> E2["Signal consistency"]
+    E --> E3["Market regime"]
+    E --> E4["Account risk"]
+    E --> E5["Execution quality"]
+    E --> E6["Entry decision: pass/reject"]
+
+    E1 --> F["Validate schema, probabilities, and confidence"]
+    E2 --> F
+    E3 --> F
+    E4 --> F
+    E5 --> F
+    E6 --> F
+
+    F -->|"Valid result and confidence threshold met"| G["Deterministic decision converger"]
+    F -->|"Timeout, error, invalid format, or low confidence"| H
+
+    D -->|"No"| H{"LLM configured?"}
+    H -->|"Yes"| I["LLM reads the same context"]
+    I --> J["Require strict JSON output"]
+    J --> K{"decision"}
+
+    H -->|"No"| O["Fail open and log the reason"]
+
+    G -->|"PASS"| P["Enter pending order queue"]
+    G -->|"REJECT"| R
+    K -->|"pass"| P
+    K -->|"reject"| R
+    K -->|"Invalid output or provider failure"| O
+
+    P --> Q["Submit to exchange asynchronously"]
+    R --> S["Record ai_rejected and the decision trace"]
+    O --> T["Place order normally and record provider unavailable"]
+```
+
+Configure `JEV_API_KEY`, `JEV_BASE_URL`, `JEV_MODEL`, and
+`JEV_TIMEOUT_SECONDS` in **System Settings → AI / LLM**. TypeSafe documents the
+HTTP contract at [`POST /v1/systemone`](https://docs.typesafe.ai/introduction/quickstart).
+
 ## AI agents and MCP
 
 The Agent Gateway is exposed under `/api/agent/v1`. The included MCP server lets
@@ -438,11 +580,15 @@ QuantDinger/
 |   |   |-- openapi/                   OpenAPI schemas, tags, registration, and export support
 |   |   |-- services/                  Domain workflows and third-party integrations
 |   |   |   |-- backtest_engine/       Backtest execution components
+|   |   |   |-- factors/               Point-in-time factor research and diagnostics
+|   |   |   |-- strategy_evolution/    Parameter search, walk-forward validation, and robustness tests
+|   |   |   |-- pending_orders/        Queued order submission, recovery, and reconciliation
 |   |   |   |-- live_trading/          Normalized crypto exchange adapters
 |   |   |   |-- alpaca_trading/        Alpaca broker integration
 |   |   |   |-- ibkr_trading/          Interactive Brokers integration
 |   |   |   |-- strategy_runtime/      Strategy signals, intents, execution, and state
-|   |   |   `-- strategy_v2/           Versioned strategy contracts and runtime services
+|   |   |   |-- strategy_v2/           Versioned strategy contracts and runtime services
+|   |   |   `-- virtual_trading.py     Isolated signal-mode account, positions, and fills
 |   |   |-- data_sources/              Raw market-data source adapters
 |   |   |-- data_providers/            Aggregated market, macro, news, and sentiment providers
 |   |   |-- markets/                   Market and symbol normalization
@@ -461,8 +607,12 @@ QuantDinger/
 |   |-- architecture/                  Boundaries, concurrency, API, and extension design
 |   |-- deployment/                    Installation, production, and observability operations
 |   |-- trading/                       Strategy and indicator development guides
+|   |-- strategies/                    Strategy authoring and validation references
 |   |-- api/                           Human API documentation
-|   `-- agent/                         Agent Gateway and MCP documentation
+|   |-- agent/                         Agent Gateway and MCP documentation
+|   |-- getting-started/               Onboarding and first-run guides
+|   |-- product/                       Product workflows and feature documentation
+|   `-- security/                      Security model and operational guidance
 |-- mcp_server/                        Standalone QuantDinger MCP server package
 |   |-- src/quantdinger_mcp/           MCP server and security implementation
 |   `-- tests/                         MCP contract and security tests
@@ -541,24 +691,8 @@ before opening a pull request. Keep routes thin, preserve API compatibility,
 place long-running behavior in the correct process, and include focused tests
 for high-risk changes.
 
-## Exchange partner links
-
-These are referral links. QuantDinger may receive a commission or trading-fee
-rebate when a user registers through one of them. This does not add a separate
-charge to the user; eligibility and terms are controlled by each venue and may
-change. Always verify the destination domain before creating an account.
-
-The same links are available in the application under **Profile → Open account**
-and **Broker Accounts → Open account**.
-
-| Exchange | Signup link |
-| --- | --- |
-| Binance | [Register](https://www.bsmkweb.cc/register?ref=QUANTDINGER) |
-| Bitget | [Register](https://partner.hdmune.cn/bg/7r4xz8kd) |
-| Bybit | [Register](https://partner.bybit.com/b/DINGER) |
-| OKX | [Register](https://www.xqmnobxky.com/join/QUANTDINGER) |
-| Gate.io | [Register](https://www.gateport.business/share/DINGER) |
-| HTX | [Register](https://www.htx.com/invite/zh-cn/1f?invite_code=dinger) |
+The [public roadmap](ROADMAP.md) lists active product themes, planning stages,
+and the process for claiming scoped contributor work.
 
 ## License and commercial terms
 
@@ -614,6 +748,7 @@ arising from use or misuse of the software.
 
 - [Website](https://www.quantdinger.com)
 - [Contributing guide](CONTRIBUTING.md)
+- [Public roadmap](ROADMAP.md)
 - [Contributors](CONTRIBUTORS.md)
 - [Report bugs or request features](https://github.com/OpenByteInc/QuantDinger/issues)
 - Email: [support@quantdinger.com](mailto:support@quantdinger.com)
@@ -655,20 +790,6 @@ We are grateful to [Atlas Cloud](https://www.atlascloud.ai/?utm_source=github&ut
 model inference and to [Amazon Web Services](https://aws.amazon.com/) for
 supporting the cloud infrastructure that helps QuantDinger serve its community.
 
-## Support the project
-
-If QuantDinger is useful to you, a GitHub star, contribution, or donation helps
-fund ongoing development and infrastructure.
-
-Crypto donation address:
-
-```text
-0x96fa4962181bea077f8c7240efe46afbe73641a7
-```
-
-Crypto transfers are irreversible. Confirm the address and intended network with
-the project maintainers before sending funds.
-
 ## Acknowledgements
 
 QuantDinger stands on top of a strong open-source ecosystem. Special thanks to
@@ -681,7 +802,6 @@ the maintainers and contributors of projects including:
 - [Redis](https://redis.io/)
 - [Pandas](https://pandas.pydata.org/)
 - [NumPy](https://numpy.org/)
-- [CCXT](https://github.com/ccxt/ccxt)
 - [yfinance](https://github.com/ranaroussi/yfinance)
 - [AkShare](https://github.com/akfamily/akshare)
 - [Vue.js](https://vuejs.org/)

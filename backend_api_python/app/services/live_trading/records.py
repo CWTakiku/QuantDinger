@@ -14,9 +14,11 @@ Live ownership:
 from __future__ import annotations
 
 import time
-from typing import Any, Dict, List, Optional, Set, Tuple, TYPE_CHECKING
+import json
+from typing import Any, Dict, List, Mapping, Optional, Set, Tuple, TYPE_CHECKING
 
 from app.utils.db import get_db_connection
+from app.utils.pnl import calc_unrealized_pnl
 
 if TYPE_CHECKING:
     from app.services.live_trading.leg_context import LegContext
@@ -33,6 +35,11 @@ def normalize_strategy_symbol(symbol: str) -> str:
     if not s:
         return ""
     if "/" in s:
+        slash_at = s.find("/")
+        settlement_at = s.find(":", slash_at + 1)
+        venue_at = s.find("@", slash_at + 1)
+        if settlement_at >= 0 and (venue_at < 0 or settlement_at < venue_at):
+            return s[:settlement_at]
         return s
     for quote in ("USDT", "USDC", "USD", "BUSD", "EUR"):
         if s.endswith(quote) and len(s) > len(quote):
@@ -84,16 +91,25 @@ def fetch_allocated_position_size(
     if side_l not in ("long", "short"):
         return 0.0
 
-    clauses = ["side = %s", "market_type = %s", "size > 0"]
+    clauses = ["p.side = %s", "p.market_type = %s", "p.size > 0"]
     params: List[Any] = [side_l, mt]
     if cred > 0 and sid > 0:
-        clauses.append("(credential_id = %s OR strategy_id = %s)")
-        params.extend([cred, sid])
+        clauses.append(
+            "(p.strategy_id = %s OR p.credential_id = %s "
+            "OR (COALESCE(p.credential_id, 0) = 0 "
+            "AND COALESCE(NULLIF(s.exchange_config::jsonb->>'credential_id', ''), "
+            "s.exchange_config::jsonb->>'credentials_id') = %s))"
+        )
+        params.extend([sid, cred, str(cred)])
     elif cred > 0:
-        clauses.append("credential_id = %s")
-        params.append(cred)
+        clauses.append(
+            "(p.credential_id = %s OR (COALESCE(p.credential_id, 0) = 0 "
+            "AND COALESCE(NULLIF(s.exchange_config::jsonb->>'credential_id', ''), "
+            "s.exchange_config::jsonb->>'credentials_id') = %s))"
+        )
+        params.extend([cred, str(cred)])
     elif sid > 0:
-        clauses.append("strategy_id = %s")
+        clauses.append("p.strategy_id = %s")
         params.append(sid)
     else:
         return 0.0
@@ -102,9 +118,11 @@ def fetch_allocated_position_size(
         cur = db.cursor()
         cur.execute(
             f"""
-            SELECT strategy_id, symbol, symbol_canonical, size
-            FROM qd_strategy_positions
+            SELECT p.strategy_id, p.symbol, p.symbol_canonical, p.size
+            FROM qd_strategy_positions p
+            JOIN qd_strategies_trading s ON s.id = p.strategy_id
             WHERE {' AND '.join(clauses)}
+              AND s.execution_mode = 'live'
             """,
             params,
         )
@@ -485,6 +503,8 @@ def record_trade(
     exchange_fill_id: str = "",
     fee_status: str = "pending",
     fee_source: str = "",
+    fees_by_ccy: Optional[Dict[str, float]] = None,
+    exchange_order_id: str = "",
 ) -> int:
     value = float(amount or 0.0) * float(price or 0.0)
     if user_id is None:
@@ -517,9 +537,9 @@ def record_trade(
              matched_entry_price, grid_matched_profit,
              market_type, credential_id, inst_id, fill_source, pending_order_id, grid_order_id,
              strategy_run_id, order_intent_id, execution_event_id, exchange_fill_id,
-             fee_status, fee_source, created_at)
+             fee_status, fee_source, commission_breakdown, exchange_order_id, created_at)
             VALUES
-            (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+            (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
             ON CONFLICT (execution_event_id) WHERE execution_event_id > 0 DO NOTHING
             RETURNING id
             """,
@@ -551,6 +571,8 @@ def record_trade(
                 str(exchange_fill_id or ""),
                 str(fee_status or "pending"),
                 str(fee_source or ""),
+                json.dumps(fees_by_ccy or ({commission_ccy: commission} if commission_ccy and commission_ccy != 'MIXED' else {})),
+                str(exchange_order_id or ''),
             ),
         )
         row = cur.fetchone()
@@ -614,6 +636,11 @@ def patch_position_markers(
     if not row or float(row.get("size") or 0.0) <= 0:
         return False
 
+    size = max(0.0, float(row.get("size") or 0.0))
+    entry_price = max(0.0, float(row.get("entry_price") or 0.0))
+    unrealized = calc_unrealized_pnl(side_l, entry_price, px, size)
+    notional = entry_price * size
+    pnl_percent = unrealized / notional * 100.0 if notional > 0 else 0.0
     hp = float(highest_price or 0.0)
     lp = float(lowest_price or 0.0)
     with get_db_connection() as db:
@@ -624,6 +651,8 @@ def patch_position_markers(
             SET current_price = %s,
                 highest_price = CASE WHEN %s > 0 THEN %s ELSE highest_price END,
                 lowest_price = CASE WHEN %s > 0 THEN %s ELSE lowest_price END,
+                unrealized_pnl = %s,
+                pnl_percent = %s,
                 updated_at = NOW()
             WHERE strategy_id = %s AND symbol = %s AND side = %s AND size > 0
             """,
@@ -633,12 +662,102 @@ def patch_position_markers(
                 hp,
                 lp,
                 lp,
+                unrealized,
+                pnl_percent,
                 int(strategy_id),
                 str(sym_key),
                 side_l,
             ),
         )
         updated = int(getattr(cur, "rowcount", 0) or 0) > 0
+        db.commit()
+        cur.close()
+    return updated
+
+
+def mark_live_positions(
+    strategy_id: int,
+    prices: Mapping[str, Any],
+) -> int:
+    """Mark one strategy ledger from venue-scoped runtime prices."""
+    normalized_prices: Dict[str, float] = {}
+    ambiguous_symbols: Set[str] = set()
+    for instrument_key, raw_price in (prices or {}).items():
+        text = str(instrument_key or "").strip()
+        if ":" in text:
+            text = text.split(":", 1)[-1]
+        symbol_key = normalize_strategy_symbol(text.split("@", 1)[0])
+        try:
+            price = float(raw_price or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if not symbol_key or price <= 0:
+            continue
+        previous = normalized_prices.get(symbol_key)
+        if previous is not None and abs(previous - price) > max(1e-10, abs(previous) * 1e-10):
+            ambiguous_symbols.add(symbol_key)
+            continue
+        normalized_prices[symbol_key] = price
+    for symbol_key in ambiguous_symbols:
+        normalized_prices.pop(symbol_key, None)
+    if not normalized_prices:
+        return 0
+
+    updated = 0
+    with get_db_connection() as db:
+        cur = db.cursor()
+        cur.execute(
+            """
+            SELECT id, symbol_canonical, symbol, side, size, entry_price
+            FROM qd_strategy_positions
+            WHERE strategy_id = %s AND size > 0
+            FOR UPDATE
+            """,
+            (int(strategy_id),),
+        )
+        rows = cur.fetchall() or []
+        for raw in rows:
+            row = dict(raw)
+            symbol_key = normalize_strategy_symbol(
+                str(row.get("symbol_canonical") or row.get("symbol") or "")
+            )
+            current_price = normalized_prices.get(symbol_key)
+            if not current_price:
+                continue
+            size = max(0.0, float(row.get("size") or 0.0))
+            entry_price = max(0.0, float(row.get("entry_price") or 0.0))
+            if size <= 1e-12 or entry_price <= 0:
+                continue
+            side = str(row.get("side") or "long").strip().lower()
+            unrealized = calc_unrealized_pnl(side, entry_price, current_price, size)
+            notional = entry_price * size
+            pnl_percent = unrealized / notional * 100.0 if notional > 0 else 0.0
+            cur.execute(
+                """
+                UPDATE qd_strategy_positions
+                SET current_price = %s,
+                    highest_price = GREATEST(COALESCE(highest_price, 0), %s),
+                    lowest_price = CASE
+                        WHEN COALESCE(lowest_price, 0) <= 0 THEN %s
+                        ELSE LEAST(lowest_price, %s)
+                    END,
+                    unrealized_pnl = %s,
+                    pnl_percent = %s,
+                    updated_at = NOW()
+                WHERE id = %s AND strategy_id = %s AND size > 0
+                """,
+                (
+                    current_price,
+                    current_price,
+                    current_price,
+                    current_price,
+                    unrealized,
+                    pnl_percent,
+                    int(row.get("id") or 0),
+                    int(strategy_id),
+                ),
+            )
+            updated += int(cur.rowcount or 0)
         db.commit()
         cur.close()
     return updated

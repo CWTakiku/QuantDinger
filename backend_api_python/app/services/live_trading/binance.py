@@ -7,6 +7,9 @@ API docs (reference):
 
 from __future__ import annotations
 
+from app.services.live_trading.binance_fees import aggregate_commissions
+from app.services.live_trading.fill_evidence import binance_execution_average
+
 import hashlib
 import hmac
 import logging
@@ -16,6 +19,7 @@ from typing import Any, Dict, Optional, Tuple
 from urllib.parse import urlencode
 
 from app.services.live_trading.base import BaseRestClient, LiveOrderResult, LiveTradingError
+from app.utils.numeric_precision import floor_decimal_to_step, format_decimal
 
 logger = logging.getLogger(__name__)
 from app.services.live_trading.symbols import to_binance_futures_symbol
@@ -23,6 +27,12 @@ from app.services.live_trading.symbols import to_binance_futures_symbol
 
 class BinanceFuturesClient(BaseRestClient):
     _BROKER_ID = "HBpUbQjT"
+
+    @staticmethod
+    def _fee_status(fees: Dict[str, float]) -> str:
+        if not fees:
+            return "pending"
+        return "actual" if any(abs(value) > 1e-18 for value in fees.values()) else "actual_zero"
 
     def __init__(self, *, api_key: str, secret_key: str, base_url: str = None, enable_demo_trading: bool = False, timeout_sec: float = 15.0, broker_id: str = ""):
         if not base_url:
@@ -150,21 +160,7 @@ class BinanceFuturesClient(BaseRestClient):
 
     @staticmethod
     def _floor_to_step(value: Decimal, step: Decimal) -> Decimal:
-        if step is None:
-            return value
-        if value <= 0:
-            return Decimal("0")
-        try:
-            st = Decimal(step)
-        except Exception:
-            st = Decimal("0")
-        if st <= 0:
-            return value
-        try:
-            n = (value / st).to_integral_value(rounding=ROUND_DOWN)
-            return n * st
-        except Exception:
-            return Decimal("0")
+        return floor_decimal_to_step(value, step)
 
     def _sign(self, query_string: str) -> str:
         sig = hmac.new(self.secret_key.encode("utf-8"), query_string.encode("utf-8"), hashlib.sha256).hexdigest()
@@ -354,7 +350,7 @@ class BinanceFuturesClient(BaseRestClient):
             return value
         try:
             q = Decimal("1").scaleb(-p)  # 1e-precision
-            return value.quantize(q, rounding=ROUND_DOWN)
+            return floor_decimal_to_step(value, q)
         except Exception:
             return value
 
@@ -446,7 +442,7 @@ class BinanceFuturesClient(BaseRestClient):
         """
         return self._signed_request("GET", "/fapi/v2/account", params={})
 
-    def get_user_trades(self, *, symbol: str, order_id: str = "", limit: int = 100) -> Any:
+    def get_user_trades(self, *, symbol: str, order_id: str = "", limit: int = 100, end_time_ms: int = 0) -> Any:
         """
         Fetch user trades (fills).
 
@@ -466,9 +462,28 @@ class BinanceFuturesClient(BaseRestClient):
         except Exception:
             lim = 100
         lim = max(1, min(1000, lim))
+        if end_time_ms > 0:
+            params["endTime"] = int(end_time_ms)
+            params["startTime"] = max(0, int(end_time_ms) - 7 * 86400000 + 1)
         params["limit"] = lim
         data = self._signed_request("GET", "/fapi/v1/userTrades", params=params)
-        return data
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict) and isinstance(data.get("raw"), list):
+            return data["raw"]
+        return []
+
+    def get_open_orders(self, *, symbol: str = "") -> Any:
+        """Return current USD-M futures orders, optionally scoped to one symbol."""
+        params: Dict[str, Any] = {}
+        if symbol:
+            params["symbol"] = to_binance_futures_symbol(symbol)
+        data = self._signed_request("GET", "/fapi/v1/openOrders", params=params)
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict) and isinstance(data.get("raw"), list):
+            return data["raw"]
+        return []
 
     def get_fee_for_order(self, *, symbol: str, order_id: str, max_retries: int = 3) -> Tuple[float, str]:
         """
@@ -495,7 +510,7 @@ class BinanceFuturesClient(BaseRestClient):
                     fee = 0.0
                 ccy = str(t.get("commissionAsset") or "").strip()
                 if fee != 0.0:
-                    total_fee += abs(float(fee))
+                    total_fee += float(fee)
                     if (not fee_ccy) and ccy:
                         fee_ccy = ccy
             if total_fee > 0 or attempt >= max_retries - 1:
@@ -672,80 +687,89 @@ class BinanceFuturesClient(BaseRestClient):
             except Exception:
                 filled = 0.0
 
-            avg_price = 0.0
-            try:
-                if last.get("avgPrice") is not None and str(last.get("avgPrice")).strip() != "":
-                    avg_price = float(last.get("avgPrice") or 0.0)
-            except Exception:
-                avg_price = 0.0
-            if avg_price <= 0 and filled > 0:
-                try:
-                    cum_quote = float(last.get("cumQuote") or 0.0)
-                    if cum_quote > 0:
-                        avg_price = cum_quote / filled
-                except Exception:
-                    pass
-            if avg_price <= 0:
-                try:
-                    avg_price = float(last.get("price") or 0.0)
-                except Exception:
-                    avg_price = 0.0
+            avg_price = binance_execution_average(last)
 
             if filled > 0 and avg_price > 0:
-                fee, fee_ccy, fees = self._fetch_commission_for_order(symbol=symbol, order_id=order_id, filled=filled, avg_price=avg_price)
-                return {"filled": filled, "avg_price": avg_price, "fee": fee, "fee_ccy": fee_ccy, "fees_by_ccy": fees, "status": status, "order": last}
+                fee, fee_ccy, fees = self._fetch_commission_for_order(
+                    symbol=symbol,
+                    order_id=order_id,
+                    filled=filled,
+                    avg_price=avg_price,
+                    max_attempts=1 if float(max_wait_sec or 0.0) <= 0 else 3,
+                    warn_missing=float(max_wait_sec or 0.0) > 0,
+                    order_time_ms=int(last.get("updateTime") or last.get("time") or 0),
+                )
+                return {"filled": filled, "avg_price": avg_price, "fee": fee, "fee_ccy": fee_ccy, "fees_by_ccy": fees, "fee_status": self._fee_status(fees), "status": status, "order": last}
 
             if status in ("FILLED", "CANCELED", "EXPIRED", "REJECTED"):
                 fee, fee_ccy, fees = 0.0, "", {}
                 if filled > 0:
-                    fee, fee_ccy, fees = self._fetch_commission_for_order(symbol=symbol, order_id=order_id, filled=filled, avg_price=avg_price)
-                return {"filled": filled, "avg_price": avg_price, "fee": fee, "fee_ccy": fee_ccy, "fees_by_ccy": fees, "status": status, "order": last}
+                    fee, fee_ccy, fees = self._fetch_commission_for_order(
+                        symbol=symbol,
+                        order_id=order_id,
+                        filled=filled,
+                        avg_price=avg_price,
+                        max_attempts=1 if float(max_wait_sec or 0.0) <= 0 else 3,
+                        warn_missing=float(max_wait_sec or 0.0) > 0,
+                        order_time_ms=int(last.get("updateTime") or last.get("time") or 0),
+                    )
+                return {"filled": filled, "avg_price": avg_price, "fee": fee, "fee_ccy": fee_ccy, "fees_by_ccy": fees, "fee_status": self._fee_status(fees), "status": status, "order": last}
 
             if time.time() >= end_ts:
                 fee, fee_ccy, fees = 0.0, "", {}
                 if filled > 0:
-                    fee, fee_ccy, fees = self._fetch_commission_for_order(symbol=symbol, order_id=order_id, filled=filled, avg_price=avg_price)
-                return {"filled": filled, "avg_price": avg_price, "fee": fee, "fee_ccy": fee_ccy, "fees_by_ccy": fees, "status": status, "order": last}
+                    fee, fee_ccy, fees = self._fetch_commission_for_order(
+                        symbol=symbol,
+                        order_id=order_id,
+                        filled=filled,
+                        avg_price=avg_price,
+                        max_attempts=1 if float(max_wait_sec or 0.0) <= 0 else 3,
+                        warn_missing=float(max_wait_sec or 0.0) > 0,
+                        order_time_ms=int(last.get("updateTime") or last.get("time") or 0),
+                    )
+                return {"filled": filled, "avg_price": avg_price, "fee": fee, "fee_ccy": fee_ccy, "fees_by_ccy": fees, "fee_status": self._fee_status(fees), "status": status, "order": last}
             time.sleep(float(poll_interval_sec or 0.5))
 
-    def _fetch_commission_for_order(self, *, symbol: str, order_id: str, filled: float, avg_price: float) -> Tuple[float, str, Dict[str, float]]:
+    def _fetch_commission_for_order(
+        self,
+        *,
+        symbol: str,
+        order_id: str,
+        filled: float,
+        avg_price: float,
+        max_attempts: int = 3,
+        warn_missing: bool = True,
+        order_time_ms: int = 0,
+    ) -> Tuple[float, str, Dict[str, float]]:
         """Fetch authoritative per-fill commission from USD-M futures trades."""
         oid = str(order_id or "").strip()
-        # Method 1: userTrades (up to 3 attempts with 1s delay)
-        for attempt in range(3):
+        attempts = max(1, int(max_attempts or 1))
+        for attempt in range(attempts):
             try:
-                trades = self.get_user_trades(symbol=symbol, order_id=oid, limit=200) if oid else []
+                window = {"end_time_ms": order_time_ms + 60000} if order_time_ms > 0 else {}
+                trades = self.get_user_trades(symbol=symbol, order_id=oid, limit=1000, **window) if oid else []
                 if not isinstance(trades, list):
                     trades = []
-                fees: Dict[str, float] = {}
-                for t in trades:
-                    if not isinstance(t, dict):
-                        continue
-                    try:
-                        c = float(t.get("commission") or 0.0)
-                    except (ValueError, TypeError):
-                        c = 0.0
-                    ccy = str(t.get("commissionAsset") or "").strip()
-                    if c != 0.0:
-                        key = ccy.upper() if ccy else "UNKNOWN"
-                        fees[key] = fees.get(key, 0.0) + abs(c)
+                fees = aggregate_commissions(trades, oid, filled)
                 if fees:
                     fee_ccy = next(iter(fees)) if len(fees) == 1 else "MIXED"
                     total_fee = sum(fees.values()) if len(fees) == 1 else 0.0
                     logger.debug("Binance fee via userTrades: %s (order=%s, attempt=%d)", fees, oid, attempt)
                     return total_fee, fee_ccy, fees
-                if attempt < 2:
+                if attempt < attempts - 1:
                     time.sleep(1.5)
             except Exception as e:
-                logger.warning("Binance userTrades fee query failed (attempt=%d): %s", attempt, e)
-                if attempt < 2:
+                log = logger.warning if warn_missing else logger.debug
+                log("Binance userTrades fee query failed (attempt=%d): %s", attempt, e)
+                if attempt < attempts - 1:
                     time.sleep(1.0)
 
         # Do not reconstruct historical fees from the account's current rate.
         # userTrades is the authoritative source for both the charged amount and
         # the actual commission asset. The reconciliation worker retries later
         # when Binance has not exposed the fill rows yet.
-        logger.warning(
+        log = logger.warning if warn_missing else logger.debug
+        log(
             "Binance userTrades has no authoritative fee yet for order=%s symbol=%s",
             oid,
             symbol,
@@ -769,7 +793,9 @@ class BinanceFuturesClient(BaseRestClient):
         q_req = float(quantity or 0.0)
         q_dec, qty_precision = self._normalize_quantity(symbol=symbol, quantity=q_req, for_market=True)
         if float(q_dec or 0) <= 0:
-            raise LiveTradingError(f"Invalid quantity (below step/minQty): requested={q_req}")
+            raise LiveTradingError(
+                f"Invalid quantity (below step/minQty): requested={format_decimal(q_req)}"
+            )
 
         # Best-effort MIN_NOTIONAL validation (common reason for "open still fails" with small qty).
         # Use markPrice as an approximation for MARKET order notional.
@@ -840,7 +866,7 @@ class BinanceFuturesClient(BaseRestClient):
                             exchange_id="binance",
                             exchange_order_id=str(raw.get("orderId") or raw.get("clientOrderId") or ""),
                             filled=float(raw.get("executedQty") or 0.0),
-                            avg_price=float(raw.get("avgPrice") or raw.get("price") or 0.0),
+                            avg_price=binance_execution_average(raw),
                             raw=raw,
                         )
                     except Exception:
@@ -856,7 +882,7 @@ class BinanceFuturesClient(BaseRestClient):
                             exchange_id="binance",
                             exchange_order_id=str(raw.get("orderId") or raw.get("clientOrderId") or ""),
                             filled=float(raw.get("executedQty") or 0.0),
-                            avg_price=float(raw.get("avgPrice") or raw.get("price") or 0.0),
+                            avg_price=binance_execution_average(raw),
                             raw=raw,
                         )
                     except Exception:
@@ -901,7 +927,7 @@ class BinanceFuturesClient(BaseRestClient):
         # Best-effort parse fill info.
         exchange_order_id = str(raw.get("orderId") or raw.get("clientOrderId") or "")
         filled = float(raw.get("executedQty") or 0.0)
-        avg_price = float(raw.get("avgPrice") or raw.get("price") or 0.0)
+        avg_price = binance_execution_average(raw)
 
         return LiveOrderResult(
             exchange_id="binance",
@@ -932,10 +958,14 @@ class BinanceFuturesClient(BaseRestClient):
             raise LiveTradingError("Invalid quantity/price")
         q_dec, qty_precision = self._normalize_quantity(symbol=symbol, quantity=q_req, for_market=False)
         if float(q_dec or 0) <= 0:
-            raise LiveTradingError(f"Invalid quantity (below step/minQty): requested={q_req}")
+            raise LiveTradingError(
+                f"Invalid quantity (below step/minQty): requested={format_decimal(q_req)}"
+            )
         px_dec = self._normalize_price(symbol=symbol, price=px)
         if float(px_dec or 0) <= 0:
-            raise LiveTradingError(f"Invalid price (bad tick/minPrice): requested={px}")
+            raise LiveTradingError(
+                f"Invalid price (bad tick/minPrice): requested={format_decimal(px)}"
+            )
 
         params: Dict[str, Any] = {
             "symbol": sym,
@@ -974,7 +1004,7 @@ class BinanceFuturesClient(BaseRestClient):
                             exchange_id="binance",
                             exchange_order_id=str(raw.get("orderId") or raw.get("clientOrderId") or ""),
                             filled=float(raw.get("executedQty") or 0.0),
-                            avg_price=float(raw.get("avgPrice") or raw.get("price") or 0.0),
+                            avg_price=binance_execution_average(raw),
                             raw=raw,
                         )
                     except Exception:
@@ -989,7 +1019,7 @@ class BinanceFuturesClient(BaseRestClient):
                             exchange_id="binance",
                             exchange_order_id=str(raw.get("orderId") or raw.get("clientOrderId") or ""),
                             filled=float(raw.get("executedQty") or 0.0),
-                            avg_price=float(raw.get("avgPrice") or raw.get("price") or 0.0),
+                            avg_price=binance_execution_average(raw),
                             raw=raw,
                         )
                     except Exception:
@@ -1001,7 +1031,7 @@ class BinanceFuturesClient(BaseRestClient):
             )
         exchange_order_id = str(raw.get("orderId") or raw.get("clientOrderId") or "")
         filled = float(raw.get("executedQty") or 0.0)
-        avg_price = float(raw.get("avgPrice") or raw.get("price") or 0.0)
+        avg_price = binance_execution_average(raw)
         return LiveOrderResult(exchange_id="binance", exchange_order_id=exchange_order_id, filled=filled, avg_price=avg_price, raw=raw)
 
     def cancel_order(self, *, symbol: str, order_id: str = "", client_order_id: str = "") -> Dict[str, Any]:

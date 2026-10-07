@@ -61,6 +61,8 @@ def normalize_member(raw: dict, *, default_market: str = "") -> dict:
     if market not in VALID_MARKETS:
         raise UniverseError("universe.invalidMarket")
     symbol = normalize_symbol(raw.get("symbol"))
+    if market in {"USStock", "CNStock", "HKStock"} and "/" in symbol:
+        raise UniverseError("universe.memberMarketMismatch")
     if market == "Crypto":
         symbol = normalize_crypto_symbol(symbol)
         if "/" not in symbol:
@@ -107,6 +109,16 @@ def normalize_members(raw_members: Iterable[dict], *, default_market: str = "") 
     return [deduped[key] for key in sorted(deduped)]
 
 
+def normalize_manual_members(market: str, raw_members: Iterable[dict]) -> list[dict]:
+    """Normalize a personal universe while enforcing a single market."""
+    if market not in VALID_MARKETS:
+        raise UniverseError("universe.invalidMarket")
+    members = normalize_members(raw_members, default_market=market)
+    if any(member["market"] != market for member in members):
+        raise UniverseError("universe.memberMarketMismatch")
+    return members
+
+
 def member_content_hash(members: Iterable[dict]) -> str:
     """Hash only canonical execution identity and optional index metadata."""
     canonical = []
@@ -137,6 +149,7 @@ class UniverseService:
             cur.execute(
                 """
                 SELECT u.*,
+                       (SELECT MIN(m.valid_from) FROM qd_universe_members m WHERE m.universe_id = u.id) AS history_from,
                        CASE WHEN u.universe_type = 'watchlist' THEN
                          (SELECT COUNT(*) FROM qd_watchlist w WHERE w.user_id = ?)
                        ELSE
@@ -163,6 +176,11 @@ class UniverseService:
     def get_universe(self, user_id: int, universe_id: int) -> dict:
         with get_db_connection() as db:
             row = self._get_visible_universe(db, user_id, universe_id)
+            cur = db.cursor()
+            cur.execute("SELECT MIN(valid_from) AS history_from FROM qd_universe_members WHERE universe_id = ?", (universe_id,))
+            row = dict(row, **(cur.fetchone() or {}))
+            cur.close()
+        row['member_count'] = len(self.resolve_members(user_id, universe_id))
         return _serialize_universe(row)
 
     def create_manual(self, user_id: int, payload: dict) -> dict:
@@ -170,10 +188,7 @@ class UniverseService:
         market = str((payload or {}).get("market") or "").strip()
         if not name or len(name) > 160:
             raise UniverseError("universe.invalidName")
-        if market not in VALID_MARKETS and market != "Mixed":
-            raise UniverseError("universe.invalidMarket")
-        default_market = "" if market == "Mixed" else market
-        members = normalize_members((payload or {}).get("members") or [], default_market=default_market)
+        members = normalize_manual_members(market, (payload or {}).get("members") or [])
         code = f"{normalize_universe_code(name)}-{uuid.uuid4().hex[:10]}"
         metadata = (payload or {}).get("metadata") if isinstance((payload or {}).get("metadata"), dict) else {}
 
@@ -204,9 +219,15 @@ class UniverseService:
         clone_name = str(name or source.get("name") or source.get("code") or "").strip()
         if not clone_name:
             raise UniverseError("universe.invalidName")
+        clone_market = str(source.get("market") or "")
+        if clone_market == "Mixed":
+            member_markets = {str(member.get("market") or "") for member in members}
+            if len(member_markets) != 1:
+                raise UniverseError("universe.memberMarketMismatch")
+            clone_market = member_markets.pop()
         return self.create_manual(user_id, {
             "name": clone_name,
-            "market": source.get("market") or "Mixed",
+            "market": clone_market,
             "members": members,
             "metadata": {
                 "cloned_from_universe_id": int(universe_id),
@@ -260,14 +281,27 @@ class UniverseService:
             universe = self._get_visible_universe(db, user_id, universe_id, require_owner=True)
             if universe.get("universe_type") not in EDITABLE_UNIVERSE_TYPES:
                 raise UniverseError("universe.readOnly", status_code=409)
-            default_market = "" if universe.get("market") == "Mixed" else str(universe.get("market") or "")
-            members = normalize_members(raw_members, default_market=default_market)
+            members = normalize_manual_members(str(universe.get("market") or ""), raw_members)
             cur = db.cursor()
             self._replace_static_members(cur, int(universe_id), members)
             cur.execute("UPDATE qd_universes SET updated_at = NOW() WHERE id = ?", (int(universe_id),))
             db.commit()
             cur.close()
         return self.resolve_members(user_id, universe_id, as_of=STATIC_START)
+
+    def delete_manual(self, user_id: int, universe_id: int) -> dict:
+        with get_db_connection() as db:
+            universe = self._get_visible_universe(db, user_id, universe_id, require_owner=True)
+            if universe.get("universe_type") not in EDITABLE_UNIVERSE_TYPES:
+                raise UniverseError("universe.readOnly", status_code=409)
+            cur = db.cursor()
+            cur.execute("DELETE FROM qd_universes WHERE id = ?", (int(universe_id),))
+            db.commit()
+            cur.close()
+        return {
+            "id": int(universe_id),
+            "code": str(universe.get("code") or ""),
+        }
 
     def resolve_members(self, user_id: int, universe_id: int, *, as_of: Any = None) -> list[dict]:
         as_of_date = parse_as_of(as_of)
@@ -371,13 +405,20 @@ class UniverseService:
                 member["market"], member["symbol"], member["exchange_id"],
                 member["market_type"], member["instrument_id"],
             )
+            period = {
+                "valid_from": member.get("valid_from"),
+                "valid_to": member.get("valid_to"),
+            }
             existing = deduped.get(key)
-            # Keep the largest weight seen in-range so universe_top_n fetch
-            # does not drop historically heavy names that later shrank.
-            if existing is None or float(member.get("weight") or 0.0) > float(
-                existing.get("weight") or 0.0
-            ):
-                deduped[key] = member
+            if existing is None:
+                deduped[key] = {**member, "membership_periods": [period]}
+            else:
+                existing["membership_periods"].append(period)
+                # Keep the largest weight seen in-range so universe_top_n fetch
+                # does not drop historically heavy names that later shrank.
+                if float(member.get("weight") or 0.0) > float(existing.get("weight") or 0.0):
+                    periods = existing["membership_periods"]
+                    deduped[key] = {**member, "membership_periods": periods}
         return [deduped[key] for key in sorted(deduped)]
 
     def create_snapshot(self, user_id: int, universe_id: int, *, as_of: Any = None) -> dict:
@@ -478,6 +519,7 @@ def _serialize_universe(row: dict) -> dict:
         "is_system": bool(row.get("is_system")),
         "status": str(row.get("status") or ""),
         "member_count": int(row.get("member_count") or 0),
+        "history_from": _iso(row.get("history_from")),
         "metadata": _json_value(row.get("metadata_json"), {}),
         "created_at": _iso(row.get("created_at")),
         "updated_at": _iso(row.get("updated_at")),

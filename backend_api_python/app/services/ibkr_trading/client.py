@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from typing import Optional, Dict, Any, List
 
 from app.utils.logger import get_logger
+from app.utils.local_brokers import require_local_desktop_brokers_allowed
 from app.services.ibkr_trading.symbols import normalize_symbol, format_display_symbol
 
 logger = get_logger(__name__)
@@ -114,6 +115,12 @@ class IBKRClient:
         Returns:
             True if connected successfully
         """
+        try:
+            require_local_desktop_brokers_allowed()
+        except PermissionError as exc:
+            logger.warning("IBKR connection blocked by deployment policy: %s", exc)
+            return False
+
         with self._lock:
             if self.connected:
                 return True
@@ -168,6 +175,7 @@ class IBKRClient:
     
     def _ensure_connected(self):
         """Ensure connection is established."""
+        require_local_desktop_brokers_allowed()
         # Ensure event loop exists (may be called from different threads)
         _ensure_event_loop()
         if not self.connected:
@@ -245,6 +253,7 @@ class IBKRClient:
             "filled": float(getattr(order_status, "filled", 0) or 0),
             "remaining": float(getattr(order_status, "remaining", 0) or 0),
             "avgFillPrice": float(getattr(order_status, "avgFillPrice", 0) or 0),
+            "orderRef": str(getattr(order, "orderRef", "") or ""),
             **fee_snapshot,
         }
         return OrderResult(
@@ -284,6 +293,7 @@ class IBKRClient:
         side: str,
         quantity: float,
         market_type: str = "USStock",
+        client_order_id: str = "",
     ) -> OrderResult:
         """
         Place a market order.
@@ -313,6 +323,8 @@ class IBKRClient:
                 totalQuantity=quantity,
                 account=self._account
             )
+            if str(client_order_id or "").strip():
+                order.orderRef = str(client_order_id).strip()[:64]
             
             trade = self._ib.placeOrder(contract, order)
             
@@ -335,6 +347,7 @@ class IBKRClient:
         quantity: float,
         price: float,
         market_type: str = "USStock",
+        client_order_id: str = "",
     ) -> OrderResult:
         """
         Place a limit order.
@@ -366,6 +379,8 @@ class IBKRClient:
                 lmtPrice=price,
                 account=self._account
             )
+            if str(client_order_id or "").strip():
+                order.orderRef = str(client_order_id).strip()[:64]
             
             trade = self._ib.placeOrder(contract, order)
             self._ib.sleep(1)
@@ -391,6 +406,7 @@ class IBKRClient:
         stop_loss_price: float = 0.0,
         limit_price: float = 0.0,
         market_type: str = "USStock",
+        client_order_id: str = "",
     ) -> OrderResult:
         """Submit a parent order and attached take-profit/stop-loss orders atomically."""
         try:
@@ -412,6 +428,8 @@ class IBKRClient:
                 if float(limit_price or 0.0) > 0
                 else ib_insync.MarketOrder(action, quantity, account=self._account)
             )
+            if str(client_order_id or "").strip():
+                parent.orderRef = str(client_order_id).strip()[:64]
             parent.orderId = self._ib.client.getReqId()
             parent.transmit = False
 
@@ -529,6 +547,45 @@ class IBKRClient:
         except Exception as e:
             logger.error(f"Get order status failed: {e}")
             return OrderResult(success=False, order_id=order_id, message=str(e))
+
+    def get_order_status_by_client_id(self, client_order_id: str) -> OrderResult:
+        """Return the latest order carrying the deterministic IBKR orderRef."""
+        try:
+            self._ensure_connected()
+            requested = str(client_order_id or "").strip()
+            if not requested:
+                return OrderResult(success=False, message="Missing client_order_id")
+            trades = []
+            for method_name, args in (
+                ("reqAllOpenOrders", ()),
+                ("openTrades", ()),
+                ("trades", ()),
+                ("reqCompletedOrders", (False,)),
+            ):
+                method = getattr(self._ib, method_name, None)
+                if not callable(method):
+                    continue
+                try:
+                    trades.extend(list(method(*args) or []))
+                except Exception:
+                    continue
+            for trade in trades:
+                order = getattr(trade, "order", None)
+                if str(getattr(order, "orderRef", "") or "") == requested:
+                    return self._trade_result(trade)
+            return OrderResult(
+                success=True,
+                status="Unknown",
+                message="Order not found by orderRef in the current IBKR session",
+                raw={"orderRef": requested},
+            )
+        except Exception as e:
+            logger.error(f"Get order status by orderRef failed: {e}")
+            return OrderResult(
+                success=False,
+                message=str(e),
+                raw={"orderRef": str(client_order_id or "")},
+            )
 
     # ==================== Query Methods ====================
     

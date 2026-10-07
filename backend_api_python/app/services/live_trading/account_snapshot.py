@@ -6,6 +6,7 @@ Used by broker-accounts UI (not strategy L3 ledger).
 from __future__ import annotations
 
 import time
+import math
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.services.exchange_execution import resolve_exchange_config
@@ -240,12 +241,8 @@ def _fetch_swap_positions_snapshot(client: Any, exchange_id: str, errors: List[s
                 row = dict(item)
                 row["size"] = sz_ct
                 row["symbol"] = contract
-                qm = 1.0
-                try:
-                    meta = client.get_contract(contract=contract) or {}
-                    qm = float(meta.get("quanto_multiplier") or meta.get("contract_size") or 0.0) or 1.0
-                except Exception:
-                    qm = 1.0
+                from app.services.live_trading.fill_accounting import contract_multiplier
+                qm = contract_multiplier(client, 'gate', contract.replace('_', '/'))
                 for leg in _parse_swap_position_items([row], market_type="swap"):
                     leg["size"] = float(leg.get("size") or 0) * qm
                     parsed.append(leg)
@@ -253,7 +250,15 @@ def _fetch_swap_positions_snapshot(client: Any, exchange_id: str, errors: List[s
         if isinstance(client, HtxClient):
             resp = client.get_positions() or {}
             data = (resp.get("data") or []) if isinstance(resp, dict) else []
-            return _parse_swap_position_items(data if isinstance(data, list) else [], market_type="swap")
+            from app.services.live_trading.fill_accounting import contract_multiplier
+            parsed = []
+            for row in data if isinstance(data, list) else []:
+                symbol = str(row.get('contract_code') or '').replace('-', '/')
+                multiplier = contract_multiplier(client, 'htx', symbol)
+                for leg in _parse_swap_position_items([row], market_type='swap'):
+                    leg['size'] = float(leg.get('size') or 0) * multiplier
+                    parsed.append(leg)
+            return parsed
         if hasattr(client, "get_positions"):
             resp = client.get_positions() or {}
             if isinstance(resp, list):
@@ -294,7 +299,151 @@ def _fetch_multi_crypto_snapshot(
     if not spot_pos and swap_client is not None and spot_client is not swap_client:
         spot_pos = _fetch_spot_wallet(swap_client, errors, label=f"{ex.upper()} 现货持仓")
 
+    if ex in ("gate", "gateio"):
+        orders.extend(_fetch_gate_open_orders(swap_client, spot_client, errors))
+    elif ex in ("bybit", "bitget"):
+        from app.services.live_trading.open_orders import fetch_exchange_open_orders
+
+        for mt, order_client in (("spot", spot_client), ("swap", swap_client)):
+            try:
+                if order_client is None:
+                    raise ValueError("missing_exchange_client")
+                orders.extend(fetch_exchange_open_orders(order_client, exchange_id=ex, market_type=mt))
+            except Exception:
+                logger.warning("%s %s open orders failed", ex, mt, exc_info=True)
+                errors.append(
+                    "brokerAccounts.snapshotSpotOrdersFailed"
+                    if mt == "spot"
+                    else "brokerAccounts.snapshotSwapOrdersFailed"
+                )
+
     return swap_pos, spot_pos, orders
+
+
+def _gate_symbol(raw: Any) -> str:
+    native = str(raw or "").strip().upper()
+    if not native:
+        return ""
+    symbol = native.replace("-", "/").replace("_", "/")
+    return normalize_strategy_symbol(symbol) or symbol
+
+
+def _parse_gate_spot_orders(payload: Any) -> List[Dict[str, Any]]:
+    """Flatten Gate's account-wide spot open-order groups."""
+    rows: List[Dict[str, Any]] = []
+    raw_groups = payload if isinstance(payload, list) else []
+    for group in raw_groups:
+        if not isinstance(group, dict):
+            continue
+        grouped_orders = group.get("orders")
+        if isinstance(grouped_orders, list):
+            native_pair = str(group.get("currency_pair") or "")
+            candidates = [
+                (order, native_pair)
+                for order in grouped_orders
+                if isinstance(order, dict)
+            ]
+        else:
+            candidates = [(group, str(group.get("currency_pair") or ""))]
+        for order, fallback_pair in candidates:
+            native_pair = str(order.get("currency_pair") or fallback_pair).strip()
+            symbol = _gate_symbol(native_pair)
+            if not symbol:
+                continue
+            try:
+                amount = abs(float(order.get("amount") or 0.0))
+                raw_left = order.get("left")
+                remaining = abs(
+                    float(amount if raw_left is None or raw_left == "" else raw_left)
+                )
+                price = float(order.get("price") or 0.0)
+            except (TypeError, ValueError):
+                amount, remaining, price = 0.0, 0.0, 0.0
+            rows.append(
+                {
+                    "symbol": symbol,
+                    "side": str(order.get("side") or "").strip().lower(),
+                    "market_type": "spot",
+                    "order_type": str(order.get("type") or "limit").strip().lower(),
+                    "price": price,
+                    "amount": amount,
+                    "filled": max(0.0, amount - remaining),
+                    "exchange_order_id": str(order.get("id") or order.get("id_string") or ""),
+                    "status": str(order.get("status") or "open"),
+                    "inst_id": native_pair,
+                }
+            )
+    return rows
+
+
+def _parse_gate_futures_orders(payload: Any, *, client: Any = None) -> List[Dict[str, Any]]:
+    """Normalize Gate futures contracts to the account snapshot order schema."""
+    rows: List[Dict[str, Any]] = []
+    multiplier_cache: Dict[str, float] = {}
+    for order in payload if isinstance(payload, list) else []:
+        if not isinstance(order, dict):
+            continue
+        contract = str(order.get("contract") or "").strip()
+        symbol = _gate_symbol(contract)
+        if not symbol:
+            continue
+        try:
+            raw_size = order.get("amount")
+            if raw_size is None or raw_size == "":
+                raw_size = order.get("size")
+            signed_size = float(raw_size or 0.0)
+            raw_left = order.get("left")
+            signed_left = float(
+                signed_size if raw_left is None or raw_left == "" else raw_left
+            )
+            price = float(order.get("price") or 0.0)
+        except (TypeError, ValueError):
+            signed_size, signed_left, price = 0.0, 0.0, 0.0
+
+        multiplier = multiplier_cache.get(contract)
+        if multiplier is None:
+            from app.services.live_trading.fill_accounting import contract_multiplier
+            multiplier = contract_multiplier(client, 'gate', contract.replace('_', '/'))
+            multiplier_cache[contract] = multiplier
+        amount = abs(signed_size) * multiplier
+        remaining = abs(signed_left) * multiplier
+        rows.append(
+            {
+                "symbol": symbol,
+                "side": "buy" if signed_size > 0 else "sell" if signed_size < 0 else "",
+                "market_type": "swap",
+                "order_type": "market" if price <= 0 else "limit",
+                "price": price,
+                "amount": amount,
+                "filled": max(0.0, amount - remaining),
+                "exchange_order_id": str(order.get("id_string") or order.get("id") or ""),
+                "status": str(order.get("status") or "open"),
+                "inst_id": contract,
+            }
+        )
+    return rows
+
+
+def _fetch_gate_open_orders(
+    swap_client: Any,
+    spot_client: Any,
+    errors: List[str],
+) -> List[Dict[str, Any]]:
+    from app.services.live_trading.gate import GateSpotClient, GateUsdtFuturesClient
+    from app.services.live_trading.open_orders import fetch_exchange_open_orders
+
+    orders: List[Dict[str, Any]] = []
+    if isinstance(swap_client, GateUsdtFuturesClient):
+        try:
+            orders.extend(fetch_exchange_open_orders(swap_client, exchange_id="gate", market_type="swap"))
+        except Exception as e:
+            _append_snapshot_error(errors, e, context="GATE 合约挂单")
+    if isinstance(spot_client, GateSpotClient):
+        try:
+            orders.extend(fetch_exchange_open_orders(spot_client, exchange_id="gate", market_type="spot"))
+        except Exception as e:
+            _append_snapshot_error(errors, e, context="GATE 现货挂单")
+    return orders
 
 
 def _parse_binance_futures_positions(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -401,6 +550,7 @@ def _fetch_okx_snapshot(
     client, exchange_id: str, errors: List[str]
 ) -> Tuple[List[Dict], List[Dict], List[Dict]]:
     from app.services.live_trading.okx import OkxClient
+    from app.services.live_trading.open_orders import fetch_exchange_open_orders
 
     if not isinstance(client, OkxClient):
         return [], [], []
@@ -422,11 +572,7 @@ def _fetch_okx_snapshot(
         ("SPOT", "spot", "OKX 现货挂单"),
     ):
         try:
-            resp = client._signed_request(
-                "GET", "/api/v5/trade/orders-pending", params={"instType": inst_type}
-            )
-            data = (resp.get("data") or []) if isinstance(resp, dict) else []
-            orders.extend(_parse_okx_orders(data, market_type=mt))
+            orders.extend(fetch_exchange_open_orders(client, exchange_id="okx", market_type=mt))
         except Exception as e:
             _append_snapshot_error(errors, e, context=label)
     return swap_pos, spot_pos, orders
@@ -480,6 +626,63 @@ def _fetch_binance_snapshot(
     return swap_pos, spot_pos, orders
 
 
+def _fetch_alpaca_snapshot(exchange_config: Dict[str, Any], errors: List[str]) -> Tuple[List[Dict], List[Dict], List[Dict]]:
+    from app.services.alpaca_trading.symbols import parse_symbol
+
+    positions: List[Dict[str, Any]] = []
+    orders: List[Dict[str, Any]] = []
+    try:
+        client = create_client(exchange_config, market_type="spot")
+    except Exception:
+        logger.warning("Alpaca snapshot connection failed", exc_info=True)
+        errors.append("brokerAccounts.snapshotConnectionFailed")
+        return [], positions, orders
+
+    def instrument(item):
+        asset_class = str(item.get("asset_class") or "").lower()
+        hint = "Crypto" if asset_class == "crypto" else "USStock" if asset_class == "us_equity" else None
+        symbol, asset_class = parse_symbol(str(item.get("symbol") or ""), market_hint=hint)
+        return {"symbol": symbol, "inst_id": str(item.get("symbol") or ""), "market_type": "spot",
+                "market": "Crypto" if asset_class == "crypto" else "USStock", "asset_class": asset_class}
+
+    try:
+        for item in client.get_positions(raise_on_error=True):
+            quantity = float(item.get("qty") or item.get("quantity") or 0)
+            if not math.isfinite(quantity):
+                raise ValueError("invalid_position_quantity")
+            if not quantity:
+                continue
+            positions.append({
+                **instrument(item),
+                "side": "short" if quantity < 0 or str(item.get("side")).lower() == "short" else "long",
+                "size": abs(quantity),
+                "entry_price": float(item.get("avg_entry_price") or item.get("avgCost") or 0),
+                "mark_price": float(item.get("current_price") or item.get("currentPrice") or 0),
+                "market_value": float(item.get("market_value") or item.get("marketValue") or 0),
+                "unrealized_pnl": float(item.get("unrealized_pnl") or item.get("unrealizedPnL") or 0),
+            })
+    except Exception:
+        logger.warning("Alpaca snapshot positions failed", exc_info=True)
+        errors.append("brokerAccounts.snapshotPositionsFailed")
+    try:
+        for item in client.get_orders(status="open", limit=500, raise_on_error=True):
+            orders.append({
+                **instrument(item),
+                "exchange_order_id": str(item.get("id") or item.get("orderId") or ""),
+                "side": str(item.get("side") or "").lower(),
+                "order_type": str(item.get("order_type") or item.get("orderType") or "").lower(),
+                "price": float(item.get("limit_price") or item.get("limitPrice") or 0),
+                "amount": abs(float(item.get("qty") or item.get("quantity") or 0)),
+                "filled": abs(float(item.get("filled_qty") or item.get("filled") or 0)),
+                "notional": float(item.get("notional") or 0),
+                "status": str(item.get("status") or ""),
+            })
+    except Exception:
+        logger.warning("Alpaca snapshot orders failed", exc_info=True)
+        errors.append("brokerAccounts.snapshotOrdersFailed")
+    return [], positions, orders
+
+
 def fetch_account_snapshot(*, user_id: int, credential_id: int) -> Dict[str, Any]:
     """Live fetch swap/spot legs + open orders for one credential."""
     cred = int(credential_id or 0)
@@ -509,7 +712,12 @@ def fetch_account_snapshot(*, user_id: int, credential_id: int) -> Dict[str, Any
     spot_all: List[Dict[str, Any]] = []
     orders_all: List[Dict[str, Any]] = []
 
-    if exchange_id in ("okx", "okex"):
+    if exchange_id == "alpaca":
+        sp, st, od = _fetch_alpaca_snapshot(exchange_config, errors)
+        swap_all.extend(sp)
+        spot_all.extend(st)
+        orders_all.extend(od)
+    elif exchange_id in ("okx", "okex"):
         try:
             client = create_client(exchange_config, market_type="swap")
             sp, st, od = _fetch_okx_snapshot(client, exchange_id, errors)
@@ -563,7 +771,12 @@ def fetch_account_snapshot(*, user_id: int, credential_id: int) -> Dict[str, Any
     deduped_orders: List[Dict[str, Any]] = []
     for o in orders_all:
         oid = str(o.get("exchange_order_id") or "")
-        key = oid or f"{o.get('symbol')}-{o.get('side')}-{o.get('price')}"
+        market_type = str(o.get("market_type") or "").strip().lower()
+        key = (
+            f"{market_type}:{oid}"
+            if oid
+            else f"{market_type}:{o.get('symbol')}-{o.get('side')}-{o.get('price')}"
+        )
         if key in seen:
             continue
         seen.add(key)

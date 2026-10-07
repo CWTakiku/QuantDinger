@@ -54,6 +54,10 @@ class _Sources:
     def get_source(_source_id, user_id=None):
         return {"id": 9, "name": "Dual strategy", "code": SOURCE}
 
+    @staticmethod
+    def get_latest_version(_source_id, user_id=None):
+        return {"id": 109, "source_id": 9, "name": "Dual strategy", "code": SOURCE}
+
 
 def _payload(direction_mode):
     return {
@@ -71,12 +75,58 @@ def test_deployment_persists_manifest_direction_and_legacy_position_side(monkeyp
     monkeypatch.setattr(deployment, "get_db_connection", lambda: _Db(cursor))
 
     strategy_id = StrategyV2DeploymentService().save(user_id=7, payload=_payload("both"))
-    trading_config = json.loads(cursor.params[-1])
+    trading_config = json.loads(cursor.params[-2])
 
     assert strategy_id == 41
     assert trading_config["direction_mode"] == "both"
     assert trading_config["position_side"] == "neutral"
     assert trading_config["strategy_manifest"]["directionMode"] == "both"
+    assert trading_config["script_source_version_id"] == 109
+    assert cursor.params[-1] == 109
+
+
+def test_explicit_deployment_edit_rebinds_the_latest_saved_source_version(monkeypatch):
+    cursor = _Cursor()
+    monkeypatch.setattr(deployment, "get_script_source_service", lambda: _Sources())
+    monkeypatch.setattr(deployment, "get_db_connection", lambda: _Db(cursor))
+
+    strategy_id = StrategyV2DeploymentService().save(
+        user_id=7,
+        payload=_payload("both"),
+        strategy_id=73,
+    )
+
+    trading_config = json.loads(cursor.params[-4])
+    assert strategy_id == 73
+    assert trading_config["script_source_version_id"] == 109
+    assert cursor.params[-3:] == (109, 73, 7)
+
+
+def test_deployment_persists_one_way_without_legacy_position_side(monkeypatch):
+    cursor = _Cursor()
+
+    class _OneWaySources:
+        @staticmethod
+        def get_source(_source_id, user_id=None):
+            return {
+                "id": 9,
+                "name": "Net strategy",
+                "code": SOURCE.replace('direction_mode="both"', 'direction_mode="one_way"'),
+            }
+
+        @staticmethod
+        def get_latest_version(_source_id, user_id=None):
+            source = _OneWaySources.get_source(_source_id, user_id=user_id)
+            return {**source, "id": 110, "source_id": 9}
+
+    monkeypatch.setattr(deployment, "get_script_source_service", lambda: _OneWaySources())
+    monkeypatch.setattr(deployment, "get_db_connection", lambda: _Db(cursor))
+
+    StrategyV2DeploymentService().save(user_id=7, payload=_payload("one_way"))
+    trading_config = json.loads(cursor.params[-2])
+
+    assert trading_config["direction_mode"] == "one_way"
+    assert trading_config["position_side"] == ""
 
 
 def test_deployment_rejects_direction_override_that_conflicts_with_manifest(monkeypatch):
@@ -108,16 +158,113 @@ def test_deployment_recovers_legacy_visual_grid_runtime_from_executor_type(monke
                 },
             }
 
+        @staticmethod
+        def get_latest_version(_source_id, user_id=None):
+            source = _GridSources.get_source(_source_id, user_id=user_id)
+            return {**source, "id": 111, "source_id": 9}
+
     cursor = _Cursor()
     monkeypatch.setattr(deployment, "get_script_source_service", lambda: _GridSources())
     monkeypatch.setattr(deployment, "get_db_connection", lambda: _Db(cursor))
 
     StrategyV2DeploymentService().save(user_id=7, payload=_payload("both"))
-    trading_config = json.loads(cursor.params[-1])
+    trading_config = json.loads(cursor.params[-2])
 
     assert trading_config["bot_type"] == "grid"
     assert trading_config["executor_type"] == "grid"
     assert trading_config["bot_params"]["amountPerGridPct"] == pytest.approx(0.25)
+
+
+def test_deployment_manifest_trend_contract_removes_stale_grid_runtime(monkeypatch):
+    trend_source = SOURCE.replace(
+        'context.set_metadata(direction_mode="both")',
+        'context.set_metadata(direction_mode="both", strategy_family="trend")',
+    )
+
+    class _TrendSources:
+        @staticmethod
+        def get_source(_source_id, user_id=None):
+            return {
+                "id": 9,
+                "name": "Trend strategy",
+                "code": trend_source,
+                "metadata": {
+                    "last_run_config": {
+                        "strategy_family": "robot",
+                        "executor_type": "grid",
+                        "executor_config": {"grid_count": 20},
+                        "bot_type": "grid",
+                        "bot_params": {
+                            "gridCount": 20,
+                            "lowerPrice": 0.98,
+                            "upperPrice": 1.02,
+                        },
+                    },
+                },
+            }
+
+        @staticmethod
+        def get_latest_version(_source_id, user_id=None):
+            source = _TrendSources.get_source(_source_id, user_id=user_id)
+            return {**source, "id": 114, "source_id": 9}
+
+    cursor = _Cursor()
+    monkeypatch.setattr(deployment, "get_script_source_service", lambda: _TrendSources())
+    monkeypatch.setattr(deployment, "get_db_connection", lambda: _Db(cursor))
+
+    StrategyV2DeploymentService().save(user_id=7, payload=_payload("both"))
+    trading_config = json.loads(cursor.params[-2])
+
+    assert trading_config["strategy_family"] == "trend"
+    assert "executor_type" not in trading_config
+    assert "executor_config" not in trading_config
+    assert "bot_type" not in trading_config
+    assert "bot_params" not in trading_config
+
+
+def test_deployment_recovers_grid_contract_from_legacy_root_metadata(monkeypatch):
+    class _LegacyGridSources:
+        @staticmethod
+        def get_source(_source_id, user_id=None):
+            return {
+                "id": 9,
+                "name": "Legacy grid strategy",
+                "code": SOURCE,
+                "metadata": {
+                    "executor_type": "grid",
+                    "executor_config": {
+                        "side": "long",
+                        "start_price": 90,
+                        "end_price": 110,
+                        "grid_count": 5,
+                        "total_amount_quote": 500,
+                        "initial_position_pct": 0.6,
+                        "max_open_orders": 4,
+                        "dynamic_anchor": True,
+                    },
+                },
+            }
+
+        @staticmethod
+        def get_latest_version(_source_id, user_id=None):
+            source = _LegacyGridSources.get_source(_source_id, user_id=user_id)
+            return {**source, "id": 112, "source_id": 9}
+
+    cursor = _Cursor()
+    monkeypatch.setattr(deployment, "get_script_source_service", lambda: _LegacyGridSources())
+    monkeypatch.setattr(deployment, "get_db_connection", lambda: _Db(cursor))
+
+    StrategyV2DeploymentService().save(user_id=7, payload=_payload("both"))
+    trading_config = json.loads(cursor.params[-2])
+
+    assert trading_config["strategy_family"] == "robot"
+    assert trading_config["executor_type"] == "grid"
+    assert trading_config["bot_type"] == "grid"
+    assert trading_config["entry_trigger_mode"] == "exchange_resting_orders"
+    assert trading_config["bot_params"]["gridCount"] == 5
+    assert trading_config["bot_params"]["lowerPrice"] == pytest.approx(90)
+    assert trading_config["bot_params"]["upperPrice"] == pytest.approx(110)
+    assert trading_config["bot_params"]["amountPerGridPct"] == pytest.approx(0.2)
 
 
 def test_deployment_manifest_overrides_stale_editor_symbol_and_market_type(monkeypatch):
@@ -145,12 +292,17 @@ def handle_data(context, data):
                 },
             }
 
+        @staticmethod
+        def get_latest_version(_source_id, user_id=None):
+            source = _StockSources.get_source(_source_id, user_id=user_id)
+            return {**source, "id": 113, "source_id": 9}
+
     cursor = _Cursor()
     monkeypatch.setattr(deployment, "get_script_source_service", lambda: _StockSources())
     monkeypatch.setattr(deployment, "get_db_connection", lambda: _Db(cursor))
 
     StrategyV2DeploymentService().save(user_id=7, payload=_payload(""))
-    trading_config = json.loads(cursor.params[-1])
+    trading_config = json.loads(cursor.params[-2])
 
     assert trading_config["symbol"] == "SPY"
     assert trading_config["market_type"] == "spot"

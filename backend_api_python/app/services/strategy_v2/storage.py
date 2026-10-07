@@ -2,15 +2,40 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 from datetime import datetime, timezone
 from typing import Any, Optional
 
 from app.utils.db import get_db_connection
 
+from .contract import strategy_source_code_hash
+from .curve_sampling import sample_equity_curve
+
 
 class StrategyBacktestRepository:
+    def has_successful_run(
+        self,
+        *,
+        user_id: int,
+        source_id: int,
+        code_hash: str = "",
+    ) -> bool:
+        where = ["user_id = ?", "source_id = ?", "status = 'success'"]
+        params: list[Any] = [int(user_id), int(source_id)]
+        normalized_hash = str(code_hash or "").strip()
+        if normalized_hash:
+            where.append("code_hash = ?")
+            params.append(normalized_hash)
+        with get_db_connection() as db:
+            cur = db.cursor()
+            cur.execute(
+                f"SELECT id FROM qd_backtest_runs WHERE {' AND '.join(where)} ORDER BY id DESC LIMIT 1",
+                tuple(params),
+            )
+            found = cur.fetchone() is not None
+            cur.close()
+        return found
+
     def persist_run(
         self,
         *,
@@ -32,6 +57,7 @@ class StrategyBacktestRepository:
         result: dict[str, Any],
         code: str,
     ) -> int | None:
+        compact_result = _compact_backtest_result(result)
         with get_db_connection() as db:
             cur = db.cursor()
             cur.execute(
@@ -40,8 +66,10 @@ class StrategyBacktestRepository:
                 (user_id, strategy_id, source_id, strategy_name, market, symbol, market_type,
                  timeframe, start_date, end_date, initial_capital, commission, slippage, leverage,
                  params_json, manifest_json, engine_version, code_hash, status, error_message,
-                 result_json, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'success', '', ?, NOW())
+                 result_json, result_compacted, total_return, win_rate, total_trades, total_executions,
+                 max_drawdown, sharpe_ratio, result_status, data_kind, benchmark_total_return,
+                 summary_backfilled, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'success', '', ?, TRUE, ?, ?, ?, ?, ?, ?, ?, ?, ?, TRUE, NOW())
                 """,
                 (
                     int(user_id),
@@ -70,13 +98,22 @@ class StrategyBacktestRepository:
                     json.dumps(params, ensure_ascii=False),
                     json.dumps(manifest, ensure_ascii=False),
                     str((result.get("engine") or {}).get("version") or "strategy-api-v2"),
-                    hashlib.sha256(code.encode("utf-8")).hexdigest(),
-                    json.dumps(result, ensure_ascii=False),
+                    strategy_source_code_hash(code),
+                    json.dumps(compact_result, ensure_ascii=False),
+                    _nullable_number(result.get("totalReturn")),
+                    _nullable_number(result.get("winRate")),
+                    _nullable_int(result.get("totalTrades")),
+                    _nullable_int(result.get("totalExecutions")),
+                    _nullable_number(result.get("maxDrawdown")),
+                    _nullable_number(result.get("sharpeRatio")),
+                    str(result.get("resultStatus") or "unknown"),
+                    str((result.get("dataProvenance") or {}).get("kind") or "unknown"),
+                    _nullable_number(result.get("benchmarkTotalReturn")),
                 ),
             )
             run_id = int(cur.lastrowid or 0) or None
             if run_id is not None:
-                self._persist_details(cur, run_id, user_id, strategy_id, result)
+                self._persist_details(cur, run_id, user_id, strategy_id, compact_result)
             db.commit()
             cur.close()
         return run_id
@@ -111,7 +148,9 @@ class StrategyBacktestRepository:
                 f"""
                 SELECT id, user_id, strategy_id, source_id, strategy_name, market, symbol, market_type, timeframe,
                        start_date, end_date, initial_capital, commission, slippage, leverage,
-                       params_json, manifest_json, engine_version, code_hash, status, result_json, created_at
+                       params_json, manifest_json, engine_version, code_hash, status, created_at,
+                       total_return, win_rate, total_trades, total_executions, result_status,
+                       data_kind, benchmark_total_return, max_drawdown, sharpe_ratio
                 FROM qd_backtest_runs
                 WHERE {' AND '.join(where)}
                 ORDER BY id DESC
@@ -121,7 +160,7 @@ class StrategyBacktestRepository:
             )
             rows = cur.fetchall() or []
             cur.close()
-        return [self._hydrate(row, include_result=False) for row in rows]
+        return [self._hydrate_summary(row) for row in rows]
 
     def get_run(self, *, user_id: int, run_id: int) -> Optional[dict[str, Any]]:
         with get_db_connection() as db:
@@ -130,15 +169,72 @@ class StrategyBacktestRepository:
                 """
                 SELECT id, user_id, strategy_id, source_id, strategy_name, market, symbol, market_type, timeframe,
                        start_date, end_date, initial_capital, commission, slippage, leverage,
-                       params_json, manifest_json, engine_version, code_hash, status, result_json, created_at
+                       params_json, manifest_json, engine_version, code_hash, status,
+                       CASE WHEN result_compacted THEN result_json ELSE '{}' END AS result_json,
+                       result_compacted, total_return, win_rate, total_trades, total_executions,
+                       result_status, data_kind, benchmark_total_return, max_drawdown, sharpe_ratio, created_at
                 FROM qd_backtest_runs
                 WHERE id = ? AND user_id = ?
                 """,
                 (int(run_id), int(user_id)),
             )
             row = cur.fetchone()
+            fallback_result = None
+            if row and not bool(row.get("result_compacted")):
+                fallback_result = self._load_lightweight_details(cur, int(run_id))
             cur.close()
-        return self._hydrate(row, include_result=True) if row else None
+        return self._hydrate(row, include_result=True, fallback_result=fallback_result) if row else None
+
+    @staticmethod
+    def _load_lightweight_details(cur, run_id: int) -> dict[str, Any]:
+        """Open old runs without reading their oversized monolithic result JSON."""
+        cur.execute(
+            """
+            SELECT payload_json
+            FROM qd_backtest_trades
+            WHERE run_id = ?
+            ORDER BY trade_index ASC
+            LIMIT 5000
+            """,
+            (int(run_id),),
+        )
+        trades = []
+        for row in cur.fetchall() or []:
+            try:
+                payload = json.loads(row.get("payload_json") or "{}")
+            except (TypeError, ValueError):
+                payload = {}
+            if isinstance(payload, dict):
+                trades.append(payload)
+
+        cur.execute(
+            """
+            WITH ranked AS (
+                SELECT point_time, point_value,
+                       ROW_NUMBER() OVER (ORDER BY point_index ASC) AS row_number,
+                       COUNT(*) OVER () AS row_count
+                FROM qd_backtest_equity_points
+                WHERE run_id = ?
+            )
+            SELECT point_time, point_value
+            FROM ranked
+            WHERE row_count <= 2400
+               OR row_number = 1
+               OR row_number = row_count
+               OR MOD(row_number - 1, GREATEST(1, CEIL(row_count / 2400.0)::INTEGER)) = 0
+            ORDER BY row_number ASC
+            """,
+            (int(run_id),),
+        )
+        equity_curve = [
+            {"time": row.get("point_time"), "value": _number(row.get("point_value"))}
+            for row in (cur.fetchall() or [])
+        ]
+        return {
+            "closedTrades": trades,
+            "equityCurve": equity_curve,
+            "historyStorage": {"version": 2, "lightweightLegacyRead": True},
+        }
 
     def delete_run(self, *, user_id: int, run_id: int) -> bool:
         with get_db_connection() as db:
@@ -213,12 +309,8 @@ class StrategyBacktestRepository:
             )
 
     @staticmethod
-    def _hydrate(row: dict[str, Any], *, include_result: bool) -> dict[str, Any]:
+    def _hydrate_summary(row: dict[str, Any]) -> dict[str, Any]:
         item = dict(row)
-        try:
-            result = json.loads(item.pop("result_json", "") or "{}")
-        except (TypeError, ValueError):
-            result = {}
         try:
             item["params"] = json.loads(item.pop("params_json", "") or "{}")
         except (TypeError, ValueError):
@@ -227,16 +319,120 @@ class StrategyBacktestRepository:
             item["manifest"] = json.loads(item.pop("manifest_json", "") or "{}")
         except (TypeError, ValueError):
             item["manifest"] = {}
-        item["total_return"] = result.get("totalReturn")
-        item["win_rate"] = result.get("winRate")
-        item["total_trades"] = result.get("totalTrades")
-        item["total_executions"] = result.get("totalExecutions")
-        item["result_status"] = result.get("resultStatus") or "unknown"
-        item["data_kind"] = (result.get("dataProvenance") or {}).get("kind") or "unknown"
-        item["benchmark_total_return"] = result.get("benchmarkTotalReturn")
+        item["result_status"] = item.get("result_status") or "unknown"
+        item["data_kind"] = item.get("data_kind") or "unknown"
+        return item
+
+    @staticmethod
+    def _hydrate(
+        row: dict[str, Any],
+        *,
+        include_result: bool,
+        fallback_result: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        item = dict(row)
+        try:
+            result = json.loads(item.pop("result_json", "") or "{}")
+        except (TypeError, ValueError):
+            result = {}
+        if fallback_result:
+            result = {**result, **fallback_result}
+        try:
+            item["params"] = json.loads(item.pop("params_json", "") or "{}")
+        except (TypeError, ValueError):
+            item["params"] = {}
+        try:
+            item["manifest"] = json.loads(item.pop("manifest_json", "") or "{}")
+        except (TypeError, ValueError):
+            item["manifest"] = {}
+        summary_fields = {
+            "total_return": "totalReturn",
+            "win_rate": "winRate",
+            "total_trades": "totalTrades",
+            "total_executions": "totalExecutions",
+            "benchmark_total_return": "benchmarkTotalReturn",
+            "max_drawdown": "maxDrawdown",
+            "sharpe_ratio": "sharpeRatio",
+        }
+        for column, field in summary_fields.items():
+            value = item.get(column)
+            if value is None:
+                value = result.get(field)
+            item[column] = value
+            result.setdefault(field, value)
+        item["result_status"] = item.get("result_status") or result.get("resultStatus") or "unknown"
+        item["data_kind"] = item.get("data_kind") or (result.get("dataProvenance") or {}).get("kind") or "unknown"
+        result.setdefault("resultStatus", item["result_status"])
+        result.setdefault("dataProvenance", {"kind": item["data_kind"]})
+        result.setdefault("manifest", item.get("manifest") or {})
+        result.setdefault("timeframe", item.get("timeframe") or "")
         if include_result:
             item["result"] = _normalize_backtest_result(result, item)
         return item
+
+
+def _sample_evenly(rows: Any, limit: int) -> list[Any]:
+    items = list(rows or []) if isinstance(rows, (list, tuple)) else []
+    if len(items) <= limit:
+        return items
+    step = (len(items) - 1) / float(limit - 1)
+    indexes = sorted({min(len(items) - 1, int(round(index * step))) for index in range(limit)})
+    return [items[index] for index in indexes]
+
+
+def _compact_backtest_result(result: dict[str, Any]) -> dict[str, Any]:
+    """Bound history payload size and remove duplicate compatibility arrays."""
+    if not isinstance(result, dict):
+        return {}
+    compact = dict(result)
+    compact["closedTrades"] = _sample_evenly(
+        result.get("closedTrades") or result.get("trades"),
+        5000,
+    )
+    compact["executions"] = _sample_evenly(
+        result.get("executions") or result.get("rawTrades"),
+        5000,
+    )
+    compact.pop("trades", None)
+    compact.pop("rawTrades", None)
+    compact["equityCurve"] = sample_equity_curve(
+        result.get("equityCurve") or [], 2400,
+        _number(result.get("initialCapital"), _number(
+            (result.get("executionAssumptions") or {}).get("initialCapital"),
+        )),
+    )
+    for field, limit in (
+        ("benchmarkCurve", 2400),
+        ("holdingSnapshots", 1200),
+        ("rebalanceRecords", 1500),
+        ("orderLedger", 3000),
+    ):
+        compact[field] = _sample_evenly(result.get(field), limit)
+    snapshots = result.get("reviewCandles") if isinstance(result.get("reviewCandles"), dict) else {}
+    compact["reviewCandles"] = {
+        str(symbol): {
+            "timeframe": str((snapshot or {}).get("timeframe") or ""),
+            "candles": list((snapshot or {}).get("candles") or [])[-3000:],
+        }
+        for symbol, snapshot in list(snapshots.items())[:12]
+        if isinstance(snapshot, dict)
+    }
+    compact["historyStorage"] = {
+        "version": 2,
+        "compacted": True,
+        "limits": {
+            "equityCurve": 2400,
+            "benchmarkCurve": 2400,
+            "holdingSnapshots": 1200,
+            "rebalanceRecords": 1500,
+            "orderLedger": 3000,
+            "closedTrades": 5000,
+            "executions": 5000,
+            "reviewCandleSymbols": 12,
+            "reviewCandlesPerSymbol": 3000,
+        },
+    }
+    return compact
 
 
 def _normalize_backtest_result(
@@ -649,6 +845,21 @@ def _number(value: Any, default: float = 0.0) -> float:
     return number if number == number and number not in (float("inf"), float("-inf")) else float(default)
 
 
+def _nullable_number(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number == number and number not in (float("inf"), float("-inf")) else None
+
+
+def _nullable_int(value: Any) -> int | None:
+    number = _nullable_number(value)
+    return int(number) if number is not None else None
+
+
 class FactorResearchRepository:
     def persist_run(
         self,
@@ -678,8 +889,9 @@ class FactorResearchRepository:
                 (user_id, source_id, source_name, market, timeframe, start_date, end_date,
                  factor_id, groups_count, holding_period, commission, slippage,
                  neutralize_industry, universe_size, manifest_json, code_hash, result_json,
-                 status, error_message, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'success', '', NOW())
+                 rank_ic, icir, coverage, net_long_short_return, observation_count,
+                 summary_backfilled, status, error_message, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, TRUE, 'success', '', NOW())
                 """,
                 (
                     int(user_id), int(source_id), str(source_name or ""), str(market or ""),
@@ -687,8 +899,13 @@ class FactorResearchRepository:
                     int(groups), int(holding_period), float(commission), float(slippage),
                     bool(neutralize_industry), int(result.get("symbolsUsed") or 0),
                     json.dumps(manifest, ensure_ascii=False),
-                    hashlib.sha256(code.encode("utf-8")).hexdigest(),
+                    strategy_source_code_hash(code),
                     json.dumps(result, ensure_ascii=False),
+                    _nullable_number(result.get("rankIc")),
+                    _nullable_number(result.get("icir")),
+                    _nullable_number(result.get("coverage")),
+                    _nullable_number(result.get("netLongShortReturn")),
+                    len(result.get("icSeries") or []),
                 ),
             )
             run_id = int(cur.lastrowid or 0) or None
@@ -715,7 +932,8 @@ class FactorResearchRepository:
                 f"""
                 SELECT id, user_id, source_id, source_name, market, timeframe, start_date,
                        end_date, factor_id, groups_count, holding_period, commission, slippage,
-                       neutralize_industry, universe_size, manifest_json, code_hash, result_json,
+                       neutralize_industry, universe_size, manifest_json, code_hash,
+                       rank_ic, icir, coverage, net_long_short_return, observation_count,
                        status, created_at
                 FROM qd_factor_research_runs
                 WHERE {' AND '.join(where)}
@@ -726,7 +944,7 @@ class FactorResearchRepository:
             )
             rows = cur.fetchall() or []
             cur.close()
-        return [self._hydrate(row, include_result=False) for row in rows]
+        return [self._hydrate_summary(row) for row in rows]
 
     def get_run(self, *, user_id: int, run_id: int) -> Optional[dict[str, Any]]:
         with get_db_connection() as db:
@@ -757,6 +975,15 @@ class FactorResearchRepository:
             db.commit()
             cur.close()
         return deleted
+
+    @staticmethod
+    def _hydrate_summary(row: dict[str, Any]) -> dict[str, Any]:
+        item = dict(row)
+        try:
+            item["manifest"] = json.loads(item.pop("manifest_json", "") or "{}")
+        except (TypeError, ValueError):
+            item["manifest"] = {}
+        return item
 
     @staticmethod
     def _hydrate(row: dict[str, Any], *, include_result: bool) -> dict[str, Any]:

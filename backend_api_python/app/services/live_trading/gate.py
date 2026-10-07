@@ -23,8 +23,20 @@ from urllib.parse import urlencode
 
 from app.services.live_trading.base import BaseRestClient, LiveOrderResult, LiveTradingError
 from app.services.live_trading.symbols import to_gate_currency_pair
+from app.services.live_trading.gate_spot_fill import parse_gate_spot_fill
+from app.utils.numeric_precision import floor_decimal_to_step
 
 logger = logging.getLogger(__name__)
+
+
+def _gate_decimal_text(value: Union[Decimal, float, int, str]) -> str:
+    """Serialize numeric order fields without scientific notation.
+
+    Gate spot rejects otherwise valid small amounts such as ``5e-05``.  Build
+    the decimal from ``str`` first so binary-float artifacts are not exposed,
+    then force fixed-point output for every Gate order path.
+    """
+    return format(Decimal(str(value)), "f")
 
 
 def _gate_ticker_response_to_normalized(raw: Any) -> Dict[str, Any]:
@@ -71,7 +83,7 @@ class _GateBase(BaseRestClient):
         return hmac.new(self.secret_key.encode("utf-8"), msg.encode("utf-8"), hashlib.sha512).hexdigest()
 
     def _headers(self, ts: str, sign: str) -> Dict[str, str]:
-        headers = {"KEY": self.api_key, "Timestamp": ts, "SIGN": sign, "Content-Type": "application/json"}
+        headers = {"KEY": self.api_key, "Timestamp": ts, "SIGN": sign, "Content-Type": "application/json", "X-Gate-Size-Decimal": "1"}
         if self.channel_id:
             headers["X-Gate-Channel-Id"] = self.channel_id[:19]
         return headers
@@ -150,7 +162,24 @@ class _GateBase(BaseRestClient):
         return None
 
 
+    def _order_trade_rows(self, path: str, params: Dict[str, Any]) -> list:
+        rows = []
+        for page in range(1, 11):
+            result = self._signed_request('GET', path, params={**params, 'limit': 100, 'page': page})
+            if not isinstance(result, list):
+                raise LiveTradingError('strategyRuntime.fillSnapshotNotReady')
+            rows.extend(result)
+            if len(result) < 100:
+                return rows
+        raise LiveTradingError('strategyRuntime.fillSnapshotNotReady')
+
+
 class GateSpotClient(_GateBase):
+    def get_currency_pair(self, *, symbol: str) -> Dict[str, Any]:
+        """Return native public spot amount/price precision and minimums."""
+        pair = to_gate_currency_pair(symbol)
+        return self._public_request("GET", f"/api/v4/spot/currency_pairs/{pair}")
+
     def ping(self) -> bool:
         try:
             _ = self._public_request("GET", "/api/v4/spot/time")
@@ -166,6 +195,15 @@ class GateSpotClient(_GateBase):
     def get_accounts(self) -> Any:
         return self._signed_request("GET", "/api/v4/spot/accounts")
 
+    def get_open_orders(self, *, limit: int = 100) -> Any:
+        """Return current spot orders across every currency pair."""
+        page_limit = min(100, max(1, int(limit or 100)))
+        return self._signed_request(
+            "GET",
+            "/api/v4/spot/open_orders",
+            params={"page": 1, "limit": page_limit, "account": "spot"},
+        )
+
     def place_limit_order(self, *, symbol: str, side: str, size: float, price: float, client_order_id: Optional[str] = None) -> LiveOrderResult:
         sd = (side or "").strip().lower()
         if sd not in ("buy", "sell"):
@@ -178,8 +216,8 @@ class GateSpotClient(_GateBase):
             "currency_pair": to_gate_currency_pair(symbol),
             "side": sd,
             "type": "limit",
-            "amount": str(qty),
-            "price": str(px),
+            "amount": _gate_decimal_text(qty),
+            "price": _gate_decimal_text(px),
             "time_in_force": "gtc",
         }
         text = self._format_text(client_order_id)
@@ -201,7 +239,7 @@ class GateSpotClient(_GateBase):
             "currency_pair": to_gate_currency_pair(symbol),
             "side": sd,
             "type": "market",
-            "amount": str(qty),
+            "amount": _gate_decimal_text(qty),
             "time_in_force": "ioc",
         }
         text = self._format_text(client_order_id)
@@ -211,60 +249,46 @@ class GateSpotClient(_GateBase):
         oid = str(raw.get("id") or "") if isinstance(raw, dict) else ""
         return LiveOrderResult(exchange_id="gate", exchange_order_id=oid, filled=0.0, avg_price=0.0, raw=raw if isinstance(raw, dict) else {"raw": raw})
 
-    def cancel_order(self, *, order_id: str) -> Any:
+    def cancel_order(self, *, order_id: str, symbol: str) -> Any:
         if not order_id:
             raise LiveTradingError("Gate spot cancel_order requires order_id")
-        return self._signed_request("DELETE", f"/api/v4/spot/orders/{str(order_id)}")
+        if not str(symbol or "").strip():
+            raise LiveTradingError("Gate spot cancel_order requires symbol")
+        return self._signed_request("DELETE", f"/api/v4/spot/orders/{str(order_id)}",
+                                    params={"currency_pair": to_gate_currency_pair(symbol)})
 
-    def get_order(self, *, order_id: str) -> Any:
+    def get_order(self, *, order_id: str, symbol: str) -> Any:
         if not order_id:
             raise LiveTradingError("Gate spot get_order requires order_id")
-        return self._signed_request("GET", f"/api/v4/spot/orders/{str(order_id)}")
+        if not str(symbol or "").strip():
+            raise LiveTradingError("Gate spot get_order requires symbol")
+        return self._signed_request("GET", f"/api/v4/spot/orders/{str(order_id)}",
+                                    params={"currency_pair": to_gate_currency_pair(symbol)})
 
-    def get_spot_trades_for_order(self, *, order_id: str, currency_pair: str) -> Tuple[float, str]:
-        """Aggregate the actual fee from Gate spot fill history for a given order.
-
-        Gate updates ``fee`` on the spot order object asynchronously after the
-        underlying fills are settled; the authoritative source is
-        ``GET /api/v4/spot/my_trades`` which we sum here. Returns ``(0.0, "")``
-        on any failure so callers can transparently fall back to the order-level
-        fee. Reference: https://www.gate.com/docs/developers/apiv4/#list-personal-trading-history
-        """
-        oid = str(order_id or "").strip()
-        pair = str(currency_pair or "").strip()
-        if not oid or not pair:
-            return 0.0, ""
+    def get_spot_trades_for_order(self, *, order_id: str, currency_pair: str, details=None) -> Tuple[float, str]:
         try:
-            resp = self._signed_request(
-                "GET", "/api/v4/spot/my_trades",
-                params={"currency_pair": pair, "order_id": oid, "limit": 100},
-            )
+            rows = self._order_trade_rows('/api/v4/spot/my_trades', {'currency_pair': currency_pair, 'order_id': str(order_id)})
         except Exception:
-            return 0.0, ""
-        if not isinstance(resp, list):
-            return 0.0, ""
-        total = 0.0
-        ccy = ""
-        for t in resp:
-            if not isinstance(t, dict):
-                continue
-            try:
-                v = abs(float(t.get("fee") or 0.0))
-            except Exception:
-                v = 0.0
-            if v > 0:
-                total += v
-                if not ccy:
-                    ccy = str(t.get("fee_currency") or "").strip()
-        return total, ccy
+            return 0.0, ''
+        fees = {}
+        for row in rows:
+            currency = str(row.get('fee_currency') or '').upper()
+            if currency and row.get('fee') not in (None, ''):
+                fees[currency] = fees.get(currency, 0.0) + float(row['fee'])
+        if details is not None:
+            details.update(fees)
+        if len(fees) == 1:
+            currency, amount = next(iter(fees.items()))
+            return amount, currency
+        return 0.0, 'MIXED' if fees else ''
 
-    def wait_for_fill(self, *, order_id: str, max_wait_sec: float = 10.0, poll_interval_sec: float = 0.5) -> Dict[str, Any]:
+    def wait_for_fill(self, *, order_id: str, symbol: str, max_wait_sec: float = 10.0, poll_interval_sec: float = 0.5) -> Dict[str, Any]:
         end_ts = time.time() + float(max_wait_sec or 0.0)
         last: Dict[str, Any] = {}
         while True:
             timed_out = time.time() >= end_ts
             try:
-                resp = self.get_order(order_id=str(order_id))
+                resp = self.get_order(order_id=str(order_id), symbol=symbol)
                 last = resp if isinstance(resp, dict) else {"raw": resp}
             except Exception:
                 last = last or {}
@@ -273,19 +297,11 @@ class GateSpotClient(_GateBase):
             avg_price = 0.0
             fee = 0.0
             fee_ccy = ""
-            try:
-                filled = float(last.get("filled_amount") or 0.0)
-            except Exception:
-                filled = 0.0
-            try:
-                filled_total = float(last.get("filled_total") or 0.0)
-                if filled > 0 and filled_total > 0:
-                    avg_price = filled_total / filled
-            except Exception:
-                avg_price = 0.0
+            fees_by_ccy = {}
+            filled, avg_price = parse_gate_spot_fill(last)
             # Extract fee from Gate API
             try:
-                fee = abs(float(last.get("fee") or 0.0))
+                fee = float(last.get("fee") or 0.0)
             except Exception:
                 fee = 0.0
             fee_ccy = str(last.get("fee_currency") or "").strip()
@@ -295,31 +311,333 @@ class GateSpotClient(_GateBase):
             # fills endpoint and use its sum. This is the same shape Binance /
             # OKX use (post-fill trades endpoint), without it Gate fills get
             # persisted with ``commission=0`` and P&L drifts.
-            if filled > 0 and fee <= 0:
+            if filled > 0 and fee == 0:
                 try:
                     mt_fee, mt_ccy = self.get_spot_trades_for_order(
                         order_id=str(order_id),
-                        currency_pair=str(last.get("currency_pair") or ""),
+                        currency_pair=str(last.get("currency_pair") or to_gate_currency_pair(symbol)),
+                        details=fees_by_ccy,
                     )
                 except Exception:
                     mt_fee, mt_ccy = 0.0, ""
-                if mt_fee > 0:
+                if mt_ccy:
                     fee = mt_fee
                     if mt_ccy:
                         fee_ccy = mt_ccy
+            if not fees_by_ccy and fee_ccy and fee != 0:
+                fees_by_ccy = {fee_ccy: fee}
             # Fee may lag behind filled/avg on order object; keep polling until timeout (same idea as Bitget/OKX).
             if filled > 0 and avg_price > 0:
-                if fee <= 0 and not timed_out:
+                if not fees_by_ccy and not timed_out:
                     time.sleep(float(poll_interval_sec or 0.5))
                     continue
-                return {"filled": filled, "avg_price": avg_price, "fee": fee, "fee_ccy": fee_ccy, "status": status, "order": last}
+                return {"filled": filled, "avg_price": avg_price, "fee": fee, "fee_ccy": fee_ccy, "fees_by_ccy": fees_by_ccy, "status": status, "order": last}
             if status.lower() in ("closed", "cancelled", "canceled"):
-                if fee <= 0 and filled > 0 and avg_price > 0 and not timed_out:
+                if fee == 0 and filled > 0 and avg_price > 0 and not timed_out:
                     time.sleep(float(poll_interval_sec or 0.5))
                     continue
-                return {"filled": filled, "avg_price": avg_price, "fee": fee, "fee_ccy": fee_ccy, "status": status, "order": last}
+                return {"filled": filled, "avg_price": avg_price, "fee": fee, "fee_ccy": fee_ccy, "fees_by_ccy": fees_by_ccy, "status": status, "order": last}
             if timed_out:
-                return {"filled": filled, "avg_price": avg_price, "fee": fee, "fee_ccy": fee_ccy, "status": status, "order": last}
+                return {"filled": filled, "avg_price": avg_price, "fee": fee, "fee_ccy": fee_ccy, "fees_by_ccy": fees_by_ccy, "status": status, "order": last}
+            time.sleep(float(poll_interval_sec or 0.5))
+
+
+class GateStockClient(_GateBase):
+    """Gate traditional-stock client for the dedicated ``/stock`` API family."""
+
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        secret_key: str,
+        base_url: str = "https://api.gateio.ws",
+        timeout_sec: float = 15.0,
+        channel_id: str = "",
+        product_meta: Optional[Dict[str, Any]] = None,
+    ):
+        super().__init__(
+            api_key=api_key,
+            secret_key=secret_key,
+            base_url=base_url,
+            timeout_sec=timeout_sec,
+            channel_id=channel_id,
+        )
+        self._seed_product_meta = dict(product_meta or {})
+        self._symbol_detail_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+        self._symbol_detail_cache_ttl_sec = 30.0
+
+    @staticmethod
+    def _symbol(symbol: str) -> str:
+        value = str(symbol or "").strip().upper()
+        if ":" in value:
+            value = value.split(":", 1)[0]
+        if "/" in value:
+            value = value.split("/", 1)[0]
+        if not value:
+            raise LiveTradingError("Gate stock symbol is required")
+        return value
+
+    @staticmethod
+    def _rows(raw: Any) -> list[Dict[str, Any]]:
+        data = raw.get("data") if isinstance(raw, dict) else None
+        rows = data.get("list") if isinstance(data, dict) else None
+        return [dict(item) for item in rows or [] if isinstance(item, dict)]
+
+    def ping(self) -> bool:
+        try:
+            raw = self._public_request(
+                "GET", "/api/v4/stock/symbols/detail", params={"symbols": "AAPL", "page_size": 1}
+            )
+            return isinstance(raw, dict)
+        except Exception:
+            return False
+
+    def get_symbol_details(self, *, symbol: str) -> Dict[str, Any]:
+        ticker = self._symbol(symbol)
+        cached = self._symbol_detail_cache.get(ticker)
+        now = time.time()
+        if cached and now - cached[0] <= self._symbol_detail_cache_ttl_sec:
+            return dict(cached[1])
+        params: Dict[str, Any] = {"symbols": ticker, "page_size": 1}
+        stock_exchange = str(self._seed_product_meta.get("stock_exchange") or "").strip().lower()
+        if stock_exchange in {"us", "hk", "kr"}:
+            params["exchange"] = stock_exchange
+        raw = self._public_request(
+            "GET",
+            "/api/v4/stock/symbols/detail",
+            params=params,
+        )
+        rows = self._rows(raw)
+        detail = rows[0] if rows else {}
+        if detail:
+            self._symbol_detail_cache[ticker] = (now, dict(detail))
+        return detail
+
+    @staticmethod
+    def _to_decimal(value: Any) -> Decimal:
+        try:
+            return Decimal(str(value))
+        except Exception:
+            return Decimal("0")
+
+    def _order_rules(self, *, symbol: str) -> Dict[str, Any]:
+        detail: Dict[str, Any] = {}
+        try:
+            detail = self.get_symbol_details(symbol=symbol)
+        except Exception as exc:
+            logger.warning("Gate stock symbol rule refresh failed for %s: %s", symbol, exc)
+        return {**self._seed_product_meta, **detail}
+
+    def _assert_side_allowed(self, *, symbol: str, side: str) -> Dict[str, Any]:
+        rules = self._order_rules(symbol=symbol)
+        try:
+            trade_mode = int(rules.get("trade_mode") or 0)
+        except Exception:
+            trade_mode = 0
+        allowed = {"buy": {1, 3, 4}, "sell": {2, 3, 4}}
+        if trade_mode and trade_mode not in allowed[str(side)]:
+            raise LiveTradingError(f"Gate stock {side} is disabled for {self._symbol(symbol)}")
+        return rules
+
+    def _normalize_quantity(
+        self,
+        *,
+        symbol: str,
+        quantity: float,
+        for_market: bool,
+    ) -> Tuple[Decimal, Optional[int]]:
+        del for_market
+        value = self._to_decimal(quantity)
+        if value <= 0:
+            return Decimal("0"), None
+        rules = self._order_rules(symbol=symbol)
+        step = self._to_decimal(rules.get("step_order_volume") or 0)
+        minimum = self._to_decimal(rules.get("min_order_volume") or 0)
+        maximum = self._to_decimal(rules.get("max_order_volume") or 0)
+        if step > 0:
+            value = floor_decimal_to_step(value, step)
+        precision: Optional[int] = None
+        try:
+            precision = int(rules.get("volume_precision"))
+        except Exception:
+            if step > 0:
+                precision = max(0, -step.normalize().as_tuple().exponent)
+        if precision is not None and precision >= 0:
+            quantum = Decimal("1").scaleb(-precision)
+            value = value.quantize(quantum, rounding=ROUND_DOWN)
+        if (minimum > 0 and value < minimum) or (maximum > 0 and value > maximum):
+            return Decimal("0"), precision
+        return value, precision
+
+    def get_ticker(self, *, symbol: str) -> Dict[str, Any]:
+        ticker = self._symbol(symbol)
+        raw = self._public_request("GET", f"/api/v4/stock/market/{ticker}/orderbook")
+        data = raw.get("data") if isinstance(raw, dict) else None
+        bids = data.get("bids") if isinstance(data, dict) else []
+        asks = data.get("asks") if isinstance(data, dict) else []
+        bid = float((bids[0] if bids else {}).get("p") or 0.0)
+        ask = float((asks[0] if asks else {}).get("p") or 0.0)
+        last = (bid + ask) / 2 if bid > 0 and ask > 0 else max(bid, ask)
+        return {"symbol": ticker, "last": last, "close": last, "price": last, "bid": bid, "ask": ask}
+
+    def get_accounts(self) -> Any:
+        return self._signed_request("GET", "/api/v4/stock/users/assets")
+
+    def get_positions(self, *, symbol: str = "") -> Any:
+        params = {"symbol": self._symbol(symbol)} if str(symbol or "").strip() else None
+        return self._signed_request("GET", "/api/v4/stock/positions", params=params)
+
+    def get_open_orders(self, *, symbol: str = "", limit: int = 100) -> Any:
+        params: Dict[str, Any] = {"page": 1, "page_size": min(500, max(1, int(limit or 100)))}
+        if str(symbol or "").strip():
+            params["symbol"] = self._symbol(symbol)
+        return self._signed_request("GET", "/api/v4/stock/orders", params=params)
+
+    def place_market_order(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        size: float,
+        client_order_id: Optional[str] = None,
+    ) -> LiveOrderResult:
+        sd = str(side or "").strip().lower()
+        if sd not in {"buy", "sell"}:
+            raise LiveTradingError(f"Invalid side: {side}")
+        self._assert_side_allowed(symbol=symbol, side=sd)
+        quantity, _ = self._normalize_quantity(symbol=symbol, quantity=size, for_market=True)
+        if quantity <= 0:
+            raise LiveTradingError("Gate stock quantity violates the current symbol rules")
+        body: Dict[str, Any] = {
+            "volume": _gate_decimal_text(quantity),
+            "symbol": self._symbol(symbol),
+            "side": 2 if sd == "buy" else 1,
+            "price_type": "market",
+            "trading_session": "regular",
+            "time_in_force": "day",
+        }
+        if client_order_id:
+            body["client_order_id"] = str(client_order_id)[:64]
+        raw = self._signed_request("POST", "/api/v4/stock/orders", json_body=body)
+        data = raw.get("data") if isinstance(raw, dict) else None
+        order_id = str(data.get("id") or data.get("order_id") or "") if isinstance(data, dict) else ""
+        return LiveOrderResult(
+            exchange_id="gate",
+            exchange_order_id=order_id,
+            filled=0.0,
+            avg_price=0.0,
+            raw=raw if isinstance(raw, dict) else {"raw": raw},
+        )
+
+    def place_limit_order(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        size: float,
+        price: float,
+        client_order_id: Optional[str] = None,
+    ) -> LiveOrderResult:
+        sd = str(side or "").strip().lower()
+        if sd not in {"buy", "sell"}:
+            raise LiveTradingError(f"Invalid side: {side}")
+        self._assert_side_allowed(symbol=symbol, side=sd)
+        quantity, _ = self._normalize_quantity(symbol=symbol, quantity=size, for_market=False)
+        limit_price = float(price or 0.0)
+        if quantity <= 0 or limit_price <= 0:
+            raise LiveTradingError("Invalid Gate stock limit order")
+        body: Dict[str, Any] = {
+            "volume": _gate_decimal_text(quantity),
+            "symbol": self._symbol(symbol),
+            "side": 2 if sd == "buy" else 1,
+            "price_type": "limit",
+            "trading_session": "all",
+            "time_in_force": "day",
+            "price": _gate_decimal_text(limit_price),
+        }
+        if client_order_id:
+            body["client_order_id"] = str(client_order_id)[:64]
+        raw = self._signed_request("POST", "/api/v4/stock/orders", json_body=body)
+        data = raw.get("data") if isinstance(raw, dict) else None
+        order_id = str(data.get("id") or data.get("order_id") or "") if isinstance(data, dict) else ""
+        return LiveOrderResult(
+            exchange_id="gate",
+            exchange_order_id=order_id,
+            filled=0.0,
+            avg_price=0.0,
+            raw=raw if isinstance(raw, dict) else {"raw": raw},
+        )
+
+    def cancel_order(self, *, order_id: str, symbol: str = "") -> Any:
+        oid = str(order_id or "").strip()
+        if not oid:
+            raise LiveTradingError("Gate stock cancel_order requires order_id")
+        return self._signed_request("DELETE", f"/api/v4/stock/orders/{oid}")
+
+    def get_order(self, *, order_id: str, symbol: str = "") -> Dict[str, Any]:
+        oid = str(order_id or "").strip()
+        if not oid:
+            raise LiveTradingError("Gate stock get_order requires order_id")
+        requests = (
+            lambda: self.get_open_orders(symbol=symbol, limit=500),
+            lambda: self._signed_request(
+                "GET", "/api/v4/stock/orders/history",
+                params={"order_ids": oid, "page": 1, "page_size": 20},
+            ),
+        )
+        for request in requests:
+            try:
+                raw = request()
+            except Exception:
+                continue
+            for row in self._rows(raw):
+                if str(row.get("order_id") or row.get("id") or "") == oid:
+                    return row
+        return {}
+
+    def get_fee_rate(self, symbol: str, market_type: str = "spot") -> Optional[Dict[str, float]]:
+        try:
+            detail = self.get_symbol_details(symbol=symbol)
+            fee = abs(float(detail.get("commission_rate") or 0.0))
+            if fee != 0:
+                return {"maker": fee, "taker": fee}
+        except Exception as exc:
+            logger.warning("Gate stock fee lookup failed for %s: %s", symbol, exc)
+        return None
+
+    def wait_for_fill(
+        self,
+        *,
+        order_id: str,
+        symbol: str,
+        max_wait_sec: float = 10.0,
+        poll_interval_sec: float = 0.5,
+    ) -> Dict[str, Any]:
+        deadline = time.time() + max(0.0, float(max_wait_sec or 0.0))
+        last: Dict[str, Any] = {}
+        while True:
+            try:
+                last = self.get_order(order_id=order_id, symbol=symbol)
+            except Exception:
+                pass
+            filled = float(last.get("fill_volume") or 0.0)
+            avg_price = float(last.get("avg_fill_price") or 0.0)
+            fee = float(last.get("commission") or 0.0)
+            fee_currency = str(last.get("quote_currency") or self._seed_product_meta.get("quote_currency")
+                               or (symbol.rsplit("/", 1)[-1] if "/" in symbol else "")).upper()
+            fees = {fee_currency: fee} if fee_currency and last.get("commission") not in (None, "") else {}
+            status = str(last.get("status_desc") or last.get("status") or "")
+            terminal = status.lower() in {"filled", "cancelled", "canceled", "rejected", "failed"}
+            if terminal or time.time() >= deadline:
+                return {
+                    "filled": filled,
+                    "avg_price": avg_price,
+                    "fee": fee,
+                    "fee_ccy": fee_currency if fees else "",
+                    "fees_by_ccy": fees,
+                    "status": status,
+                    "order": last,
+                }
             time.sleep(float(poll_interval_sec or 0.5))
 
 
@@ -341,10 +659,7 @@ class GateUsdtFuturesClient(_GateBase):
 
     @staticmethod
     def _floor(value: Decimal) -> Decimal:
-        try:
-            return value.to_integral_value(rounding=ROUND_DOWN)
-        except Exception:
-            return Decimal("0")
+        return floor_decimal_to_step(value, Decimal("1"))
 
     def ping(self) -> bool:
         # Gate futures REST no longer serves /api/v4/futures/usdt/time (returns 400 on fx-api / api hosts).
@@ -438,7 +753,7 @@ class GateUsdtFuturesClient(_GateBase):
 
         qm = self._to_dec(meta.get("quanto_multiplier") or meta.get("quantoMultiplier") or "0")
         if qm <= 0:
-            qm = Decimal("1")
+            raise LiveTradingError("strategyRuntime.fillContractMetadataUnavailable")
 
         contracts = req / qm
 
@@ -449,7 +764,7 @@ class GateUsdtFuturesClient(_GateBase):
 
         if dp > 0:
             step = Decimal(10) ** (-dp)
-            q = contracts.quantize(step, rounding=ROUND_DOWN)
+            q = floor_decimal_to_step(contracts, step)
             if q < order_min and contracts > 0:
                 return ("0", {"X-Gate-Size-Decimal": "1"})
             signed_q = q * sign
@@ -475,7 +790,7 @@ class GateUsdtFuturesClient(_GateBase):
             meta = {}
         qm = self._to_dec(meta.get("quanto_multiplier") or "0")
         if qm <= 0:
-            qm = Decimal("1")
+            raise LiveTradingError("strategyRuntime.fillContractMetadataUnavailable")
         return max(1, int(self._floor(self._to_dec(base_size) / qm)))
 
     def contracts_signed_to_base_qty(self, *, contract: str, contracts_signed: float) -> float:
@@ -499,7 +814,7 @@ class GateUsdtFuturesClient(_GateBase):
             or "0"
         )
         if qm <= 0:
-            qm = Decimal("1")
+            raise LiveTradingError("strategyRuntime.fillContractMetadataUnavailable")
         return float(Decimal(str(ct)) * qm)
 
     def get_accounts(self) -> Any:
@@ -543,12 +858,12 @@ class GateUsdtFuturesClient(_GateBase):
         return None
 
     def get_positions(self) -> Any:
-        mode = self.get_position_mode()
-        path = (
-            "/api/v4/futures/usdt/dual_comp/positions"
-            if mode == "dual"
-            else "/api/v4/futures/usdt/positions"
-        )
+        # Gate exposes one collection endpoint for every supported position
+        # mode.  In dual mode the response contains separate ``dual_long`` and
+        # ``dual_short`` rows.  ``dual_comp/positions`` is not a collection
+        # endpoint: Gate only defines ``dual_comp/positions/{contract}``, so
+        # routing a dual account there without a contract produces a bare 404.
+        path = "/api/v4/futures/usdt/positions"
         return self._signed_request(
             "GET", path,
             extra_headers={"X-Gate-Size-Decimal": "1"},
@@ -671,7 +986,12 @@ class GateUsdtFuturesClient(_GateBase):
         size_str, extra_headers = self._resolve_order_size(contract=contract, side=sd, base_size=base_qty)
         if size_str in ("0", "-0", ""):
             raise LiveTradingError("Invalid size (resolved contracts == 0)")
-        body: Dict[str, Any] = {"contract": contract, "size": size_str, "price": str(px), "tif": "gtc"}
+        body: Dict[str, Any] = {
+            "contract": contract,
+            "size": size_str,
+            "price": _gate_decimal_text(px),
+            "tif": "gtc",
+        }
         if reduce_only:
             body["reduce_only"] = True
         text = self._format_text(client_order_id)
@@ -696,6 +1016,15 @@ class GateUsdtFuturesClient(_GateBase):
             raise LiveTradingError("Gate futures get_order requires order_id")
         return self._signed_request("GET", f"/api/v4/futures/usdt/orders/{str(order_id)}")
 
+    def get_open_orders(self, *, limit: int = 100) -> Any:
+        """Return current USDT-settled futures orders across every contract."""
+        page_limit = min(100, max(1, int(limit or 100)))
+        return self._signed_request(
+            "GET",
+            "/api/v4/futures/usdt/orders",
+            params={"status": "open", "limit": page_limit, "offset": 0},
+        )
+
     def get_futures_trades_for_order(self, *, order_id: str, contract: str) -> Tuple[float, str]:
         """Aggregate the actual fee from Gate USDT futures fill history.
 
@@ -712,24 +1041,19 @@ class GateUsdtFuturesClient(_GateBase):
         if not oid or not c:
             return 0.0, ""
         try:
-            resp = self._signed_request(
-                "GET", "/api/v4/futures/usdt/my_trades",
-                params={"contract": c, "order": oid, "limit": 100},
-            )
+            resp = self._order_trade_rows('/api/v4/futures/usdt/my_trades', {'contract': c, 'order': oid})
         except Exception:
-            return 0.0, ""
-        if not isinstance(resp, list):
-            return 0.0, ""
+            return 0.0, ''
         total = 0.0
         for t in resp:
             if not isinstance(t, dict):
                 continue
             try:
-                v = abs(float(t.get("fee") or 0.0))
+                v = float(t.get("fee") or 0.0)
             except Exception:
                 v = 0.0
             total += v
-        if total > 0:
+        if resp:
             # Gate USDT-margined perpetuals settle fees in USDT.
             return total, "USDT"
         return 0.0, ""
@@ -737,14 +1061,8 @@ class GateUsdtFuturesClient(_GateBase):
     def wait_for_fill(self, *, order_id: str, contract: str, max_wait_sec: float = 12.0, poll_interval_sec: float = 0.5) -> Dict[str, Any]:
         end_ts = time.time() + float(max_wait_sec or 0.0)
         last: Dict[str, Any] = {}
-        qm = Decimal("1")
-        try:
-            meta = self.get_contract(contract=str(contract)) or {}
-            qm = self._to_dec(meta.get("quanto_multiplier") or meta.get("contract_size") or "1")
-            if qm <= 0:
-                qm = Decimal("1")
-        except Exception:
-            qm = Decimal("1")
+        from app.services.live_trading.fill_accounting import contract_multiplier
+        qm = Decimal(str(contract_multiplier(self, 'gate', str(contract).replace('_', '/'))))
         while True:
             timed_out = time.time() >= end_ts
             try:
@@ -769,23 +1087,23 @@ class GateUsdtFuturesClient(_GateBase):
             except Exception:
                 filled = 0.0
             try:
-                avg_price = float(last.get("fill_price") or last.get("fillPrice") or last.get("price") or 0.0)
+                avg_price = float(last.get("fill_price") or last.get("fillPrice") or 0.0)
             except Exception:
                 avg_price = 0.0
             # Extract fee from Gate Futures API
             try:
-                fee = abs(float(last.get("fee") or 0.0))
+                fee = float(last.get("fee") or 0.0)
             except Exception:
                 fee = 0.0
             # Gate USDT futures fees are in USDT
-            if fee > 0:
+            if fee != 0:
                 fee_ccy = "USDT"
             # Gate USDT futures order objects routinely report ``fee=0`` even
             # after the order is fully filled; the authoritative source is
             # /futures/usdt/my_trades (filtered by the ``order`` param). Pull
             # from there so commissions stop landing in ``qd_strategy_trades``
             # as zero and P&L stops drifting.
-            if filled > 0 and fee <= 0:
+            if filled > 0 and fee == 0:
                 try:
                     mt_fee, mt_ccy = self.get_futures_trades_for_order(
                         order_id=str(order_id),
@@ -793,19 +1111,19 @@ class GateUsdtFuturesClient(_GateBase):
                     )
                 except Exception:
                     mt_fee, mt_ccy = 0.0, ""
-                if mt_fee > 0:
+                if mt_ccy:
                     fee = mt_fee
                     fee_ccy = mt_ccy or "USDT"
             if filled > 0 and avg_price > 0:
-                if fee <= 0 and not timed_out:
+                if not fee_ccy and not timed_out:
                     time.sleep(float(poll_interval_sec or 0.5))
                     continue
-                return {"filled": filled, "avg_price": avg_price, "fee": fee, "fee_ccy": fee_ccy, "status": status, "order": last}
+                return {"filled": filled, "avg_price": avg_price, "fee": fee, "fee_ccy": fee_ccy, "fees_by_ccy": {fee_ccy: fee} if fee_ccy else {}, "status": status, "order": last}
             if str(status).lower() in ("finished", "cancelled", "canceled"):
-                if fee <= 0 and filled > 0 and avg_price > 0 and not timed_out:
+                if not fee_ccy and filled > 0 and avg_price > 0 and not timed_out:
                     time.sleep(float(poll_interval_sec or 0.5))
                     continue
-                return {"filled": filled, "avg_price": avg_price, "fee": fee, "fee_ccy": fee_ccy, "status": status, "order": last}
+                return {"filled": filled, "avg_price": avg_price, "fee": fee, "fee_ccy": fee_ccy, "fees_by_ccy": {fee_ccy: fee} if fee_ccy else {}, "status": status, "order": last}
             if timed_out:
-                return {"filled": filled, "avg_price": avg_price, "fee": fee, "fee_ccy": fee_ccy, "status": status, "order": last}
+                return {"filled": filled, "avg_price": avg_price, "fee": fee, "fee_ccy": fee_ccy, "fees_by_ccy": {fee_ccy: fee} if fee_ccy else {}, "status": status, "order": last}
             time.sleep(float(poll_interval_sec or 0.5))

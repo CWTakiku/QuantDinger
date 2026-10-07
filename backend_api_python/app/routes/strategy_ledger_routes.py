@@ -27,6 +27,19 @@ def _normalize_trade_row_for_api(trade: dict, *, leverage: float = 1.0, market_t
     except Exception:  # pragma: no cover
         Decimal = ()  # type: ignore
     out = dict(trade)
+    commission_ccy = str(out.get("commission_ccy") or "").strip().upper()
+    exchange_id = str(out.get("exchange_id") or "").strip().lower()
+    if (
+        out.get("commission_quote") is None
+        and commission_ccy in {"", "UNKNOWN"}
+        and (commission_ccy != "UNKNOWN" or exchange_id == "bitget")
+    ):
+        from app.services.live_trading.fee_quote import STABLE_QUOTES, symbol_currencies
+
+        _, quote_currency = symbol_currencies(str(out.get("symbol") or ""))
+        if quote_currency in STABLE_QUOTES and out.get("commission") is not None:
+            out["commission_quote"] = out.get("commission")
+            out["commission_ccy"] = quote_currency
     for k in (
         "price",
         "amount",
@@ -39,6 +52,11 @@ def _normalize_trade_row_for_api(trade: dict, *, leverage: float = 1.0, market_t
         "open_commission_allocated",
         "close_commission",
         "total_commission",
+        "reference_price",
+        "commission_rate",
+        "slippage_rate",
+        "slippage_quote",
+        "leverage",
     ):
         v = out.get(k)
         if isinstance(v, Decimal):
@@ -90,6 +108,84 @@ def _normalize_trade_row_for_api(trade: dict, *, leverage: float = 1.0, market_t
     return out
 
 
+def _virtual_trades_payload(strategy_id: int, *, leverage: float, market_type: str) -> dict:
+    from app.services.virtual_trading import list_virtual_trades
+    from app.utils.trade_net_pnl import enrich_trades_net_pnl
+    from app.utils.trade_close_reason import is_exit_trade_type
+
+    ledger_rows = []
+    opening_commission = 0.0
+    closing_commission = 0.0
+    total_slippage = 0.0
+    gross_realized = 0.0
+    for raw in list_virtual_trades(strategy_id):
+        trade = dict(raw)
+        created_at = trade.get("created_at")
+        if hasattr(created_at, "timestamp"):
+            dt = created_at
+            if getattr(dt, "tzinfo", None) is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            trade["created_at"] = int(dt.timestamp())
+        fee = float(trade.get("commission_quote") or trade.get("commission") or 0.0)
+        slippage = float(trade.get("slippage_quote") or 0.0)
+        reference_price = float(trade.get("reference_price") or 0.0)
+        fill_price = float(trade.get("price") or 0.0)
+        if reference_price > 0:
+            trade["price_deviation_pct"] = round(
+                (fill_price - reference_price) / reference_price * 100.0,
+                8,
+            )
+        gross = float(trade.get("profit") or 0.0)
+        exit_trade = is_exit_trade_type(str(trade.get("type") or ""))
+        opening_commission += 0.0 if exit_trade else fee
+        closing_commission += fee if exit_trade else 0.0
+        gross_realized += gross if exit_trade else 0.0
+        total_slippage += slippage
+        trade.update({
+            "profit": gross if exit_trade else None,
+            "profit_gross": gross if exit_trade else None,
+            "net_pnl": None,
+            "open_commission_allocated": 0.0,
+            "close_commission": fee if exit_trade else 0.0,
+            "total_commission": fee,
+            "pnl_source": "virtual_account",
+            "pnl_status": "complete",
+            "fee_status": "actual",
+            "fee_source": "virtual_simulation",
+            "liquidity_role": "taker",
+        })
+        ledger_rows.append(trade)
+    enrich_trades_net_pnl(ledger_rows)
+    processed_rows = [
+        _normalize_trade_row_for_api(trade, leverage=leverage, market_type=market_type)
+        for trade in ledger_rows
+    ]
+    trading_fees = opening_commission + closing_commission
+    return {
+        "trades": processed_rows,
+        "items": processed_rows,
+        "ledger_mode": "virtual",
+        "cost_summary": {
+            "gross_realized_pnl": round(gross_realized, 8),
+            "opening_commission": round(opening_commission, 8),
+            "closing_commission": round(closing_commission, 8),
+            "trading_commission": round(trading_fees, 8),
+            "slippage_cost": round(total_slippage, 8),
+            "funding_payment": 0.0,
+            "funding_cost": 0.0,
+            "broker_activity_payment": 0.0,
+            "regulatory_payment": 0.0,
+            "adr_payment": 0.0,
+            "margin_interest_payment": 0.0,
+            "other_broker_payment": 0.0,
+            "broker_activity_applicable": False,
+            "net_realized_pnl": round(gross_realized - trading_fees, 8),
+            "pnl_pending_count": 0,
+            "pnl_status": "complete",
+        },
+    }
+
+
 @strategy_blp.route('/strategies/trades', methods=['GET'])
 @login_required
 def get_trades():
@@ -115,19 +211,24 @@ def get_trades():
         if is_derivatives_market(market_type):
             market_type = "swap"
 
-        from app.services.live_trading.records import ensure_strategy_trades_close_reason_column
-        ensure_strategy_trades_close_reason_column()
+        if str(st.get("execution_mode") or "").strip().lower() == "signal":
+            return jsonify({
+                "code": 1,
+                "msg": "success",
+                "data": _virtual_trades_payload(
+                    strategy_id,
+                    leverage=leverage,
+                    market_type=market_type,
+                ),
+            })
+
         from app.services.live_trading.funding_reconciliation import (
             load_strategy_funding_summary,
-            sync_strategy_funding,
         )
         from app.services.live_trading.alpaca_activity_reconciliation import (
             is_alpaca_strategy,
             load_strategy_broker_activity_summary,
-            sync_strategy_alpaca_activities,
         )
-        sync_strategy_funding(strategy_id, user_id=user_id)
-        sync_strategy_alpaca_activities(strategy_id, user_id=user_id)
 
         bot_type = str(trading_config.get("bot_type") or "").strip().lower()
         lang = str(request.args.get("lang") or request.headers.get("Accept-Language") or "zh")[:2].lower()
@@ -140,12 +241,24 @@ def get_trades():
             cur = db.cursor()
             cur.execute(
                 """
-                SELECT id, strategy_id, symbol, type, price, amount, value,
-                       commission, commission_ccy, commission_quote, profit, close_reason,
-                       matched_entry_price, grid_matched_profit, created_at
-                FROM qd_strategy_trades
-                WHERE strategy_id = ?
-                ORDER BY id DESC
+                SELECT t.id, t.strategy_id, t.symbol, t.type, t.price, t.amount, t.value,
+                       t.commission, t.commission_ccy, t.commission_quote, t.profit, t.close_reason,
+                       t.matched_entry_price, t.grid_matched_profit, t.fee_status, t.fee_source, t.created_at,
+                       t.fill_source, t.exchange_order_id, t.exchange_fill_id,
+                       t.credential_id, t.market_type, t.strategy_run_id, t.grid_order_id, t.commission_breakdown,
+                       i.client_order_id AS grid_client_reference,
+                       c.exchange_id,
+                       r.purpose AS grid_order_purpose, r.extra AS grid_order_extra,
+                       p.price AS request_price, p.payload_json AS request_payload,
+                       r.price AS grid_request_price
+                FROM qd_strategy_trades t
+                LEFT JOIN qd_exchange_credentials c ON c.id = t.credential_id AND c.user_id = t.user_id
+                LEFT JOIN pending_orders p ON p.id = t.pending_order_id AND p.strategy_id = t.strategy_id
+                LEFT JOIN strategy_order_intents i ON i.id = t.order_intent_id AND i.strategy_id = t.strategy_id
+                LEFT JOIN qd_grid_resting_orders r ON r.id = t.grid_order_id AND r.strategy_id = t.strategy_id
+                    AND r.exchange_order_id = t.exchange_order_id AND t.exchange_order_id <> ''
+                WHERE t.strategy_id = ?
+                ORDER BY t.id DESC
                 """,
                 (strategy_id,)
             )
@@ -154,9 +267,10 @@ def get_trades():
 
         from app.utils.trade_close_reason import enrich_trade_row
         from app.utils.trade_net_pnl import enrich_trades_net_pnl
+        from app.utils.trade_execution import enrich_execution_reference
         processed_rows = []
         for row in rows:
-            trade = dict(row)
+            trade = enrich_execution_reference(row)
             created_at = trade.get('created_at')
             if created_at:
                 if hasattr(created_at, 'timestamp'):
@@ -177,17 +291,27 @@ def get_trades():
             processed_rows.append(trade)
 
         enrich_trades_net_pnl(processed_rows)
+        from app.services.grid.order_pnl import enrich_grid_order_pnl, execution_fee
+        enrich_grid_order_pnl(processed_rows)
+        from app.services.execution_streams.pnl_reconciliation import enrich_reported_order_pnl
+        try:
+            enrich_reported_order_pnl(processed_rows, user_id=user_id, trading_config=trading_config)
+        except Exception:
+            logger.warning("Reported P&L unavailable for strategy=%s", strategy_id, exc_info=True)
         processed_rows = [
             _normalize_trade_row_for_api(trade, leverage=leverage, market_type=market_type)
             for trade in processed_rows
         ]
 
         from app.utils.trade_close_reason import is_exit_trade_type
+        paired_grid = any(t.get("pnl_source") == "grid_exchange_order_pairs" for t in processed_rows)
         opening_commission = 0.0
         closing_commission = 0.0
         gross_realized = 0.0
         for trade in processed_rows:
-            fee = float(trade.get("commission_quote") if trade.get("commission_quote") is not None else trade.get("commission") or 0.0)
+            fee = float(execution_fee(trade) or 0) if paired_grid else float(
+                trade.get("commission_quote") if trade.get("commission_quote") is not None else trade.get("commission") or 0.0
+            )
             if is_exit_trade_type(str(trade.get("type") or "")):
                 closing_commission += fee
                 if trade.get("profit_gross") is not None:
@@ -200,11 +324,15 @@ def get_trades():
         broker_payment = float(broker.get("broker_activity_payment") or 0.0)
         trading_fees = opening_commission + closing_commission
         net_realized = gross_realized - trading_fees + funding_payment + broker_payment
+        pending_fees = [t for t in processed_rows if paired_grid and execution_fee(t) is None]
+        pnl_pending = len({int(t["id"]) for t in processed_rows
+                           if t.get("pnl_status") in {"unmatched", "fees_pending"}
+                           or (paired_grid and execution_fee(t) is None)})
         cost_summary = {
-            "gross_realized_pnl": round(gross_realized, 8),
-            "opening_commission": round(opening_commission, 8),
-            "closing_commission": round(closing_commission, 8),
-            "trading_commission": round(trading_fees, 8),
+            "gross_realized_pnl": round(gross_realized, 8) if not any(t.get("pnl_status") == "unmatched" for t in processed_rows) else None,
+            "opening_commission": round(opening_commission, 8) if not any(not is_exit_trade_type(t["type"]) for t in pending_fees) else None,
+            "closing_commission": round(closing_commission, 8) if not any(is_exit_trade_type(t["type"]) for t in pending_fees) else None,
+            "trading_commission": round(trading_fees, 8) if not pending_fees else None,
             "funding_payment": round(funding_payment, 8),
             "funding_cost": round(-funding_payment, 8),
             "broker_activity_payment": round(broker_payment, 8),
@@ -213,7 +341,9 @@ def get_trades():
             "margin_interest_payment": round(float(broker.get("margin_interest_payment") or 0.0), 8),
             "other_broker_payment": round(float(broker.get("other_broker_payment") or 0.0), 8),
             "broker_activity_applicable": is_alpaca_strategy(strategy_id, user_id=user_id),
-            "net_realized_pnl": round(net_realized, 8),
+            "net_realized_pnl": round(net_realized, 8) if not pnl_pending else None,
+            "pnl_pending_count": pnl_pending,
+            "pnl_status": "pending" if pnl_pending else "complete",
         }
 
         return jsonify({'code': 1, 'msg': 'success', 'data': {
@@ -282,6 +412,11 @@ def _build_strategy_equity_curve(user_id: int, strategy_id: int):
     initial = float(st.get('initial_capital') or (st.get('trading_config') or {}).get('initial_capital') or 0)
     if initial <= 0:
         initial = 1000.0
+
+    if str(st.get("execution_mode") or "signal").strip().lower() == "signal":
+        from app.services.virtual_trading import build_virtual_equity_curve
+
+        return build_virtual_equity_curve(strategy_id, initial), None
 
     with get_db_connection() as db:
         cur = db.cursor()

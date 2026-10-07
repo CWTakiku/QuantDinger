@@ -49,20 +49,31 @@ celery_app.conf.update(
         "app.tasks.csi300_enhanced",
         "app.tasks.qlib_eod",
         "app.tasks.glass_fiber_industry",
+        "app.tasks.fundamental_sync",
     ),
     task_routes={
         "quantdinger.tasks.fast_analysis": {"queue": "ai"},
         "quantdinger.tasks.agent_job": {"queue": "jobs"},
+        "quantdinger.tasks.expire_agent_jobs": {"queue": "maintenance"},
         "quantdinger.tasks.reflection": {"queue": "maintenance"},
         "quantdinger.tasks.ai_calibration": {"queue": "maintenance"},
         "quantdinger.tasks.market_catalog_sync": {"queue": "maintenance"},
         "quantdinger.tasks.csi300_enhanced_daily_sync": {"queue": "maintenance"},
         "quantdinger.tasks.qlib_eod_sync": {"queue": "maintenance"},
         "quantdinger.tasks.glass_fiber_industry_sync": {"queue": "maintenance"},
+        "quantdinger.tasks.fundamental_sync_tick": {"queue": "maintenance"},
         "quantdinger.tasks.worker_heartbeat": {"queue": "maintenance"},
         "quantdinger.tasks.cleanup_runtime_metadata": {"queue": "maintenance"},
     },
     beat_schedule={
+        "fundamental-sync": {
+            "task": "quantdinger.tasks.fundamental_sync_tick",
+            "schedule": 60.0,
+        },
+        "expire-billed-agent-jobs": {
+            "task": "quantdinger.tasks.expire_agent_jobs",
+            "schedule": 60.0,
+        },
         "reflection-cycle": {
             "task": "quantdinger.tasks.reflection",
             "schedule": max(300, int(os.getenv("REFLECTION_WORKER_INTERVAL_SEC", "86400"))),

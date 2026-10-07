@@ -22,6 +22,7 @@ from urllib.parse import urlencode
 
 from app.services.live_trading.base import BaseRestClient, LiveOrderResult, LiveTradingError
 from app.services.live_trading.symbols import to_bitget_um_symbol
+from app.utils.numeric_precision import floor_decimal_to_step, format_decimal
 
 logger = logging.getLogger(__name__)
 
@@ -72,40 +73,8 @@ class BitgetSpotClient(BaseRestClient):
 
     @staticmethod
     def _parse_fee_detail(raw_fd: Any) -> Tuple[Decimal, str]:
-        """Parse Bitget feeDetail (list, dict, or JSON string) into (abs_fee, ccy).
-
-        Sums ALL entries when feeDetail is a list.
-        """
-        if raw_fd is None:
-            return Decimal("0"), ""
-
-        if isinstance(raw_fd, str):
-            raw_fd = raw_fd.strip()
-            if not raw_fd or raw_fd in ("0", "null"):
-                return Decimal("0"), ""
-            try:
-                raw_fd = json.loads(raw_fd)
-            except (json.JSONDecodeError, ValueError):
-                return Decimal("0"), ""
-
-        entries: List[Dict[str, Any]] = []
-        if isinstance(raw_fd, list):
-            entries = [e for e in raw_fd if isinstance(e, dict)]
-        elif isinstance(raw_fd, dict):
-            entries = [raw_fd]
-
-        total_fee = Decimal("0")
-        ccy = ""
-        for entry in entries:
-            fv = entry.get("totalFee") or entry.get("totalDeductionFee") or entry.get("fee")
-            try:
-                fee = Decimal(str(fv))
-            except Exception:
-                fee = Decimal("0")
-            total_fee += abs(fee)
-            if not ccy:
-                ccy = str(entry.get("feeCoin") or entry.get("feeCcy") or "").strip()
-        return total_fee, ccy
+        from app.services.live_trading.bitget_fees import fee_storage
+        return fee_storage(raw_fd)
 
     @staticmethod
     def _dec_str(d: Decimal, max_decimals: int = 18, strict_precision: Optional[int] = None) -> str:
@@ -183,21 +152,7 @@ class BitgetSpotClient(BaseRestClient):
 
     @staticmethod
     def _floor_to_step(value: Decimal, step: Decimal) -> Decimal:
-        if step is None:
-            return value
-        if value <= 0:
-            return Decimal("0")
-        try:
-            st = Decimal(step)
-        except Exception:
-            st = Decimal("0")
-        if st <= 0:
-            return value
-        try:
-            n = (value / st).to_integral_value(rounding=ROUND_DOWN)
-            return n * st
-        except Exception:
-            return Decimal("0")
+        return floor_decimal_to_step(value, step)
 
     def _sign(self, ts_ms: str, method: str, path: str, body: str) -> str:
         prehash = f"{ts_ms}{method.upper()}{path}{body}"
@@ -448,10 +403,14 @@ class BitgetSpotClient(BaseRestClient):
             raise LiveTradingError("Invalid size/price")
         sz_dec, sz_precision = self._normalize_base_size(symbol=symbol, base_size=req)
         if float(sz_dec or 0) <= 0:
-            raise LiveTradingError(f"Invalid size (below step/min): requested={req}")
+            raise LiveTradingError(
+                f"Invalid size (below step/min): requested={format_decimal(req)}"
+            )
         px_dec, px_precision = self._normalize_limit_price(symbol=symbol, price=px)
         if float(px_dec or 0) <= 0:
-            raise LiveTradingError(f"Invalid price (below tick/min): requested={px}")
+            raise LiveTradingError(
+                f"Invalid price (below tick/min): requested={format_decimal(px)}"
+            )
 
         body: Dict[str, Any] = {
             "side": sd,
@@ -484,13 +443,16 @@ class BitgetSpotClient(BaseRestClient):
         if sd == "sell":
             sz_dec, sz_precision = self._normalize_base_size(symbol=symbol, base_size=req)
             if float(sz_dec or 0) <= 0:
-                raise LiveTradingError(f"Invalid size (below step/min): requested={req}")
+                raise LiveTradingError(
+                    f"Invalid size (below step/min): requested={format_decimal(req)}"
+                )
             sz_str = self._dec_str(sz_dec, strict_precision=sz_precision)
         else:
             sz_dec, sz_precision = self._normalize_quote_size(symbol=symbol, quote_size=req)
             if float(sz_dec or 0) <= 0:
                 raise LiveTradingError(
-                    f"Invalid quote size (below minTradeUSDT/precision): requested={req}"
+                    "Invalid quote size (below minTradeUSDT/precision): "
+                    f"requested={format_decimal(req)}"
                 )
             sz_str = self._dec_str(sz_dec, strict_precision=sz_precision)
 
@@ -508,11 +470,15 @@ class BitgetSpotClient(BaseRestClient):
         order_id = str(data.get("orderId") or "") if isinstance(data, dict) else ""
         return LiveOrderResult(exchange_id="bitget", exchange_order_id=order_id, filled=0.0, avg_price=0.0, raw=raw)
 
-    def cancel_order(self, *, symbol: str, client_order_id: str) -> Dict[str, Any]:
+    def cancel_order(self, *, symbol: str, order_id: str = "", client_order_id: str = "") -> Dict[str, Any]:
         sym = to_bitget_um_symbol(symbol)
-        if not client_order_id:
-            raise LiveTradingError("BitgetSpot cancel_order requires client_order_id")
-        body = {"symbol": sym, "clientOid": str(client_order_id)}
+        body = {"symbol": sym}
+        if order_id:
+            body["orderId"] = str(order_id)
+        elif client_order_id:
+            body["clientOid"] = str(client_order_id)
+        else:
+            raise LiveTradingError("BitgetSpot cancel_order requires order_id or client_order_id")
         return self._signed_request("POST", "/api/v2/spot/trade/cancel-order", json_body=body)
 
     def get_order(self, *, symbol: str, order_id: str = "", client_order_id: str = "") -> Dict[str, Any]:
@@ -529,7 +495,18 @@ class BitgetSpotClient(BaseRestClient):
     def get_fills(self, *, symbol: str, order_id: str) -> Dict[str, Any]:
         sym = to_bitget_um_symbol(symbol)
         params: Dict[str, Any] = {"symbol": sym, "orderId": str(order_id)}
-        return self._signed_request("GET", "/api/v2/spot/trade/fills", params=params)
+        rows = []
+        for _ in range(10):
+            raw = self._signed_request("GET", "/api/v2/spot/trade/fills", params={**params, 'limit': 100})
+            page = raw.get('data') or []
+            rows.extend(page)
+            if len(page) < 100:
+                return {**raw, 'data': rows}
+            cursor = str(page[-1].get('tradeId') or '')
+            if not cursor or cursor == params.get('idLessThan'):
+                break
+            params['idLessThan'] = cursor
+        raise LiveTradingError('strategyRuntime.fillSnapshotNotReady')
 
     def wait_for_fill(
         self,
@@ -541,6 +518,9 @@ class BitgetSpotClient(BaseRestClient):
         poll_interval_sec: float = 0.5,
     ) -> Dict[str, Any]:
         end_ts = time.time() + float(max_wait_sec or 0.0)
+        from app.services.live_trading.fee_quote import symbol_currencies
+
+        base_currency, quote_currency = symbol_currencies(symbol)
         last_order: Dict[str, Any] = {}
         last_fills: Dict[str, Any] = {}
         state = ""
@@ -573,40 +553,27 @@ class BitgetSpotClient(BaseRestClient):
                             if sz > 0 and px > 0:
                                 total_base += sz
                                 total_quote += sz * px
-                            fee_v = f.get("fee")
-                            if fee_v is None:
-                                fee_v = f.get("fillFee")
-                            if fee_v is None:
-                                fee_v = f.get("tradeFee")
-                            ccy = str(f.get("feeCoin") or f.get("feeCcy") or f.get("fillFeeCoin") or f.get("fillFeeCcy") or "").strip()
-                            # Bitget V2: fee is inside feeDetail (list/dict/JSON string)
-                            if fee_v is None or str(fee_v).strip() in ("", "0", "0.0"):
-                                fd_fee, fd_ccy = self._parse_fee_detail(f.get("feeDetail"))
-                                if fd_fee > 0:
-                                    fee = float(fd_fee)
-                                    if not ccy and fd_ccy:
-                                        ccy = fd_ccy
-                                else:
-                                    try:
-                                        fee = float(fee_v or 0.0)
-                                    except Exception:
-                                        fee = 0.0
-                            else:
-                                try:
-                                    fee = float(fee_v or 0.0)
-                                except Exception:
-                                    fee = 0.0
-                            if fee != 0.0:
-                                abs_fee = abs(float(fee))
-                                total_fee += abs_fee
-                                if (not fee_ccy) and ccy:
-                                    fee_ccy = ccy
-                                fee_key = ccy.upper() if ccy else "UNKNOWN"
-                                fees_by_ccy[fee_key] = fees_by_ccy.get(fee_key, 0.0) + abs_fee
+                            from app.services.live_trading.bitget_fees import fee_breakdown
+                            received_currency = (
+                                base_currency
+                                if str(f.get("side") or "").strip().lower() == "buy"
+                                else quote_currency
+                            )
+                            native = fee_breakdown(
+                                f.get("feeDetail"),
+                                received_currency=received_currency,
+                            )
+                            if not native and f.get("fee") is not None:
+                                native = fee_breakdown({"fee": f["fee"], "feeCoin": f.get("feeCoin") or f.get("feeCcy")})
+                            for currency, amount in native.items():
+                                fees_by_ccy[currency] = fees_by_ccy.get(currency, 0.0) + amount
+                            total_fee = sum(fees_by_ccy.values()) if len(fees_by_ccy) == 1 else 0
+                            fee_ccy = next(iter(fees_by_ccy)) if len(fees_by_ccy) == 1 else "MIXED" if fees_by_ccy else ""
+
                         except Exception:
                             continue
                 if total_base > 0 and total_quote > 0:
-                    if total_fee <= 0 and not timed_out:
+                    if not fees_by_ccy and not timed_out:
                         time.sleep(float(poll_interval_sec or 0.5))
                         continue
                     logger.debug(
@@ -641,7 +608,7 @@ class BitgetSpotClient(BaseRestClient):
                 fee = 0.0
                 fee_ccy = ""
                 try:
-                    filled = float(row.get("baseVolume") or row.get("filledQty") or row.get("dealSize") or row.get("size") or 0.0)
+                    filled = float(row.get("baseVolume") or row.get("filledQty") or row.get("dealSize") or 0.0)
                 except Exception:
                     filled = 0.0
                 try:
@@ -649,27 +616,37 @@ class BitgetSpotClient(BaseRestClient):
                     if filled > 0 and quote_amt > 0:
                         avg_price = quote_amt / filled
                     else:
-                        avg_price = float(row.get("priceAvg") or row.get("price") or 0.0)
+                        avg_price = float(row.get("priceAvg") or 0.0)
                 except Exception:
                     avg_price = 0.0
                 try:
-                    fee = abs(float(row.get("fee") or row.get("fillFee") or 0.0))
+                    fee = -float(row.get("fee") or row.get("fillFee") or 0.0)
                     fee_ccy = str(row.get("feeCoin") or row.get("feeCcy") or "").strip()
                 except Exception:
                     pass
-                if fee <= 0 and isinstance(row, dict):
+                if fee == 0 and isinstance(row, dict):
                     fd_fee, fd_ccy = self._parse_fee_detail(row.get("feeDetail"))
-                    if fd_fee > 0:
+                    if fd_ccy:
                         fee = float(fd_fee)
                         if not fee_ccy and fd_ccy:
                             fee_ccy = fd_ccy
                         logger.debug("Bitget Spot timeout fallback fee via feeDetail: %.8f %s", fee, fee_ccy)
+                from app.services.live_trading.bitget_fees import fee_breakdown
+                from app.services.live_trading.fee_quote import symbol_currencies
+                base, quote = symbol_currencies(symbol)
+                native_fees = fee_breakdown(row.get('feeDetail'), received_currency=base if row.get('side') == 'buy' else quote)
+                if not native_fees and fee_ccy:
+                    native_fees = {fee_ccy.upper(): fee}
+                if len(native_fees) == 1:
+                    fee_ccy, fee = next(iter(native_fees.items()))
+                elif native_fees:
+                    fee_ccy, fee = 'MIXED', 0
                 return {
                     "filled": filled,
                     "avg_price": avg_price,
                     "fee": fee,
                     "fee_ccy": fee_ccy,
-                    "fees_by_ccy": ({str(fee_ccy).upper(): fee} if fee > 0 else {}),
+                    "fees_by_ccy": native_fees,
                     "state": state,
                     "order": last_order,
                     "fills": last_fills,
@@ -693,4 +670,3 @@ class BitgetSpotClient(BaseRestClient):
         if isinstance(data, dict):
             return data
         return {}
-

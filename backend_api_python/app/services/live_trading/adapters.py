@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict
+from typing import Any, Callable, Dict, Optional
 
 from app.services.live_trading.base import LiveOrderResult
 from app.services.live_trading.contracts import FillSnapshot, OrderIntent, PositionSnapshot
@@ -28,6 +28,7 @@ class LiveOrderPhaseAdapter:
         ref_price: float = 0.0,
         spot_quote_amt: float = 0.0,
         spot_market_buy_uses_quote: bool = False,
+        before_submit: Optional[Callable[[OrderIntent], None]] = None,
     ):
         self.client = client
         self.exchange_id = str(exchange_id or "")
@@ -37,8 +38,11 @@ class LiveOrderPhaseAdapter:
         self.ref_price = float(ref_price or 0.0)
         self.spot_quote_amt = float(spot_quote_amt or 0.0)
         self.spot_market_buy_uses_quote = bool(spot_market_buy_uses_quote)
+        self.before_submit = before_submit
 
     def place_market_order(self, intent: OrderIntent) -> LiveOrderResult:
+        if self.before_submit is not None:
+            self.before_submit(intent)
         return place_live_market_order(
             client=self.client,
             symbol=str(intent.symbol),
@@ -52,11 +56,13 @@ class LiveOrderPhaseAdapter:
             exchange_config=self.exchange_config,
             leverage=float(intent.leverage or 1.0),
             ref_price=float(self.ref_price or 0.0),
-            spot_quote_amt=float(self.spot_quote_amt or 0.0),
+            spot_quote_amt=float(intent.quote_amount or self.spot_quote_amt or 0.0),
             spot_market_buy_uses_quote=bool(self.spot_market_buy_uses_quote),
         )
 
     def place_limit_order(self, intent: OrderIntent) -> LiveOrderResult:
+        if self.before_submit is not None:
+            self.before_submit(intent)
         return place_live_limit_order(
             client=self.client,
             symbol=str(intent.symbol),
@@ -106,25 +112,29 @@ class LiveOrderPhaseAdapter:
         if isinstance(raw_breakdown, dict):
             for currency, amount in raw_breakdown.items():
                 try:
-                    fee = abs(float(amount or 0.0))
+                    fee = float(amount or 0.0)
                 except (TypeError, ValueError):
                     fee = 0.0
-                if fee > 0:
+                if currency:
                     fees_by_ccy[str(currency or "").strip().upper() or "UNKNOWN"] = fee
         if not fees_by_ccy:
             try:
-                fee = abs(float((raw or {}).get("fee") or 0.0))
+                fee = float((raw or {}).get("fee") or 0.0)
             except (TypeError, ValueError):
                 fee = 0.0
-            if fee > 0:
+            if fee != 0:
                 currency = str((raw or {}).get("fee_ccy") or "").strip().upper() or "UNKNOWN"
                 fees_by_ccy[currency] = fee
         return FillSnapshot(
             filled_qty=float((raw or {}).get("filled") or 0.0),
             avg_price=float((raw or {}).get("avg_price") or 0.0),
-            status=str((raw or {}).get("status") or ""),
+            status=str((raw or {}).get("status") or (raw or {}).get("state") or ""),
             raw=dict(raw or {}),
             fees_by_ccy=fees_by_ccy,
+            fee_status=str(
+                (raw or {}).get("fee_status")
+                or ("actual" if fees_by_ccy else "pending")
+            ),
         )
 
     def query_position(self, intent: OrderIntent) -> PositionSnapshot:

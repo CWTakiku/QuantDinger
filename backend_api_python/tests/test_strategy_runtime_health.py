@@ -53,6 +53,7 @@ def test_strategy_rows_include_daily_pnl_metrics(monkeypatch):
 
 def test_runtime_heartbeat_persists_loop_latency(monkeypatch):
     saved = {}
+    health.reset_runtime_heartbeat_coalescer()
 
     class Store:
         def __init__(self, **kwargs):
@@ -83,6 +84,44 @@ def test_runtime_heartbeat_persists_loop_latency(monkeypatch):
     assert saved["values"]["last_heartbeat_at"] == 1784434455
     assert saved["values"]["loop_latency_ms"] == 41
     assert saved["values"]["latency_ms"] == 41
+
+
+def test_runtime_heartbeat_coalesces_repeated_writes_but_persists_status_changes(monkeypatch):
+    writes = []
+    health.reset_runtime_heartbeat_coalescer()
+
+    class Store:
+        def __init__(self, **_kwargs):
+            pass
+
+        def save(self, values):
+            writes.append(values)
+
+    from app.services.strategy_runtime import state
+    from app.services import strategy_daily_pnl
+
+    clock = iter([100.0, 101.0, 102.0])
+    monkeypatch.setattr(state, "RuntimeStateStore", Store)
+    monkeypatch.setattr(health.time, "time", lambda: next(clock))
+    monkeypatch.setattr(strategy_daily_pnl, "maybe_capture_strategy_equity_snapshot", lambda _id: None)
+
+    common = {
+        "strategy_id": 20,
+        "strategy_run_id": 7,
+        "symbol": "BTC/USDT",
+        "pending_signal_count": 0,
+    }
+    health.record_runtime_heartbeat(**common, price=100.0)
+    health.record_runtime_heartbeat(**common, price=101.0)
+    health.record_runtime_heartbeat(
+        **common,
+        price=101.0,
+        status="degraded",
+        last_error="quote stale",
+    )
+
+    assert len(writes) == 2
+    assert writes[-1]["status"] == "degraded"
 
 
 def test_historical_failed_order_does_not_degrade_current_run(monkeypatch):
@@ -144,6 +183,31 @@ def test_position_drift_degrades_running_strategy_health():
     }
 
     assert health._health_state(snapshot, strategy_status="running", now=1_010) == "degraded"
+
+
+def test_active_lease_keeps_event_driven_idle_runtime_healthy():
+    snapshot = {
+        **health._empty_snapshot(),
+        "run_id": 7,
+        "last_heartbeat_at": 1_000,
+        "trigger_mode": "closed_bar_event",
+        "runtime_lease_active": True,
+    }
+
+    assert health._health_state(snapshot, strategy_status="running", now=2_000) == "healthy"
+
+
+def test_active_lease_does_not_hide_event_runtime_error():
+    snapshot = {
+        **health._empty_snapshot(),
+        "run_id": 7,
+        "last_heartbeat_at": 1_000,
+        "trigger_mode": "closed_bar_event",
+        "runtime_lease_active": True,
+        "last_error": "market_data_unavailable",
+    }
+
+    assert health._health_state(snapshot, strategy_status="running", now=2_000) == "degraded"
 
 
 def test_position_ownership_loader_attaches_matching_okx_drift(monkeypatch):

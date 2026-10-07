@@ -17,6 +17,7 @@ from typing import Any, Dict, Optional, Tuple
 from urllib.parse import urlencode
 
 from app.services.live_trading.base import BaseRestClient, LiveOrderResult, LiveTradingError
+from app.utils.numeric_precision import floor_decimal_to_step, format_decimal
 
 logger = logging.getLogger(__name__)
 from app.services.live_trading.symbols import to_okx_swap_inst_id, to_okx_spot_inst_id
@@ -170,21 +171,7 @@ class OkxClient(BaseRestClient):
 
     @staticmethod
     def _floor_to_step(value: Decimal, step: Decimal) -> Decimal:
-        if step is None:
-            return value
-        try:
-            st = Decimal(step)
-        except Exception:
-            st = Decimal("0")
-        if st <= 0:
-            return value
-        if value <= 0:
-            return Decimal("0")
-        try:
-            n = (value / st).to_integral_value(rounding=ROUND_DOWN)
-            return n * st
-        except Exception:
-            return Decimal("0")
+        return floor_decimal_to_step(value, step)
 
     def _public_request(self, method: str, path: str, *, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         code, data, text = self._request(method, path, params=params, json_body=None, headers=None, data=None)
@@ -249,9 +236,10 @@ class OkxClient(BaseRestClient):
 
         # Convert base qty -> contracts for swaps if ctVal is provided.
         if mt != "spot":
-            ct_val = self._to_dec((inst or {}).get("ctVal") or "0")
-            if ct_val > 0:
-                req = req / ct_val
+            from app.services.live_trading.fill_accounting import contract_multiplier
+            canonical_symbol = iid.replace("-SWAP", "").replace("-", "/")
+            ct_val = Decimal(str(contract_multiplier(self, "okx", canonical_symbol)))
+            req = req / ct_val
 
         # Align to lot size step.
         if lot_sz > 0:
@@ -630,7 +618,10 @@ class OkxClient(BaseRestClient):
         sz_raw = float(size or 0.0)
         sz_dec, sz_precision = self._normalize_order_size(inst_id=inst_id, market_type=mt, size=sz_raw)
         if float(sz_dec or 0) <= 0:
-            raise LiveTradingError(f"Invalid size (below lot/min size): requested={sz_raw}")
+            raise LiveTradingError(
+                "Invalid size (below lot/min size): "
+                f"requested={format_decimal(sz_raw)}"
+            )
 
         if mt == "spot":
             body: Dict[str, Any] = {
@@ -707,21 +698,27 @@ class OkxClient(BaseRestClient):
             inst_id = to_okx_spot_inst_id(symbol)
             sz_dec, sz_precision = self._normalize_order_size(inst_id=inst_id, market_type=mt, size=sz_raw)
             if float(sz_dec or 0) <= 0:
-                raise LiveTradingError(f"Invalid size (below lot/min size): requested={sz_raw}")
+                raise LiveTradingError(
+                    "Invalid size (below lot/min size): "
+                    f"requested={format_decimal(sz_raw)}"
+                )
             body: Dict[str, Any] = {
                 "instId": inst_id,
                 "tdMode": "cash",
                 "side": sd,
                 "ordType": "limit",
                 "sz": self._dec_str(sz_dec, strict_precision=sz_precision),
-                "px": str(px),
+                "px": self._dec_str(self._to_dec(px)),
             }
         else:
             inst_id = to_okx_swap_inst_id(symbol)
             ps = self._resolve_pos_side(requested_pos_side=pos_side, market_type=mt)
             sz_dec, sz_precision = self._normalize_order_size(inst_id=inst_id, market_type=mt, size=sz_raw)
             if float(sz_dec or 0) <= 0:
-                raise LiveTradingError(f"Invalid size (below lot/min size): requested={sz_raw}")
+                raise LiveTradingError(
+                    "Invalid size (below lot/min size): "
+                    f"requested={format_decimal(sz_raw)}"
+                )
             td = (td_mode or "cross").lower()
             if td not in ("cross", "isolated"):
                 td = "cross"
@@ -732,7 +729,7 @@ class OkxClient(BaseRestClient):
                 "posSide": ps,
                 "ordType": "limit",
                 "sz": self._dec_str(sz_dec, strict_precision=sz_precision),
-                "px": str(px),
+                "px": self._dec_str(self._to_dec(px)),
             }
             if reduce_only and ps == "net":
                 body["reduceOnly"] = "true"
@@ -814,14 +811,8 @@ class OkxClient(BaseRestClient):
         inst_id = to_okx_spot_inst_id(symbol) if mt == "spot" else to_okx_swap_inst_id(symbol)
         ct_val = Decimal("0")
         if mt != "spot":
-            try:
-                inst = self.get_instrument(inst_type="SWAP", inst_id=inst_id) or {}
-                ct_val = self._to_dec(inst.get("ctVal") or "0")
-            except Exception:
-                ct_val = Decimal("0")
-            if ct_val <= 0:
-                # Fallback: keep quantities unchanged if ctVal is unavailable (best-effort).
-                ct_val = Decimal("1")
+            from app.services.live_trading.fill_accounting import contract_multiplier
+            ct_val = Decimal(str(contract_multiplier(self, "okx", symbol)))
         end_ts = time.time() + float(max_wait_sec or 0.0)
         last_order: Dict[str, Any] = {}
         last_fills: Dict[str, Any] = {}
@@ -851,6 +842,13 @@ class OkxClient(BaseRestClient):
                 filled = float(filled_base_dec or 0)
             except Exception:
                 filled = 0.0
+
+            if filled > 0 and avg_price > 0 and last_order.get('fee') not in (None, '') and last_order.get('feeCcy'):
+                fee = -float(last_order['fee'])
+                currency = str(last_order['feeCcy']).upper()
+                return dict(filled=filled, avg_price=avg_price, fee=fee, fee_ccy=currency,
+                    fees_by_ccy={currency: fee}, fee_status='actual' if fee else 'actual_zero',
+                    state=state, order=last_order, filled_unit='base')
 
             # Prefer fills endpoint for fee (and more reliable avg/filled aggregation).
             try:
@@ -883,9 +881,9 @@ class OkxClient(BaseRestClient):
                                 total_base += sz_base
                                 total_quote += sz_base * px
                                 got_any_fill = True
-                            if fee != 0.0:
-                                # OKX fees are often negative for costs; store absolute cost.
-                                abs_fee = abs(float(fee))
+                            if fee_v is not None and ccy:
+                                # OKX debits are negative and rebates are positive.
+                                abs_fee = -float(fee)
                                 total_fee += abs_fee
                                 if (not fee_ccy) and ccy:
                                     fee_ccy = ccy
@@ -896,7 +894,7 @@ class OkxClient(BaseRestClient):
                 # If fills are present, they are the best source of fee/avg aggregation.
                 # However, OKX may lag in exposing fills right after an order is filled.
                 # To avoid losing commission, do not fall back early when we haven't seen any fills yet.
-                if got_any_fill and total_base > 0 and total_quote > 0:
+                if got_any_fill and total_base > 0 and total_quote > 0 and float(total_base) + 1e-12 >= filled:
                     return {
                         "filled": float(total_base),
                         "avg_price": float(total_quote / total_base),

@@ -24,7 +24,7 @@ logger = get_logger(__name__)
 
 alpaca_blp = Blueprint('alpaca', __name__)
 
-# Per-user client cache keyed by (user_id, 'alpaca')
+# Clients are isolated by authenticated user and saved credential id.
 _sessions = BrokerSessionRegistry('alpaca')
 
 
@@ -66,6 +66,8 @@ def _config_from_request(data: dict) -> AlpacaConfig:
     secret_key = str(data.get("secretKey") or data.get("secret_key") or "").strip()
     if not api_key or not secret_key:
         raise ValueError("apiKey and secretKey required")
+    if str(data.get("baseUrl") or data.get("base_url") or "").strip():
+        raise ValueError("ALPACA_BASE_URL_OVERRIDE_NOT_ALLOWED")
     paper_raw = data.get("paper")
     if paper_raw is None:
         paper = api_key.upper().startswith("PK")
@@ -75,7 +77,6 @@ def _config_from_request(data: dict) -> AlpacaConfig:
         api_key=api_key,
         secret_key=secret_key,
         paper=paper,
-        base_url=data.get("baseUrl") or data.get("base_url") or None,
     )
 
 
@@ -85,30 +86,55 @@ def _config_to_vault_dict(config: AlpacaConfig) -> dict:
         "api_key": config.api_key,
         "secret_key": config.secret_key,
         "paper": bool(config.paper),
-        "base_url": config.base_url or "",
         "market_category": "USStock",
         "market_type": "spot",
     }
 
 
-def _load_saved_alpaca_config(user_id: int) -> dict:
-    """Load the most recent saved Alpaca credential for this user."""
+def _saved_alpaca_rows(user_id: int) -> list:
     with get_db_connection() as db:
         cur = db.cursor()
         cur.execute(
             """
-            SELECT id, encrypted_config
+            SELECT id, name, api_key_hint, encrypted_config
             FROM qd_exchange_credentials
             WHERE user_id = %s AND exchange_id = 'alpaca'
             ORDER BY updated_at DESC NULLS LAST, id DESC
-            LIMIT 1
             """,
             (int(user_id),),
         )
-        row = cur.fetchone() or {}
+        rows = cur.fetchall() or []
         cur.close()
-    if not row:
+    return rows
+
+
+def _requested_credential_id():
+    body = request.get_json(silent=True) or {}
+    value = request.args.get("credential_id", body.get("credential_id"))
+    if value is None:
+        return None
+    try:
+        credential_id = int(value)
+        if credential_id > 0:
+            return credential_id
+    except (ValueError, TypeError):
+        pass
+    raise ValueError("brokerAccounts.accountSelectionRequired")
+
+
+def _load_saved_alpaca_config(user_id: int) -> dict:
+    """Resolve an owned credential; never silently choose between accounts."""
+    rows = _saved_alpaca_rows(user_id)
+    credential_id = _requested_credential_id()
+    if credential_id is not None:
+        rows = [row for row in rows if int(row["id"]) == credential_id]
+        if not rows:
+            raise ValueError("brokerAccounts.accountUnavailable")
+    elif len(rows) > 1:
+        raise ValueError("brokerAccounts.accountSelectionRequired")
+    if not rows:
         return {}
+    row = rows[0]
     try:
         plain = decrypt_credential_blob(row.get("encrypted_config"))
         cfg = json.loads(plain) if plain else {}
@@ -121,7 +147,7 @@ def _load_saved_alpaca_config(user_id: int) -> dict:
         return {}
 
 
-def _save_or_update_alpaca_credential(user_id: int, config: AlpacaConfig) -> int:
+def _save_or_update_alpaca_credential(user_id: int, config: AlpacaConfig, name: str = "") -> int:
     """Persist the connected Alpaca credential so refresh/restart can restore it."""
     vault_cfg = _config_to_vault_dict(config)
     api_key = str(config.api_key or "").strip()
@@ -157,10 +183,11 @@ def _save_or_update_alpaca_credential(user_id: int, config: AlpacaConfig) -> int
                 UPDATE qd_exchange_credentials
                 SET api_key_hint = %s,
                     encrypted_config = %s,
+                    name = COALESCE(NULLIF(%s, ''), name),
                     updated_at = NOW()
                 WHERE id = %s AND user_id = %s
                 """,
-                (hint, encrypted, target_id, int(user_id)),
+                (hint, encrypted, str(name or "").strip()[:100], target_id, int(user_id)),
             )
             cred_id = target_id
         else:
@@ -171,7 +198,7 @@ def _save_or_update_alpaca_credential(user_id: int, config: AlpacaConfig) -> int
                 VALUES (%s, %s, 'alpaca', %s, %s, NOW(), NOW())
                 RETURNING id
                 """,
-                (int(user_id), f"Alpaca {_alpaca_env_tag(api_key).title()}", hint, encrypted),
+                (int(user_id), str(name or "").strip()[:100] or f"Alpaca {_alpaca_env_tag(api_key).title()}", hint, encrypted),
             )
             cred_id = int((cur.fetchone() or {}).get("id") or 0)
         db.commit()
@@ -179,38 +206,51 @@ def _save_or_update_alpaca_credential(user_id: int, config: AlpacaConfig) -> int
     return cred_id
 
 
-def _client_from_saved_credential():
+def _client_from_saved_credential(cfg=None):
     user_id = int(getattr(g, "user_id", 1) or 1)
-    cfg = _load_saved_alpaca_config(user_id)
+    cfg = cfg if cfg is not None else _load_saved_alpaca_config(user_id)
     if not cfg:
         return None
-    config = AlpacaConfig(
-        api_key=str(cfg.get("api_key") or cfg.get("apiKey") or "").strip(),
-        secret_key=str(cfg.get("secret_key") or cfg.get("secretKey") or cfg.get("secret") or "").strip(),
-        paper=_as_bool(cfg.get("paper"), str(cfg.get("api_key") or "").upper().startswith("PK")),
-        base_url=cfg.get("base_url") or cfg.get("baseUrl") or None,
-    )
+    try:
+        config = AlpacaConfig(
+            api_key=str(cfg.get("api_key") or cfg.get("apiKey") or "").strip(),
+            secret_key=str(cfg.get("secret_key") or cfg.get("secretKey") or cfg.get("secret") or "").strip(),
+            paper=_as_bool(cfg.get("paper"), str(cfg.get("api_key") or "").upper().startswith("PK")),
+            base_url=cfg.get("base_url") or cfg.get("baseUrl") or None,
+        )
+    except ValueError:
+        logger.warning("Rejected a saved Alpaca credential with a non-official trading endpoint")
+        return None
     if not config.api_key or not config.secret_key:
         return None
     client = AlpacaClient(config)
     if not client.connect():
         return None
-    _sessions.set(client)
+    _sessions.set(client, cfg["credential_id"])
     return client
 
 
 # ==================== Connection Management ====================
+
+@alpaca_blp.route('/accounts', methods=['GET'])
+@login_required
+def get_saved_accounts():
+    rows = _saved_alpaca_rows(int(g.user_id))
+    return jsonify({"success": True, "data": [
+        {key: row.get(key) for key in ("id", "name", "api_key_hint")}
+        for row in rows
+    ]})
 
 @alpaca_blp.route('/status', methods=['GET'])
 @login_required
 def get_status():
     """Get Alpaca connection status."""
     try:
-        client = _sessions.get()
+        saved = _load_saved_alpaca_config(int(g.user_id))
+        client = _sessions.get(saved["credential_id"]) if saved else None
         if client is None:
-            client = _client_from_saved_credential()
+            client = _client_from_saved_credential(saved)
         if client is None:
-            saved = _load_saved_alpaca_config(int(getattr(g, "user_id", 1) or 1))
             data = _placeholder_status()
             if saved:
                 data.update(
@@ -222,11 +262,12 @@ def get_status():
                 )
             return jsonify({"success": True, "data": data})
         data = client.get_connection_status()
-        saved = _load_saved_alpaca_config(int(getattr(g, "user_id", 1) or 1))
         if saved:
             data["credential_id"] = saved.get("credential_id") or 0
             data["saved"] = True
         return jsonify({"success": True, "data": data})
+    except ValueError as e:
+        return jsonify({"success": False, "error": str(e)}), 400
     except Exception as e:
         logger.error(f"Get status failed: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
@@ -242,7 +283,6 @@ def connect():
         apiKey (required): API key (PK prefix = paper, AK = live)
         secretKey (required): Secret key
         paper (optional, default true): Use paper trading
-        baseUrl (optional): Override API base URL
     """
     try:
         data = request.get_json() or {}
@@ -254,8 +294,8 @@ def connect():
         client = AlpacaClient(config)
         success = client.connect()
         if success:
-            cred_id = _save_or_update_alpaca_credential(int(getattr(g, "user_id", 1) or 1), config)
-            _sessions.set(client)
+            cred_id = _save_or_update_alpaca_credential(int(g.user_id), config, data.get("name", ""))
+            _sessions.set(client, cred_id)
             status = client.get_connection_status()
             status["credential_id"] = cred_id
             status["saved"] = True
@@ -283,7 +323,9 @@ def connect():
 def disconnect():
     """Disconnect from Alpaca."""
     try:
-        _sessions.disconnect_current()
+        cfg = _load_saved_alpaca_config(int(g.user_id))
+        if cfg:
+            _sessions.disconnect_current(cfg["credential_id"])
         return jsonify({"success": True, "message": "Disconnected"})
     except Exception as e:
         logger.error(f"Disconnect failed: {e}")
@@ -293,9 +335,13 @@ def disconnect():
 # ==================== Account Queries ====================
 
 def _require_connected_client():
-    client = _sessions.get()
+    try:
+        cfg = _load_saved_alpaca_config(int(g.user_id))
+    except ValueError as exc:
+        return None, (jsonify({"success": False, "error": str(exc)}), 400)
+    client = _sessions.get(cfg["credential_id"]) if cfg else None
     if client is None or not client.connected:
-        client = _client_from_saved_credential()
+        client = _client_from_saved_credential(cfg)
     if client is None or not client.connected:
         return None, (jsonify({"success": False, "error": "Not connected to Alpaca"}), 400)
     return client, None
@@ -309,7 +355,26 @@ def get_account():
         client, err = _require_connected_client()
         if err is not None:
             return err
-        return jsonify({"success": True, "data": client.get_account_summary()})
+        summary = client.get_account_summary()
+        if summary.get("success") is False:
+            return jsonify({"success": False, "error": "brokerAccounts.accountLoadFailed"}), 502
+        if not _as_bool(request.args.get("include_counts"), True):
+            return jsonify({"success": True, "data": summary})
+        summary["position_count"] = None
+        summary["recent_filled_order_count"] = None
+        summary["recent_order_limit"] = 100
+        try:
+            summary["position_count"] = len(client.get_positions(raise_on_error=True))
+        except Exception:
+            logger.warning("Alpaca account position count unavailable")
+        try:
+            orders = client.get_orders(limit=100, raise_on_error=True)
+            summary["recent_filled_order_count"] = sum(
+                1 for order in orders if str(order.get("status") or "").strip().lower() == "filled"
+            )
+        except Exception:
+            logger.warning("Alpaca account recent order count unavailable")
+        return jsonify({"success": True, "data": summary})
     except Exception as e:
         logger.error(f"Get account info failed: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
@@ -323,7 +388,7 @@ def get_positions():
         client, err = _require_connected_client()
         if err is not None:
             return err
-        return jsonify({"success": True, "data": client.get_positions()})
+        return jsonify({"success": True, "data": client.get_positions(raise_on_error=True)})
     except Exception as e:
         logger.error(f"Get positions failed: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
@@ -339,7 +404,7 @@ def get_orders():
             return err
         status = str(request.args.get("status") or "all").strip().lower()
         limit = int(request.args.get("limit") or 100)
-        return jsonify({"success": True, "data": client.get_orders(status=status, limit=limit)})
+        return jsonify({"success": True, "data": client.get_orders(status=status, limit=limit, raise_on_error=True)})
     except Exception as e:
         logger.error(f"Get orders failed: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
@@ -356,7 +421,7 @@ def place_order():
     Request body:
         symbol (required): Ticker, e.g. AAPL
         side (required): buy or sell
-        quantity (required): Share quantity
+        quantity or notional (required): Share quantity or USD amount; mutually exclusive
         marketType (optional): USStock or crypto (default USStock)
         orderType (optional): market or limit (default market)
         price (required for limit): Limit price
@@ -370,28 +435,67 @@ def place_order():
         data = request.get_json() or {}
         symbol = data.get('symbol')
         side = data.get('side')
-        quantity = data.get('quantity')
+        try:
+            quantity = float(data.get('quantity') or 0)
+            notional = float(data.get('notional') or data.get('amount') or 0)
+        except (TypeError, ValueError):
+            return jsonify({"success": False, "error": "quantity and notional must be numeric"}), 400
         if not symbol:
             return jsonify({"success": False, "error": "Missing symbol"}), 400
         if not side or side.lower() not in ('buy', 'sell'):
             return jsonify({"success": False, "error": "side must be buy or sell"}), 400
-        if not quantity or float(quantity) <= 0:
-            return jsonify({"success": False, "error": "quantity must be > 0"}), 400
+        if (quantity > 0) == (notional > 0):
+            return jsonify({"success": False, "error": "Provide exactly one of quantity or notional"}), 400
 
         market_type = data.get('marketType', 'USStock')
         order_type = (data.get('orderType') or 'market').lower()
 
+        if bool(data.get('ai_decision_filter')):
+            from app.services.ai_decision_filter import AIDecisionFilter, AIDecisionRequest
+
+            decision_price = float(data.get('price') or data.get('reference_price') or 0)
+            decision = AIDecisionFilter().evaluate(
+                AIDecisionRequest(
+                    user_id=int(g.user_id),
+                    source_type="quick_trade",
+                    source_id=int(data.get("credential_id") or 0),
+                    symbol=str(symbol),
+                    action="open_long" if str(side).lower() == "buy" else "close_long",
+                    market_type=str(market_type),
+                    order_type=order_type,
+                    quantity=quantity if quantity > 0 else notional / decision_price if decision_price > 0 else 0,
+                    reference_price=decision_price,
+                    reason=str(data.get('source') or 'indicator'),
+                    context={"source": str(data.get('source') or 'indicator')},
+                ),
+                enabled=True,
+            )
+            if not decision.allowed:
+                return jsonify({
+                    "success": False,
+                    "ai_rejected": True,
+                    "error": "aiDecisionFilter.rejected",
+                    "data": {"ai_decision": decision.public_dict()},
+                })
+
         if order_type == 'limit':
-            price = data.get('price')
-            if not price or float(price) <= 0:
+            try:
+                price = float(data.get('price') or 0)
+            except (TypeError, ValueError):
+                price = 0
+            if price <= 0:
                 return jsonify({"success": False, "error": "Limit order requires price"}), 400
+            if notional > 0:
+                quantity = int((notional / price) * 1_000_000_000) / 1_000_000_000
+                if quantity <= 0:
+                    return jsonify({"success": False, "error": "notional is too small for the limit price"}), 400
             result = client.place_limit_order(
-                symbol=symbol, side=side, quantity=float(quantity), price=float(price),
+                symbol=symbol, side=side, quantity=quantity, price=price,
                 market_type=market_type, extended_hours=bool(data.get('extendedHours', False)),
             )
         else:
             result = client.place_market_order(
-                symbol=symbol, side=side, quantity=float(quantity), market_type=market_type,
+                symbol=symbol, side=side, quantity=quantity, notional=notional, market_type=market_type,
             )
 
         if result.success:

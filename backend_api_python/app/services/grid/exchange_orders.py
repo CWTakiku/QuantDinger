@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import secrets
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -12,7 +13,7 @@ from app.services.live_trading.binance_spot import BinanceSpotClient
 from app.services.live_trading.bitget import BitgetMixClient
 from app.services.live_trading.bitget_spot import BitgetSpotClient
 from app.services.live_trading.bybit import BybitClient
-from app.services.live_trading.gate import GateSpotClient, GateUsdtFuturesClient, to_gate_currency_pair
+from app.services.live_trading.gate import GateSpotClient, GateStockClient, GateUsdtFuturesClient, to_gate_currency_pair
 from app.services.live_trading.htx import HtxClient
 from app.services.live_trading.okx import OkxClient
 from app.services.live_trading.symbols import to_okx_spot_inst_id, to_okx_swap_inst_id
@@ -34,6 +35,7 @@ class GridMarketOrderExecution:
     commission_ccy: str = ""
     commission_quote: Optional[float] = None
     fees_by_ccy: Dict[str, float] = field(default_factory=dict)
+    fee_status: str = "pending"
     raw: Dict[str, Any] = field(default_factory=dict)
 
     def __iter__(self):
@@ -43,7 +45,7 @@ class GridMarketOrderExecution:
         yield self.avg_price
 
 
-def normalize_grid_order_quantity(
+def _normalize_grid_order_quantity_for_client(
     client: BaseRestClient,
     *,
     symbol: str,
@@ -173,6 +175,94 @@ def normalize_grid_order_quantity(
     return qty
 
 
+def _grid_exchange_id(client: BaseRestClient, exchange_config: Dict[str, Any]) -> str:
+    configured = str(
+        exchange_config.get("exchange_id")
+        or exchange_config.get("exchange")
+        or exchange_config.get("exchangeId")
+        or ""
+    ).strip().lower()
+    aliases = {
+        "gateio": "gate",
+        "gate.io": "gate",
+        "huobi": "htx",
+    }
+    if configured:
+        return aliases.get(configured, configured)
+    if isinstance(client, (BinanceFuturesClient, BinanceSpotClient)):
+        return "binance"
+    if isinstance(client, (BitgetMixClient, BitgetSpotClient)):
+        return "bitget"
+    if isinstance(client, BybitClient):
+        return "bybit"
+    if isinstance(client, (GateUsdtFuturesClient, GateSpotClient)):
+        return "gate"
+    if isinstance(client, HtxClient):
+        return "htx"
+    if isinstance(client, OkxClient):
+        return "okx"
+    return ""
+
+
+def normalize_grid_order_quantity(
+    client: BaseRestClient,
+    *,
+    symbol: str,
+    quantity: float,
+    market_type: str,
+    exchange_config: Optional[Dict[str, Any]] = None,
+    price: float = 0.0,
+) -> float:
+    """Normalize a grid order against both client and native exchange rules.
+
+    The client-specific pass converts contracts to base units where needed.
+    The common rules pass then floors amount precision and rejects quantities
+    below either the exchange minimum amount or minimum order notional.
+    """
+    cfg = exchange_config if isinstance(exchange_config, dict) else {}
+    normalized = _normalize_grid_order_quantity_for_client(
+        client,
+        symbol=symbol,
+        quantity=quantity,
+        market_type=market_type,
+        exchange_config=cfg,
+    )
+    if normalized <= 0:
+        return 0.0
+
+    exchange_id = _grid_exchange_id(client, cfg)
+    if not exchange_id:
+        return normalized
+    try:
+        from app.services.instrument_rules import get_instrument_rules_provider
+
+        rules = get_instrument_rules_provider().get_rules(
+            symbol,
+            exchange_id=exchange_id,
+            market_type=market_type,
+            client=client,
+        )
+        normalized = rules.normalize_amount(normalized, enforce_minimum=True)
+        px = max(0.0, float(price or 0.0))
+        min_notional = max(0.0, float(rules.min_notional or 0.0))
+        if normalized <= 0:
+            return 0.0
+        if px > 0 and min_notional > 0 and normalized * px < min_notional:
+            return 0.0
+        return normalized
+    except Exception as exc:
+        # If native rules cannot be verified, skipping the grid order is safer
+        # than passing an unrounded float to an exchange. The next sync cycle
+        # retries after the provider cache/endpoint recovers.
+        logger.warning(
+            "grid native quantity rules unavailable exchange=%s symbol=%s: %s",
+            exchange_id,
+            symbol,
+            exc,
+        )
+        return 0.0
+
+
 def make_grid_initial_client_order_id(strategy_id: int, leg: str = "") -> str:
     """Stable client oid for grid initial market leg (one per strategy/leg, avoids duplicate opens)."""
     suffix = str(leg or "").strip().lower()[:1]
@@ -182,7 +272,12 @@ def make_grid_initial_client_order_id(strategy_id: int, leg: str = "") -> str:
 
 
 def make_grid_client_order_id(strategy_id: int, cell_index: int, purpose: str) -> str:
-    """Short client oid (OKX max 32). purpose: e/l/x/s = entry long/exit/short entry."""
+    """Return a collision-resistant grid order id within OKX's 32-char limit.
+
+    Resting orders for the same cell can be replaced more than once in one
+    second. A second-resolution suffix is therefore not unique enough and is
+    rejected by exchanges such as Binance after an id has been used once.
+    """
     p = (purpose or "x")[:1].lower()
     if "long_entry" in purpose:
         p = "e"
@@ -192,8 +287,8 @@ def make_grid_client_order_id(strategy_id: int, cell_index: int, purpose: str) -
         p = "s"
     elif "short_exit" in purpose:
         p = "c"
-    ts = int(__import__("time").time()) % 1000000
-    return f"g{int(strategy_id) % 10000:04d}c{int(cell_index):03d}{p}{ts % 99999:05d}"[:32]
+    nonce = secrets.token_hex(6)
+    return f"g{int(strategy_id) % 10000:04d}c{int(cell_index):03d}{p}{nonce}"[:32]
 
 
 def place_grid_limit_order(
@@ -363,6 +458,17 @@ def wait_grid_market_fill(
     coid = str(client_order_id or "")
 
     try:
+        if isinstance(client, OkxClient):
+            q = client.wait_for_fill(symbol=str(symbol), ord_id=ex_oid, cl_ord_id=coid,
+                market_type=mt, max_wait_sec=max_wait_sec)
+            if details is not None:
+                details.update(q)
+            return float(q.get('filled') or 0), float(q.get('avg_price') or 0)
+        if isinstance(client, GateStockClient):
+            q = client.wait_for_fill(symbol=str(symbol), order_id=ex_oid, max_wait_sec=max_wait_sec)
+            if details is not None:
+                details.update(q)
+            return float(q.get('filled') or 0), float(q.get('avg_price') or 0)
         if isinstance(client, BitgetMixClient) and hasattr(client, "wait_for_fill"):
             product_type = str(ex_cfg.get("product_type") or ex_cfg.get("productType") or "USDT-FUTURES")
             q = client.wait_for_fill(
@@ -382,6 +488,11 @@ def wait_grid_market_fill(
                 client_order_id=coid,
                 max_wait_sec=max_wait_sec,
             )
+            if details is not None and isinstance(q, dict):
+                details.update(q)
+            return float(q.get("filled") or 0), float(q.get("avg_price") or 0)
+        if isinstance(client, GateSpotClient):
+            q = client.wait_for_fill(order_id=ex_oid, symbol=str(symbol), max_wait_sec=max_wait_sec)
             if details is not None and isinstance(q, dict):
                 details.update(q)
             return float(q.get("filled") or 0), float(q.get("avg_price") or 0)
@@ -542,6 +653,10 @@ def execute_grid_market_order(
         commission_ccy=commission_ccy,
         commission_quote=commission_quote,
         fees_by_ccy=fees,
+        fee_status=str(
+            details.get("fee_status")
+            or ("actual" if fees else "pending")
+        ),
         raw=details,
     )
 
@@ -557,6 +672,14 @@ def cancel_grid_order(
 ) -> None:
     mt = str(market_type or "swap").strip().lower()
     ex_cfg = exchange_config if isinstance(exchange_config, dict) else {}
+    if isinstance(client, (GateSpotClient, GateUsdtFuturesClient)):
+        if not exchange_order_id:
+            raise LiveTradingError("Gate cancellation requires a confirmed exchange order ID")
+        if isinstance(client, GateSpotClient):
+            client.cancel_order(order_id=str(exchange_order_id), symbol=str(symbol))
+        else:
+            client.cancel_order(order_id=str(exchange_order_id))
+        return
     if isinstance(client, OkxClient):
         client.cancel_order(
             market_type=mt,
@@ -629,16 +752,6 @@ def _extract_order_id_from_payload(data: Dict[str, Any], fallback: str = "") -> 
     return str(fallback or "")
 
 
-def _bitget_contract_size(client: BitgetMixClient, symbol: str, exchange_config: Dict[str, Any]) -> float:
-    product_type = str(exchange_config.get("product_type") or exchange_config.get("productType") or "USDT-FUTURES")
-    try:
-        contract = client.get_contract(symbol=str(symbol), product_type=product_type) or {}
-        ct = _float(contract.get("contractSize") or contract.get("contractSz") or contract.get("ctVal"))
-        return ct if ct > 0 else 1.0
-    except Exception:
-        return 1.0
-
-
 def _unwrap_bitget_fills(raw: Any) -> List[Dict[str, Any]]:
     if not isinstance(raw, dict):
         return []
@@ -685,7 +798,6 @@ def _aggregate_bitget_grid_fills(
     mt = str(market_type or "swap").strip().lower()
     if mt in ("futures", "future", "perp", "perpetual"):
         mt = "swap"
-    ct = _bitget_contract_size(client, symbol, exchange_config) if isinstance(client, BitgetMixClient) else 1.0
 
     total_base = 0.0
     total_quote = 0.0
@@ -696,9 +808,6 @@ def _aggregate_bitget_grid_fills(
             amount = _float(f.get("amount") or f.get("quoteVolume"))
         else:
             qty = _float(f.get("baseVolume"))
-            if qty <= 0:
-                contracts = _float(f.get("size") or f.get("fillSize") or f.get("filledQty"))
-                qty = contracts * ct if contracts > 0 and mt == "swap" else contracts
             px = _float(f.get("fillPrice") or f.get("priceAvg") or f.get("price"))
             amount = _float(f.get("quoteVolume") or f.get("amount"))
         if qty <= 0:
@@ -711,7 +820,7 @@ def _aggregate_bitget_grid_fills(
     if total_base <= 0:
         return 0.0, 0.0, "unknown"
     avg = total_quote / total_base if total_quote > 0 else 0.0
-    return total_base, avg, "filled"
+    return total_base, avg, "partial"
 
 
 def _parse_grid_order_fill(data: Dict[str, Any]) -> Tuple[float, float, str]:
@@ -719,6 +828,11 @@ def _parse_grid_order_fill(data: Dict[str, Any]) -> Tuple[float, float, str]:
     if not data:
         return 0.0, 0.0, "unknown"
     from app.services.grid.fill_units import order_status_from_data
+    from app.services.live_trading.gate_spot_fill import parse_gate_spot_fill
+
+    if "filled_amount" in data:
+        filled, avg = parse_gate_spot_fill(data)
+        return filled, avg, order_status_from_data(data)
 
     filled = float(
         data.get("baseVolume")
@@ -731,25 +845,8 @@ def _parse_grid_order_fill(data: Dict[str, Any]) -> Tuple[float, float, str]:
         or data.get("trade_volume")
         or 0
     )
-    avg = float(
-        data.get("avgPx")
-        or data.get("avgPrice")
-        or data.get("avg_price")
-        or data.get("fill_price")
-        or data.get("trade_avg_price")
-        or data.get("price")
-        or 0
-    )
-    if avg <= 0 and data.get("filled_total") and data.get("filled_amount"):
-        try:
-            filled_amt = float(data.get("filled_amount") or filled or 0)
-            filled_total = float(data.get("filled_total") or 0)
-            if filled_amt > 0 and filled_total > 0:
-                avg = filled_total / filled_amt
-                if filled <= 0:
-                    filled = filled_amt
-        except Exception:
-            pass
+    from app.services.grid.fill_units import extract_grid_fill_avg_price
+    avg = extract_grid_fill_avg_price(None, data=data, filled_base=filled)
     return filled, avg, order_status_from_data(data)
 
 
@@ -765,6 +862,8 @@ def _fetch_grid_client_order(
     mt = str(market_type or "swap").strip().lower()
     oid = str(exchange_order_id or "")
     coid = str(client_order_id or "")
+    if isinstance(client, GateStockClient):
+        return client.get_order(order_id=oid, symbol=str(symbol))
     if isinstance(client, OkxClient):
         inst_id = to_okx_spot_inst_id(symbol) if mt == "spot" else to_okx_swap_inst_id(symbol)
         return client.get_order(inst_id=inst_id, ord_id=oid, cl_ord_id=coid)
@@ -787,6 +886,8 @@ def _fetch_grid_client_order(
     if isinstance(client, (GateSpotClient, GateUsdtFuturesClient)):
         if not oid:
             return {}
+        if isinstance(client, GateSpotClient):
+            return _unwrap_client_order_payload(client.get_order(order_id=oid, symbol=str(symbol)))
         return _unwrap_client_order_payload(client.get_order(order_id=oid))
     if isinstance(client, HtxClient):
         return client.get_order(symbol=str(symbol), order_id=oid, client_order_id=coid)

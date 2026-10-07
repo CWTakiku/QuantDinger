@@ -38,6 +38,12 @@ def test_fee_reconciliation_reads_saved_phase_and_only_charges_delta():
     assert delta == pytest.approx({"USDT": 0.02})
 
 
+def test_fee_reconciliation_preserves_authoritative_zero_fee_evidence():
+    assert fee_breakdown_snapshot(
+        {"fees_by_ccy": {"USDT": 0}, "fee_status": "actual_zero"}
+    ) == {"USDT": 0.0}
+
+
 def test_fee_backfill_repairs_missing_quote_value_without_overwriting_native_fee(monkeypatch):
     statements = []
 
@@ -76,14 +82,54 @@ def test_fee_backfill_repairs_missing_quote_value_without_overwriting_native_fee
     )
 
     assert count == 1
-    assert "COALESCE(commission_quote, 0) = 0" in statements[0][0]
+    assert "COALESCE(fee_status, 'pending') = 'pending'" in statements[0][0]
     update_sql, update_params = statements[1]
     assert "CASE WHEN COALESCE(commission, 0) = 0" in update_sql
     assert "CASE WHEN COALESCE(commission_quote, 0) = 0" in update_sql
     assert update_params[0] == pytest.approx(0.00003)
     assert update_params[1] == "BNB"
     assert update_params[2] == pytest.approx(0.024)
-    assert update_params[3] == 1
+    assert update_params[3] == "actual"
+    assert update_params[4] == 1
+
+
+def test_fee_backfill_marks_exchange_confirmed_zero_without_retrying_forever(monkeypatch):
+    statements = []
+
+    class Cursor:
+        def execute(self, sql, params):
+            statements.append((sql, params))
+
+        def fetchall(self):
+            return [{"id": 2, "value": 50, "amount": 0.1}]
+
+        def close(self):
+            return None
+
+    class Database:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def cursor(self):
+            return Cursor()
+
+        def commit(self):
+            return None
+
+    monkeypatch.setattr(
+        "app.services.pending_orders.fee_reconciliation.get_db_connection",
+        lambda: Database(),
+    )
+
+    assert backfill_zero_commission_trades(
+        order_id=10,
+        fees_by_ccy={"USDT": 0.0},
+        commission_quote=0.0,
+    ) == 1
+    assert statements[1][1][3] == "actual_zero"
 
 
 def test_adapter_preserves_multi_currency_fee_breakdown():
@@ -148,6 +194,97 @@ def test_binance_futures_uses_futures_trade_history():
     assert breakdown == pytest.approx({"USDT": 0.03})
     assert signed.call_args.args[:2] == ("GET", "/fapi/v1/userTrades")
     assert signed.call_args.kwargs["params"]["orderId"] == "34"
+
+
+def test_binance_futures_unwraps_signed_list_response_for_fee_history():
+    client = BinanceFuturesClient(api_key="key", secret_key="secret")
+    rows = [{"orderId": 34, "qty": "0.1", "commission": "0.03", "commissionAsset": "USDT"}]
+    with patch.object(client, "_signed_request", return_value={"raw": rows}):
+        assert client.get_user_trades(symbol="BTC/USDT", order_id="34") == rows
+
+
+def test_binance_spot_unwraps_signed_list_response_for_fee_history():
+    client = BinanceSpotClient(api_key="key", secret_key="secret")
+    rows = [{"orderId": 12, "qty": "0.1", "commission": "0.00003", "commissionAsset": "BNB"}]
+    with patch.object(client, "_signed_request", return_value={"raw": rows}):
+        assert client.get_my_trades(symbol="BTC/USDT", order_id="12") == rows
+
+
+def test_binance_futures_open_orders_are_scoped_to_symbol():
+    client = BinanceFuturesClient(api_key="key", secret_key="secret")
+    with patch.object(client, "_signed_request", return_value=[]) as signed:
+        assert client.get_open_orders(symbol="SOL/USDT") == []
+
+    signed.assert_called_once_with(
+        "GET",
+        "/fapi/v1/openOrders",
+        params={"symbol": "SOLUSDT"},
+    )
+
+
+def test_binance_futures_open_orders_unwraps_signed_list_response():
+    client = BinanceFuturesClient(api_key="key", secret_key="secret")
+    rows = [{"orderId": 34, "symbol": "SOLUSDT"}]
+    with patch.object(client, "_signed_request", return_value={"raw": rows}):
+        assert client.get_open_orders(symbol="SOL/USDT") == rows
+
+
+def test_binance_zero_commission_fill_is_authoritative():
+    client = BinanceFuturesClient(api_key="key", secret_key="secret")
+    order = {
+        "status": "FILLED",
+        "executedQty": "0.1",
+        "cumQuote": "6000",
+        "avgPrice": "60000",
+    }
+    trades = [{"commission": "0", "commissionAsset": "USDT"}]
+    with patch.object(client, "get_order", return_value=order), patch.object(
+        client,
+        "get_user_trades",
+        return_value=trades,
+    ), patch("time.sleep") as sleep:
+        result = client.wait_for_fill(
+            symbol="BTC/USDT",
+            order_id="34",
+            max_wait_sec=0,
+        )
+
+    assert result["fee"] == 0
+    assert result["fees_by_ccy"] == {"USDT": 0.0}
+    assert result["fee_status"] == "actual_zero"
+    sleep.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "client,history_method",
+    [
+        (BinanceSpotClient(api_key="key", secret_key="secret"), "get_my_trades"),
+        (BinanceFuturesClient(api_key="key", secret_key="secret"), "get_user_trades"),
+    ],
+)
+def test_binance_zero_wait_fill_does_not_block_on_fee_retries(client, history_method):
+    order = {
+        "status": "FILLED",
+        "executedQty": "0.1",
+        "cummulativeQuoteQty": "6000",
+        "cumQuote": "6000",
+        "avgPrice": "60000",
+    }
+    with patch.object(client, "get_order", return_value=order), patch.object(
+        client,
+        history_method,
+        return_value=[],
+    ) as history, patch("time.sleep") as sleep:
+        result = client.wait_for_fill(
+            symbol="BTC/USDT",
+            order_id="34",
+            max_wait_sec=0,
+        )
+
+    assert result["filled"] == pytest.approx(0.1)
+    assert result["fees_by_ccy"] == {}
+    history.assert_called_once()
+    sleep.assert_not_called()
 
 
 @pytest.mark.parametrize(

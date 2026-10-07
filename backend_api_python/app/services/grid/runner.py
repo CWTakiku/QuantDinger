@@ -44,8 +44,9 @@ def shutdown_grid_for_strategy(strategy_id: int) -> None:
         gr.shutdown()
         return
     try:
-        from app.services.exchange_execution import load_strategy_configs, resolve_exchange_config
+        from app.services.exchange_execution import coalesce_exchange_config_from_payload, load_strategy_configs, resolve_exchange_config
         from app.services.live_trading.factory import create_client
+        from app.services.pending_orders.live_order_support import bind_instrument_product_contract
 
         sc = load_strategy_configs(sid) or {}
         tc = sc.get("trading_config") if isinstance(sc.get("trading_config"), dict) else {}
@@ -58,8 +59,15 @@ def shutdown_grid_for_strategy(strategy_id: int) -> None:
         if not symbol:
             return
         user_id = int(sc.get("user_id") or 1)
-        ex_cfg = resolve_exchange_config(sc.get("exchange_config") or {}, user_id=user_id)
-        mt = str(tc.get("market_type") or "swap").strip().lower()
+        ex_cfg = resolve_exchange_config(coalesce_exchange_config_from_payload(sc), user_id=user_id)
+        mt = str(tc.get("market_type") or sc.get("market_type") or "swap").strip().lower()
+        ex_cfg = bind_instrument_product_contract(
+            ex_cfg,
+            tc,
+            symbol=symbol,
+            exchange_id=str(ex_cfg.get("exchange_id") or ""),
+            market_type=mt,
+        )
 
         def _create_client():
             return create_client(ex_cfg, market_type=mt)
@@ -74,7 +82,7 @@ def shutdown_grid_for_strategy(strategy_id: int) -> None:
             enqueue_market=lambda *a, **k: False,
         )
         engine.shutdown()
-        append_strategy_log(sid, "info", "Grid orders cancelled on strategy stop (no active runner)")
+        append_strategy_log(sid, "info", "strategyRuntime.gridStopCleanup")
     except Exception as e:
         logger.warning("shutdown_grid_for_strategy sid=%s: %s", sid, e)
         append_strategy_log(sid, "warning", f"Grid stop cancel failed: {e}")
@@ -91,12 +99,14 @@ class GridRestingRunner:
         exchange_config: Dict[str, Any],
         *,
         user_id: int = 1,
+        strategy_run_id: int = 0,
         initial_capital: float,
         enqueue_market_fn: Callable[[str, float, float, str], bool],
         create_client_fn: Callable[[], Any],
         risk_exit_fn: Optional[Callable[[float], list]] = None,
     ) -> None:
         self.strategy_id = int(strategy_id)
+        self.strategy_run_id = int(strategy_run_id or 0)
         self.user_id = int(user_id or 1)
         self.symbol = str(symbol or "")
         self.trading_config = dict(trading_config or {})
@@ -113,7 +123,25 @@ class GridRestingRunner:
             create_client_fn=create_client_fn,
             enqueue_market=enqueue_market_fn,
         )
+        from app.services.grid.actor import GridActorRepository
+
+        self._actor_repository = GridActorRepository()
+        if self.strategy_run_id > 0:
+            try:
+                actor_state = self._actor_repository.load_state(
+                    strategy_id=self.strategy_id,
+                    strategy_run_id=self.strategy_run_id,
+                )
+                self._engine.restore_actor_snapshot(actor_state)
+            except Exception:
+                logger.warning(
+                    "Grid actor state restore failed: strategy=%s run=%s",
+                    self.strategy_id,
+                    self.strategy_run_id,
+                    exc_info=True,
+                )
         self._started = False
+        self._last_actor_checkpoint_ts = 0.0
         self._last_sync_ts = 0.0
         self._last_exit_sync_ts = 0.0
         self._last_operational_check_ts = 0.0
@@ -154,6 +182,7 @@ class GridRestingRunner:
         ok2, msg2 = self._engine.bootstrap(current_price)
         if not ok2:
             return False, msg2
+        self._engine.reconcile_grid_ladder_orders()
         try:
             client = self._engine._create_client()
         except Exception as e:
@@ -205,6 +234,7 @@ class GridRestingRunner:
                     "warning",
                     "Grid resting startup paused because current price is outside configured bounds",
                 )
+                self.checkpoint(force=True, status="running")
                 return True, ""
         self._engine.run_initial_market_position(current_price)
         n = self._engine.sync_grid_orders(current_price)
@@ -212,15 +242,42 @@ class GridRestingRunner:
             self._engine.sync_held_cell_exits(current_price)
         elif self._engine.cfg.initial_position_pct <= 0 or self._engine._initial_done:
             self._engine.sync_exit_coverage(current_price)
-        if self._engine.stop_requested:
+        startup_snapshot = self.operational_snapshot(force=True)
+        has_new_initial_fills = self._engine.has_new_startup_initial_fills
+        startup_coverage_failed = bool(
+            has_new_initial_fills
+            and not startup_snapshot.get("healthy")
+        )
+        if self._engine.stop_requested or startup_coverage_failed:
+            if has_new_initial_fills or startup_coverage_failed:
+                self._engine.cancel_all_orders_on_exchange()
+            else:
+                self._engine.cancel_entry_orders_on_exchange()
+            rollback_ok = (
+                self._engine.rollback_startup_initial_fills(current_price)
+                if has_new_initial_fills
+                else True
+            )
+            log_key = "strategyRuntime.gridStartupCoverageFailed"
+            if has_new_initial_fills:
+                log_key = (
+                    "strategyRuntime.gridStartupCoverageFailedRolledBack"
+                    if rollback_ok
+                    else "strategyRuntime.gridStartupCoverageFailedRollbackFailed"
+                )
             append_strategy_log(
                 self.strategy_id,
                 "error",
-                "Grid startup aborted: resting limit orders failed (check exchange error and order parameters)",
+                log_key,
             )
-            return False, "grid resting limit orders failed during startup"
+            if not has_new_initial_fills:
+                return False, "strategyRuntime.gridStartupCoverageFailed"
+            if rollback_ok:
+                return False, "strategyRuntime.gridStartupCoverageFailedRolledBack"
+            return False, "strategyRuntime.gridStartupCoverageFailedRollbackFailed"
         self._started = True
         register_runner(self)
+        self.checkpoint(force=True, status="running")
         try:
             from app.services.grid.poller import sync_strategy_grid_orders
 
@@ -238,10 +295,55 @@ class GridRestingRunner:
 
     def shutdown(self) -> None:
         try:
-            self._engine.shutdown()
+            preserve_exits = bool(
+                self._engine.stop_requested
+                and self._engine.stop_reason == "exchange error while placing grid resting order"
+            )
+            self._engine.shutdown(preserve_exit_orders=preserve_exits)
         finally:
+            self.checkpoint(force=True, status="stopped")
             unregister_runner(self.strategy_id)
             self._started = False
+
+    def detach(self) -> None:
+        """Release process-local ownership while leaving exchange orders active."""
+        self.checkpoint(force=True, status="handoff")
+        unregister_runner(self.strategy_id)
+        self._started = False
+
+    def checkpoint(
+        self,
+        *,
+        force: bool = False,
+        status: str = "running",
+        last_execution_event_id: int = 0,
+    ) -> bool:
+        if self.strategy_run_id <= 0:
+            return False
+        now = time.monotonic()
+        if not force and now - self._last_actor_checkpoint_ts < 5.0:
+            return False
+        state = self._engine.actor_snapshot()
+        state["started"] = bool(self._started)
+        try:
+            saved = self._actor_repository.checkpoint(
+                strategy_id=self.strategy_id,
+                strategy_run_id=self.strategy_run_id,
+                state=state,
+                status=status,
+                last_execution_event_id=last_execution_event_id,
+            )
+        except Exception:
+            logger.warning(
+                "Grid actor checkpoint failed: strategy=%s run=%s",
+                self.strategy_id,
+                self.strategy_run_id,
+                exc_info=True,
+            )
+            return False
+        if saved:
+            self._last_actor_checkpoint_ts = now
+        return saved
 
     def operational_snapshot(self, *, force: bool = False) -> Dict[str, Any]:
         """Return whether exchange-resting coverage is verifiably active."""
@@ -337,7 +439,8 @@ class GridRestingRunner:
             except Exception as e:
                 logger.debug("grid risk exit: %s", e)
 
-        self._engine.handle_boundary(current_price)
+        if self._engine.handle_boundary(current_price):
+            return
 
         if (
             self._engine.cfg.initial_position_pct > 0

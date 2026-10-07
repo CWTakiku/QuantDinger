@@ -75,15 +75,17 @@ class StrategyCommandClient:
                 payload={"close_positions": bool(close_positions)},
             )
             self._remember(strategy_id, "stop", command.id)
+            queued = {
+                "success": True,
+                "status": "stopping",
+                "command_id": command.id,
+                "close_requested": bool(command.payload.get("close_positions")),
+                "close_orders_queued": 0,
+                "close_errors": [],
+            }
             timeout = max(0.0, float(os.getenv("STRATEGY_COMMAND_STOP_WAIT_SEC", "5")))
             if timeout == 0:
-                return {
-                    "success": True,
-                    "status": "stopping",
-                    "close_requested": bool(close_positions),
-                    "close_orders_queued": 0,
-                    "close_errors": [],
-                }
+                return queued
             finished = self._wait(command.id, timeout)
             if finished is None or finished.status not in TERMINAL_COMMAND_STATUSES:
                 logger.warning(
@@ -91,16 +93,11 @@ class StrategyCommandClient:
                     strategy_id,
                     command.id,
                 )
-                return {
-                    "success": False,
-                    "status": "stopping",
-                    "close_requested": bool(close_positions),
-                    "close_orders_queued": 0,
-                    "close_errors": [],
-                }
+                return queued
             if finished.status == "succeeded":
                 result = dict(finished.result or {})
                 result.setdefault("success", True)
+                result.setdefault("command_id", command.id)
                 result.setdefault("status", "stopped")
                 result.setdefault("close_requested", bool(close_positions))
                 result.setdefault("close_orders_queued", 0)
@@ -109,6 +106,7 @@ class StrategyCommandClient:
             return {
                 "success": False,
                 "status": "running",
+                "command_id": command.id,
                 "close_requested": bool(close_positions),
                 "close_orders_queued": 0,
                 "close_errors": [finished.error_message] if finished.error_message else [],
@@ -122,6 +120,39 @@ class StrategyCommandClient:
                 "close_orders_queued": 0,
                 "close_errors": [str(exc)],
             }
+
+    def get_command_status(self, strategy_id: int, command_id: int) -> dict | None:
+        command = self.repository.get(int(command_id))
+        if command is None or int(command.strategy_id) != int(strategy_id):
+            return None
+        base = {
+            "command_id": int(command.id),
+            "command_status": str(command.status),
+            "attempts": int(command.attempts or 0),
+            "close_requested": bool(command.payload.get("close_positions")),
+        }
+        if command.status == "succeeded":
+            result = dict(command.result or {})
+            result.setdefault("success", True)
+            result.setdefault("status", "stopped" if command.command_type == "stop" else command.status)
+            result.setdefault("close_orders_queued", 0)
+            result.setdefault("close_errors", [])
+            return {**base, **result}
+        if command.status in {"failed", "cancelled"}:
+            return {
+                **base,
+                "success": False,
+                "status": "running",
+                "close_orders_queued": 0,
+                "close_errors": [command.error_message] if command.error_message else [],
+            }
+        return {
+            **base,
+            "success": True,
+            "status": "stopping" if command.command_type == "stop" else command.status,
+            "close_orders_queued": 0,
+            "close_errors": [],
+        }
 
     def _wait(self, command_id: int, timeout: float):
         deadline = time.monotonic() + max(0.0, float(timeout))

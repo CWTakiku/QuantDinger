@@ -8,6 +8,8 @@ Supports US stocks, ETFs, and crypto on both paper and live accounts.
 import time
 import threading
 from dataclasses import dataclass, field
+from decimal import Decimal, ROUND_HALF_UP
+import re
 from typing import Optional, Dict, Any, List, Union
 from urllib.parse import urlsplit, urlunsplit
 from uuid import UUID
@@ -18,6 +20,12 @@ from app.utils.logger import get_logger
 from app.services.alpaca_trading.symbols import normalize_symbol, format_display_symbol, parse_symbol
 
 logger = get_logger(__name__)
+
+
+_ALPACA_TRADING_HOSTS = {
+    "api.alpaca.markets",
+    "paper-api.alpaca.markets",
+}
 
 
 def _market_hint_from_type(market_type: str) -> str:
@@ -57,12 +65,33 @@ def _str_attr(obj: Any, name: str, default: str = "") -> str:
     return str(getattr(obj, name, default) or default)
 
 
+def _alpaca_error_status(message: str) -> Optional[int]:
+    code_match = re.search(r'["\']?code["\']?\s*[:=]\s*(\d+)', message, re.IGNORECASE)
+    if code_match:
+        return int(code_match.group(1)[:3])
+    status_match = re.search(
+        r'\b(?:http(?:\s+status)?|status(?:\s+code)?|code)\s*[:=]?\s*(400|401|403)\b',
+        message,
+        re.IGNORECASE,
+    )
+    return int(status_match.group(1)) if status_match else None
+
+
+def _normalize_equity_price(value: Any) -> float:
+    price = Decimal(str(value or 0))
+    if price <= 0:
+        return 0.0
+    increment = Decimal("0.01") if price >= Decimal("1") else Decimal("0.0001")
+    return float(price.quantize(increment, rounding=ROUND_HALF_UP))
+
+
 def _format_alpaca_error(err: Exception, *, context: str = "") -> str:
     """Turn Alpaca SDK/HTTP errors into actionable messages for operators."""
     msg = str(err or "").strip()
     low = msg.lower()
+    status = _alpaca_error_status(msg)
     prefix = f"{context}: " if context else ""
-    if "invalid syntax" in low or '"code":400' in low or "code 400" in low:
+    if "invalid syntax" in low or status == 400:
         return (
             prefix
             + "Alpaca 返回 400 invalid syntax。若使用行情 WebSocket，请确认："
@@ -71,9 +100,9 @@ def _format_alpaca_error(err: Exception, *, context: str = "") -> str:
             "{\"action\":\"subscribe\",\"trades\":[\"BTC/USD\"]}（加密，勿用 BTC/USDT）。"
             "本系统「测试连接」仅走 REST 交易接口，不经过该 WebSocket。"
         )
-    if "401" in low or "auth failed" in low or "not authenticated" in low or "unauthorized" in low:
+    if status == 401 or "auth failed" in low or "not authenticated" in low or "unauthorized" in low:
         return prefix + f"Alpaca authentication failed. Check API Key/Secret and paper(PK*)/live(AK*) mode. Raw error: {msg}"
-    if "403" in low:
+    if status == 403:
         return prefix + f"Alpaca rejected the request. Raw error: {msg}"
     return prefix + msg
 
@@ -93,10 +122,20 @@ def normalize_base_url(base_url: Optional[str]) -> Optional[str]:
         raw = "https://" + raw
 
     parts = urlsplit(raw)
+    scheme = (parts.scheme or "").lower()
+    hostname = (parts.hostname or "").lower().rstrip(".")
+    if scheme != "https":
+        raise ValueError("Alpaca base URL must use HTTPS")
+    if hostname not in _ALPACA_TRADING_HOSTS:
+        raise ValueError("Alpaca base URL must use an official Alpaca trading host")
+    if parts.username or parts.password or parts.port is not None:
+        raise ValueError("Alpaca base URL must not contain credentials or a custom port")
     path = (parts.path or "").rstrip("/")
     if path.lower() == "/v2":
         path = ""
-    normalized = urlunsplit((parts.scheme or "https", parts.netloc, path, "", ""))
+    elif path:
+        raise ValueError("Alpaca base URL must not contain a path")
+    normalized = urlunsplit(("https", hostname, path, "", ""))
     return normalized.rstrip("/") or None
 
 
@@ -187,21 +226,30 @@ class AlpacaClient:
         """Connection is verified by a successful account fetch."""
         return self._trading_client is not None and self._account_id is not None
 
+    def _trading_base_url(self) -> str:
+        expected_host = "paper-api.alpaca.markets" if self.config.paper else "api.alpaca.markets"
+        base_url = normalize_base_url(self.config.base_url)
+        if base_url and (urlsplit(base_url).hostname or "").lower() != expected_host:
+            raise ValueError("Alpaca base URL does not match the selected account environment")
+        return base_url or f"https://{expected_host}"
+
     def connect(self) -> bool:
         """Initialize Alpaca client and verify credentials by fetching account."""
         try:
-            modules = _ensure_alpaca()
             api_key = (self.config.api_key or "").strip()
             secret_key = (self.config.secret_key or "").strip()
             if not api_key or not secret_key:
                 logger.error("Alpaca connect failed: empty api_key or secret_key")
                 return False
 
+            base_url = self._trading_base_url()
+            modules = _ensure_alpaca()
+
             self._trading_client = modules["TradingClient"](
                 api_key=api_key,
                 secret_key=secret_key,
                 paper=self.config.paper,
-                url_override=self.config.base_url,
+                url_override=base_url,
             )
             # Paper trading keys use the standard Alpaca market-data endpoint.
             # The SDK sandbox flag targets a separate data sandbox and rejects
@@ -262,18 +310,23 @@ class AlpacaClient:
         self,
         symbol: str,
         side: str,
-        quantity: float,
+        quantity: float = 0.0,
         market_type: str = "USStock",
         take_profit_price: float = 0.0,
         stop_loss_price: float = 0.0,
+        client_order_id: str = "",
+        notional: float = 0.0,
     ) -> OrderResult:
         """Place a market order. market_type: 'USStock' or 'crypto'."""
         try:
             self._ensure_connected()
             modules = _ensure_alpaca()
             sym, asset_class = parse_symbol(symbol, market_hint=_market_hint_from_type(market_type))
-            requested_quantity = float(quantity)
-            if side.lower() == "sell":
+            requested_quantity = float(quantity or 0.0)
+            requested_notional = float(notional or 0.0)
+            if (requested_quantity > 0) == (requested_notional > 0):
+                raise ValueError("Provide exactly one of quantity or notional")
+            if side.lower() == "sell" and requested_quantity > 0:
                 positions = self._trading_client.get_all_positions()
                 matching = next(
                     (
@@ -290,13 +343,20 @@ class AlpacaClient:
 
             request_kwargs = {
                 "symbol": sym,
-                "qty": quantity,
                 "side": modules["OrderSide"].BUY if side.lower() == "buy" else modules["OrderSide"].SELL,
                 "time_in_force": modules["TimeInForce"].GTC if asset_class == "crypto" else modules["TimeInForce"].DAY,
             }
+            if requested_notional > 0:
+                request_kwargs["notional"] = requested_notional
+            else:
+                request_kwargs["qty"] = quantity
+            if str(client_order_id or "").strip():
+                request_kwargs["client_order_id"] = str(client_order_id).strip()[:48]
             take_profit_price = float(take_profit_price or 0.0)
             stop_loss_price = float(stop_loss_price or 0.0)
             if asset_class == "us_equity" and (take_profit_price > 0 or stop_loss_price > 0):
+                take_profit_price = _normalize_equity_price(take_profit_price)
+                stop_loss_price = _normalize_equity_price(stop_loss_price)
                 request_kwargs["order_class"] = (
                     modules["OrderClass"].BRACKET
                     if take_profit_price > 0 and stop_loss_price > 0
@@ -332,8 +392,11 @@ class AlpacaClient:
                     "status": status,
                     "filled_qty": filled_qty,
                     "requested_qty": requested_quantity,
-                    "submitted_qty": float(quantity),
+                    "submitted_qty": float(quantity) if requested_quantity > 0 else 0.0,
+                    "requested_notional": requested_notional,
+                    "submitted_notional": requested_notional,
                     "submitted_at": str(order.submitted_at),
+                    "client_order_id": str(getattr(order, "client_order_id", "") or client_order_id),
                     **self._order_commission_snapshot(order),
                 },
             )
@@ -351,6 +414,7 @@ class AlpacaClient:
         extended_hours: bool = False,
         take_profit_price: float = 0.0,
         stop_loss_price: float = 0.0,
+        client_order_id: str = "",
     ) -> OrderResult:
         """Place a limit order. extended_hours=True for pre/post-market."""
         try:
@@ -380,9 +444,15 @@ class AlpacaClient:
                 "limit_price": price,
                 "extended_hours": extended_hours if asset_class == "us_equity" else False,
             }
+            if str(client_order_id or "").strip():
+                request_kwargs["client_order_id"] = str(client_order_id).strip()[:48]
+            if asset_class == "us_equity":
+                request_kwargs["limit_price"] = _normalize_equity_price(price)
             take_profit_price = float(take_profit_price or 0.0)
             stop_loss_price = float(stop_loss_price or 0.0)
             if asset_class == "us_equity" and (take_profit_price > 0 or stop_loss_price > 0):
+                take_profit_price = _normalize_equity_price(take_profit_price)
+                stop_loss_price = _normalize_equity_price(stop_loss_price)
                 request_kwargs["order_class"] = (
                     modules["OrderClass"].BRACKET
                     if take_profit_price > 0 and stop_loss_price > 0
@@ -414,6 +484,7 @@ class AlpacaClient:
                     "status": status,
                     "limit_price": price,
                     "extended_hours": extended_hours,
+                    "client_order_id": str(getattr(order, "client_order_id", "") or client_order_id),
                     **self._order_commission_snapshot(order),
                 },
             )
@@ -425,6 +496,10 @@ class AlpacaClient:
         """Cancel an open order by ID."""
         try:
             self._ensure_connected()
+            order = self._trading_client.get_order_by_id(order_id)
+            status = _enum_value(getattr(order, "status", "")).strip().lower()
+            if status not in {"new", "accepted", "pending_new", "partially_filled", "accepted_for_bidding"}:
+                return False
             self._trading_client.cancel_order_by_id(order_id)
             logger.info(f"Alpaca order {_id_log_prefix(order_id)}... cancelled")
             return True
@@ -470,6 +545,20 @@ class AlpacaClient:
             logger.error("Alpaca get_order_status failed: %s", err)
             return OrderResult(success=False, message=err)
 
+    def get_order_status_by_client_id(self, client_order_id: str) -> OrderResult:
+        """Fetch an order using Alpaca's idempotent client order id."""
+        try:
+            self._ensure_connected()
+            requested = str(client_order_id or "").strip()
+            if not requested:
+                return OrderResult(success=False, message="Missing client_order_id")
+            order = self._trading_client.get_order_by_client_id(requested)
+            return self.get_order_status(str(getattr(order, "id", "") or ""))
+        except Exception as e:
+            err = _format_alpaca_error(e)
+            logger.error("Alpaca get_order_status_by_client_id failed: %s", err)
+            return OrderResult(success=False, message=err)
+
     def get_account_activities(
         self,
         *,
@@ -487,9 +576,7 @@ class AlpacaClient:
         )
         if not types:
             return []
-        host = self.config.base_url or (
-            "https://paper-api.alpaca.markets" if self.config.paper else "https://api.alpaca.markets"
-        )
+        host = self._trading_base_url()
         url = f"{host.rstrip('/')}/v2/account/activities"
         params: Dict[str, Any] = {
             "activity_types": types,
@@ -580,7 +667,7 @@ class AlpacaClient:
             logger.error(f"Alpaca get_account_summary failed: {e}")
             return {"success": False, "error": str(e)}
 
-    def get_positions(self) -> List[Dict[str, Any]]:
+    def get_positions(self, *, raise_on_error: bool = False) -> List[Dict[str, Any]]:
         """Get current positions."""
         try:
             self._ensure_connected()
@@ -606,9 +693,11 @@ class AlpacaClient:
             ]
         except Exception as e:
             logger.error(f"Alpaca get_positions failed: {e}")
+            if raise_on_error:
+                raise
             return []
 
-    def get_orders(self, status: str = "all", limit: int = 100) -> List[Dict[str, Any]]:
+    def get_orders(self, status: str = "all", limit: int = 100, *, raise_on_error: bool = False) -> List[Dict[str, Any]]:
         """Get recent orders, including filled orders by default."""
         try:
             self._ensure_connected()
@@ -628,23 +717,29 @@ class AlpacaClient:
                     "id": str(o.id),
                     "orderId": str(o.id),
                     "symbol": o.symbol,
+                    "asset_class": _enum_value(getattr(o, "asset_class", "")),
                     "side": _enum_value(getattr(o, "side", "")).lower(),
                     "action": _enum_value(getattr(o, "side", "")).upper(),
-                    "quantity": _num(getattr(o, "qty", 0)),
-                    "qty": _num(getattr(o, "qty", 0)),
+                    "quantity": _num(getattr(o, "qty", None), default=None),
+                    "qty": _num(getattr(o, "qty", None), default=None),
                     "notional": _num(getattr(o, "notional", 0), default=0.0),
-                    "orderType": _enum_value(getattr(o, "order_type", "")),
-                    "order_type": _enum_value(getattr(o, "order_type", "")),
+                    "orderType": _enum_value(getattr(o, "order_type", None) or getattr(o, "type", "")),
+                    "order_type": _enum_value(getattr(o, "order_type", None) or getattr(o, "type", "")),
                     "limitPrice": _num(getattr(o, "limit_price", None), default=None),
                     "limit_price": _num(getattr(o, "limit_price", None), default=None),
                     "status": _enum_value(getattr(o, "status", "")),
                     "filled": _num(getattr(o, "filled_qty", 0)),
                     "filled_qty": _num(getattr(o, "filled_qty", 0)),
-                    "remaining": _num(getattr(o, "qty", 0)) - _num(getattr(o, "filled_qty", 0)),
-                    "avgFillPrice": _num(getattr(o, "filled_avg_price", 0)),
-                    "filled_avg_price": _num(getattr(o, "filled_avg_price", 0)),
+                    "remaining": (
+                        max(0.0, _num(o.qty) - _num(getattr(o, "filled_qty", 0)))
+                        if getattr(o, "qty", None) is not None else None
+                    ),
+                    "avgFillPrice": _num(getattr(o, "filled_avg_price", None), default=None),
+                    "filled_avg_price": _num(getattr(o, "filled_avg_price", None), default=None),
                     "submittedAt": str(getattr(o, "submitted_at", "") or ""),
                     "submitted_at": str(getattr(o, "submitted_at", "") or ""),
+                    "filled_at": str(getattr(o, "filled_at", "") or ""),
+                    "created_at": str(getattr(o, "created_at", "") or ""),
                     "extendedHours": bool(getattr(o, "extended_hours", False)),
                     "extended_hours": bool(getattr(o, "extended_hours", False)),
                 }
@@ -652,6 +747,8 @@ class AlpacaClient:
             ]
         except Exception as e:
             logger.error(f"Alpaca get_orders failed: {e}")
+            if raise_on_error:
+                raise
             return []
 
     def get_open_orders(self) -> List[Dict[str, Any]]:
@@ -694,9 +791,7 @@ class AlpacaClient:
         return {
             "connected": self.connected,
             "paper": self.config.paper,
-            "base_url": self.config.base_url or (
-                "https://paper-api.alpaca.markets" if self.config.paper else "https://api.alpaca.markets"
-            ),
+            "base_url": self._trading_base_url(),
             "account_id": self._account_id,
         }
 

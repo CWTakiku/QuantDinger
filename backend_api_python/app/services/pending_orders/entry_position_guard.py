@@ -6,15 +6,19 @@ from dataclasses import dataclass, field
 from typing import Any, Dict
 
 from app.services.live_trading.position_ownership import (
+    DEFAULT_SHORTFALL_RELATIVE_TOLERANCE,
     evaluate_and_record_ownership,
     normalize_market_type,
     ownership_log_message,
+    DEFAULT_DRIFT_QUOTE_TOLERANCE,
+    quote_drift_tolerance,
 )
 from app.services.live_trading.position_query import query_exchange_position_size
 from app.services.live_trading.records import (
     fetch_allocated_position_size,
     fetch_position_size_for_side,
 )
+from app.services.grid.exchange_requirements import detect_hedge_position_mode
 from app.services.strategy_live_guard import resolve_strategy_direction_mode
 
 
@@ -61,13 +65,22 @@ def evaluate_entry_position_guard(
         dust_quote = float(
             trading_config.get("position_drift_tolerance_quote")
             or strategy_config.get("position_drift_tolerance_quote")
-            or 1.0
+            or DEFAULT_DRIFT_QUOTE_TOLERANCE
         )
     except (TypeError, ValueError):
-        dust_quote = 1.0
-    dust_quote = min(5.0, max(0.0, dust_quote))
+        dust_quote = DEFAULT_DRIFT_QUOTE_TOLERANCE
+    dust_quote = min(DEFAULT_DRIFT_QUOTE_TOLERANCE, max(0.0, dust_quote))
+    try:
+        shortfall_ratio = float(
+            trading_config.get("position_shortfall_tolerance_ratio")
+            or strategy_config.get("position_shortfall_tolerance_ratio")
+            or DEFAULT_SHORTFALL_RELATIVE_TOLERANCE
+        )
+    except (TypeError, ValueError):
+        shortfall_ratio = DEFAULT_SHORTFALL_RELATIVE_TOLERANCE
+    shortfall_ratio = min(0.02, max(0.001, shortfall_ratio))
     price = max(0.0, float(reference_price or 0.0))
-    absolute_tolerance = dust_quote / price if dust_quote > 0 and price > 0 else 0.0
+    absolute_tolerance = quote_drift_tolerance(symbol, price, dust_quote)
     snapshot = evaluate_and_record_ownership(
         user_id=int(user_id or 1),
         credential_id=int(credential_id or 0),
@@ -78,6 +91,7 @@ def evaluate_entry_position_guard(
         account_qty=float(account_qty or 0.0),
         strategy_qty=float(strategy_qty or 0.0),
         absolute_tolerance=absolute_tolerance,
+        shortfall_relative_tolerance=shortfall_ratio,
     )
     metadata = snapshot.metadata()
     if not snapshot.allowed:
@@ -105,8 +119,6 @@ def evaluate_entry_position_guard(
 
     opposite_side = "short" if str(side) == "long" else "long"
     local_opposite = fetch_position_size_for_side(int(strategy_id), str(symbol), opposite_side)
-    if local_opposite <= 1e-8:
-        return EntryPositionGuardResult(ownership=metadata)
     try:
         live_opposite = float(
             query_exchange_position_size(
@@ -126,6 +138,33 @@ def evaluate_entry_position_guard(
         )
     if live_opposite <= 1e-8:
         return EntryPositionGuardResult(ownership=metadata)
+    if local_opposite <= 1e-8:
+        try:
+            is_hedge, mode_label = detect_hedge_position_mode(
+                client,
+                symbol=str(symbol),
+                market_type=str(market_type),
+                exchange_config=exchange_config,
+            )
+        except Exception as exc:
+            return EntryPositionGuardResult(
+                ownership=metadata,
+                error=f"position_mode_snapshot_failed:{exc}",
+            )
+        if is_hedge is True:
+            return EntryPositionGuardResult(ownership=metadata)
+        return EntryPositionGuardResult(
+            ownership=metadata,
+            error=(
+                "opposite_account_inventory_would_be_netted:"
+                f"side={opposite_side},exchange={live_opposite},mode={mode_label}"
+            ),
+            log_level="warning",
+            log_message=(
+                f"Entry rejected because one-way position mode would net opposite "
+                f"account inventory: {symbol}"
+            ),
+        )
     return EntryPositionGuardResult(
         ownership=metadata,
         error=(

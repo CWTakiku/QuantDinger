@@ -3,6 +3,7 @@ import math
 import pandas as pd
 import pytest
 
+from app.services.instrument_rules import InstrumentRules
 from app.services.strategy_v2 import StrategyV2BacktestRunner, StrategyV2LiveSession
 from app.services.strategy_v2.data import MultiAssetDataPortal
 from app.services.strategy_v2.models import ScheduleSpec
@@ -18,6 +19,23 @@ def _frame(prices):
         "close": prices,
         "volume": [100000] * len(prices),
     }, index=index)
+
+
+def _rules(key: str, *, amount_step: float, min_notional: float = 0.0, min_amount: float = 0.0):
+    market_type = "swap" if key.lower().endswith("@swap") else "spot"
+    return {
+        key: InstrumentRules(
+            key=key,
+            exchange_id="binance",
+            market_type=market_type,
+            symbol=key.split(":", 1)[-1].split("@", 1)[0],
+            amount_step=amount_step,
+            min_amount=min_amount,
+            min_notional=min_notional,
+            price_tick=0.01,
+            captured_at="2026-01-01T00:00:00Z",
+        )
+    }
 
 
 def test_data_portal_caches_timestamps_and_slices_point_in_time_history():
@@ -63,6 +81,28 @@ def rebalance(context, data):
     assert {trade["symbol"] for trade in result["rawTrades"]} == {"USStock:AAPL", "USStock:MSFT"}
     assert result["totalExecutions"] >= 2
     assert result["finalEquity"] > 10000
+
+
+def test_backtest_range_accepts_timezone_aware_utc_boundaries():
+    runner = StrategyV2BacktestRunner(
+        code="""
+def initialize(context):
+    context.set_universe(["USStock:AAPL"])
+    context.subscribe(frequency="1d")
+
+def handle_data(context, data):
+    pass
+""",
+        frames={"USStock:AAPL": _frame([100, 101, 102])},
+        initial_capital=10000,
+    )
+
+    result = runner.run(
+        start_date=pd.Timestamp("2026-01-02", tz="UTC"),
+        end_date=pd.Timestamp("2026-01-03", tz="UTC"),
+    )
+
+    assert len(result["equityCurve"]) == 2
 
 
 def test_result_distinguishes_total_return_from_peak_to_trough_drawdown():
@@ -154,6 +194,55 @@ def handle_data(context, data):
     assert len(result["rawTrades"]) == 1
     assert result["rawTrades"][0]["time"].startswith("2026-01-02")
     assert result["rawTrades"][0]["price"] == 110
+
+
+def test_target_percent_open_sizing_ignores_same_bar_future_ohlc_values():
+    code = """
+def initialize(context):
+    context.set_universe(["USStock:AAPL"])
+    context.subscribe(frequency="1d")
+
+def handle_data(context, data):
+    bars = get_history(10, "1d", "close", "USStock:AAPL")
+    if len(bars) == 1:
+        order_target_percent("USStock:AAPL", 1.0, reason="initial_target")
+    elif len(bars) == 2:
+        order_target_percent("USStock:AAPL", 0.5, reason="rebalance_target")
+"""
+    index = pd.date_range("2026-01-01", periods=3, freq="D")
+
+    def run(close: float, high: float, low: float):
+        frame = pd.DataFrame({
+            "open": [100.0, 100.0, 100.0],
+            "high": [101.0, 101.0, high],
+            "low": [99.0, 99.0, low],
+            "close": [100.0, 100.0, close],
+            "volume": [1_000_000.0] * 3,
+        }, index=index)
+        return StrategyV2BacktestRunner(
+            code=code,
+            frames={"USStock:AAPL": frame},
+            initial_capital=10_000,
+            commission=0,
+            slippage=0,
+        ).run()
+
+    low_close = run(80.0, 150.0, 50.0)
+    high_close = run(120.0, 150.0, 50.0)
+    changed_range = run(80.0, 500.0, 1.0)
+
+    for result in (low_close, high_close, changed_range):
+        rebalance = result["executions"][1]
+        assert result["engine"]["preFillValuationPolicy"] == (
+            "explicit_fill_or_current_open_then_last_completed_close-v1"
+        )
+        assert rebalance["price"] == pytest.approx(100.0)
+        assert rebalance["side"] == "sell"
+        assert rebalance["quantity"] == pytest.approx(50.0)
+        assert result["rebalanceRecords"][1]["equityBefore"] == pytest.approx(10_000.0)
+
+    assert low_close["orderLedger"] == high_close["orderLedger"] == changed_range["orderLedger"]
+    assert low_close["rebalanceRecords"] == high_close["rebalanceRecords"] == changed_range["rebalanceRecords"]
 
 
 def test_buy_limit_remains_resting_and_uses_favorable_gap_open():
@@ -385,12 +474,14 @@ def test_explicit_backtest_quantity_is_not_scaled_by_leverage():
     assert target == 2.5
 
 
-def test_leveraged_backtest_force_closes_and_stops_after_insolvency():
+@pytest.mark.parametrize("leverage", [5, 20])
+@pytest.mark.parametrize("commission,slippage", [(0, 0), (0.0005, 0.0005)])
+def test_leveraged_backtest_force_closes_and_stops_after_insolvency(leverage, commission, slippage):
     code = """
 def initialize(context):
     context.set_universe(["Crypto:BTC/USDT@swap"])
     context.subscribe(frequency="1d")
-    context.allow_leverage(max_leverage=5)
+    context.allow_leverage(max_leverage=20)
 
 def handle_data(context, data):
     if get_position("Crypto:BTC/USDT@swap").amount == 0:
@@ -401,15 +492,22 @@ def handle_data(context, data):
         frames={"Crypto:BTC/USDT@swap": _frame([100, 100, 70, 60, 50, 40])},
         initial_capital=10_000,
         leverage_enabled=True,
-        leverage=5,
-        commission=0,
-        slippage=0,
+        leverage=leverage,
+        commission=commission,
+        slippage=slippage,
     ).run()
 
     assert result["liquidated"] is True
     assert result["finalEquity"] == pytest.approx(0.0)
     assert result["totalReturn"] == pytest.approx(-100.0)
     assert result["annualizedReturn"] == pytest.approx(-100.0)
+    assert result["maxDrawdown"] == pytest.approx(-100.0)
+    assert result["maxDrawdownTroughEquity"] == pytest.approx(0.0)
+    assert result["maxDrawdownTroughTime"] == result["liquidationEvents"][0]["time"]
+    assert min(point["drawdown"] for point in result["equityCurve"]) == pytest.approx(-100.0)
+    liquidation_time = result["liquidationEvents"][0]["time"]
+    assert all(point["value"] == 0 and point["drawdown"] == -100
+               for point in result["equityCurve"] if point["time"] >= liquidation_time)
     assert result["totalExecutions"] == 2
     assert result["totalTrades"] == 1
     assert result["closedTrades"][0]["close_reason"] == "margin_liquidation"
@@ -706,10 +804,54 @@ def test_scheduler_honors_weekday_monthday_and_intraday_time():
     )
 
 
+def test_scheduler_catches_up_target_day_missed_at_period_boundary():
+    good_friday_weekly = ScheduleSpec("weekly", "rebalance", weekday=5)
+    month_end = ScheduleSpec("monthly", "rebalance", monthday=31)
+    weekend_weekly = ScheduleSpec("weekly", "rebalance", weekday=6)
+
+    # 2026-04-03 is Good Friday (no US session): the week must still run once.
+    assert StrategyV2BacktestRunner._schedule_due(
+        good_friday_weekly, pd.Timestamp("2026-04-06"), pd.Timestamp("2026-04-02"), "1d"
+    )
+    assert not StrategyV2BacktestRunner._schedule_due(
+        good_friday_weekly, pd.Timestamp("2026-04-07"), pd.Timestamp("2026-04-06"), "1d"
+    )
+    # 2026-01-31 is a Saturday: the January month-end run happens on 2026-02-02.
+    assert StrategyV2BacktestRunner._schedule_due(
+        month_end, pd.Timestamp("2026-02-02"), pd.Timestamp("2026-01-30"), "1d"
+    )
+    assert not StrategyV2BacktestRunner._schedule_due(
+        month_end, pd.Timestamp("2026-02-03"), pd.Timestamp("2026-02-02"), "1d"
+    )
+    # A Saturday target on a weekday-only market runs on the following Monday.
+    assert StrategyV2BacktestRunner._schedule_due(
+        weekend_weekly, pd.Timestamp("2026-01-12"), pd.Timestamp("2026-01-09"), "1d"
+    )
+    assert not StrategyV2BacktestRunner._schedule_due(
+        weekend_weekly, pd.Timestamp("2026-01-13"), pd.Timestamp("2026-01-12"), "1d"
+    )
+    # Intraday: a Monday bar before the scheduled time does not re-run last week.
+    intraday = ScheduleSpec("weekly", "rebalance", weekday=1, time="09:35")
+    assert not StrategyV2BacktestRunner._schedule_due(
+        intraday, pd.Timestamp("2026-01-12 09:30"), pd.Timestamp("2026-01-09 16:00"), "5m"
+    )
+    assert not StrategyV2BacktestRunner._schedule_due(
+        good_friday_weekly, pd.Timestamp("2026-04-06"), None, "1d"
+    )
+    # Live clocks are zone-aware: stepping back a week must not cross into
+    # the week before when the gap spans a DST change (2026-03-08 in New York).
+    live = ScheduleSpec("weekly", "rebalance", weekday=6, time="09:35")
+    assert StrategyV2BacktestRunner._schedule_due(
+        live,
+        pd.Timestamp("2026-03-09 00:30", tz="America/New_York"),
+        pd.Timestamp("2026-03-06 16:00", tz="America/New_York"),
+        "1m",
+    )
+
+
 def test_rejected_and_deferred_orders_are_visible_in_audit_ledger():
     frame = _frame([100, 101, 102])
     frame["is_suspended"] = [False, True, False]
-    frame["lot_size"] = [10, 10, 10]
     code = """
 def initialize(context):
     context.set_universe(["USStock:AAPL"])
@@ -888,6 +1030,82 @@ def handle_data(context, data):
     assert trade["profit"] == pytest.approx(trade["gross_profit"] - trade["commission"])
 
 
+def test_grid_exit_uses_matched_cell_entry_without_hiding_account_realized_pnl():
+    symbol = "Crypto:XAUT/USDT@swap"
+    index = pd.date_range("2026-01-01", periods=4, freq="min")
+    frame = pd.DataFrame({
+        "open": [80.0, 90.0, 110.0, 105.0],
+        "high": [80.0, 90.0, 110.0, 105.0],
+        "low": [80.0, 90.0, 110.0, 105.0],
+        "close": [80.0, 90.0, 110.0, 105.0],
+        "volume": [100_000.0] * 4,
+    }, index=index)
+    code = """
+def initialize(context):
+    g.symbol = "Crypto:XAUT/USDT@swap"
+    g.low_sent = False
+    g.high_sent = False
+    g.exit_sent = False
+    context.set_universe([g.symbol])
+    context.subscribe(frequency="1m")
+    context.set_metadata(direction_mode="neutral")
+
+def handle_data(context, data):
+    if not g.low_sent:
+        order(
+            g.symbol, -1, position_side="short", order_type="limit",
+            limit_price=90, reason="short_entry",
+            client_order_id="grid-0-short-entry-1",
+        )
+        g.low_sent = True
+    elif get_order_status("grid-0-short-entry-1")["status"] == "filled" and not g.high_sent:
+        order(
+            g.symbol, -1, position_side="short", order_type="limit",
+            limit_price=110, reason="short_entry",
+            client_order_id="grid-1-short-entry-1",
+        )
+        g.high_sent = True
+    elif get_order_status("grid-1-short-entry-1")["status"] == "filled" and not g.exit_sent:
+        order(
+            g.symbol, 1, position_side="short", order_type="limit",
+            limit_price=105, reason="short_exit",
+            client_order_id="grid-1-short-exit-1",
+        )
+        g.exit_sent = True
+"""
+
+    result = StrategyV2BacktestRunner(
+        code=code,
+        frames={symbol: frame},
+        initial_capital=1000,
+        commission=0.001,
+        slippage=0,
+    ).run()
+
+    trade = result["closedTrades"][0]
+    assert trade["profit_basis"] == "grid_cell"
+    assert trade["entry_price"] == pytest.approx(110)
+    assert trade["matched_entry_price"] == pytest.approx(110)
+    assert trade["exit_price"] == pytest.approx(105)
+    assert trade["gross_profit"] == pytest.approx(5)
+    assert trade["entry_commission"] == pytest.approx(0.11)
+    assert trade["exit_commission"] == pytest.approx(0.105)
+    assert trade["profit"] == pytest.approx(4.785)
+    assert trade["grid_matched_profit"] == pytest.approx(4.785)
+    assert trade["account_avg_entry_price"] == pytest.approx(100)
+    assert trade["account_realized_profit"] == pytest.approx(-5.205)
+    assert result["winRate"] == pytest.approx(100)
+    assert result["gridMatchedProfit"] == pytest.approx(4.785)
+    assert result["accountRealizedProfit"] == pytest.approx(-5.205)
+    assert result["tradeProfitBasis"] == "grid_cell_when_available"
+    assert result["attribution"]["symbols"][0]["realizedProfit"] == pytest.approx(-5.205)
+    assert [row["client_order_id"] for row in result["executions"]] == [
+        "grid-0-short-entry-1",
+        "grid-1-short-entry-1",
+        "grid-1-short-exit-1",
+    ]
+
+
 def test_live_session_snapshot_round_trips_strategy_timestamps_and_order_statuses():
     frame = _frame([100, 101])
     code = """
@@ -989,6 +1207,321 @@ def handle_data(context, data):
         "strategyState": {"counter": 99},
     })
     assert restored.program.state.counter == 0
+
+
+def test_crypto_integer_lot_size_no_dust_on_close():
+    """
+    Test that when using real exchange lot_size (fractional for BTC, integer for low-priced perps),
+    closing a position does not leave sub-lot dust that blocks re-entry.
+    
+    This reproduces the issue from #219 where 1e-8 hardcoded lot_size caused
+    dust to remain after partial fills due to liquidity caps.
+    """
+    # Simulate a crypto perp with realistic BTC lot_size (0.001 BTC)
+    # Price: ~50,000 USDT, volume allows only 0.1 BTC per bar due to 10% liquidity cap
+    prices = [50000, 51000, 52000, 53000, 54000]
+    index = pd.date_range("2026-01-01", periods=len(prices), freq="1min")
+    frame = pd.DataFrame({
+        "open": prices,
+        "high": [p * 1.001 for p in prices],
+        "low": [p * 0.999 for p in prices],
+        "close": prices,
+        "volume": [0.1] * len(prices),  # Low volume so liquidity cap = 0.1 BTC
+    }, index=index)
+    
+    code = """
+def initialize(context):
+    g.symbol = "Crypto:BTC/USDT@swap"
+    g.step = 0
+    context.set_universe([g.symbol])
+    context.subscribe(frequency="1m")
+
+def handle_data(context, data):
+    if g.step == 0:
+        order_target_value(g.symbol, 5000, reason="entry")  # ~0.1 BTC
+    elif g.step == 1:
+        order_target_value(g.symbol, 0, reason="exit")  # Full close
+    g.step += 1
+"""
+    result = StrategyV2BacktestRunner(
+        code=code,
+        frames={"Crypto:BTC/USDT@swap": frame},
+        initial_capital=10_000,
+        commission=0.0005,
+        slippage=0.0005,
+        instrument_rules=_rules(
+            "Crypto:BTC/USDT@swap", amount_step=0.001, min_notional=5.0
+        ),
+    ).run()
+    
+    # Should have 2 executions (entry + exit)
+    assert result["totalExecutions"] == 2
+    assert result["totalTrades"] == 1
+    
+    # Position should be fully closed (no dust remaining)
+    trade = result["closedTrades"][0]
+    assert trade["profit"] != 0  # Trade actually happened
+    
+    # No rejected orders due to minimum_trade_unit dust
+    rejected_reasons = [item["statusReason"] for item in result["orderLedger"] if item["status"] == "rejected"]
+    assert "minimum_trade_unit" not in rejected_reasons, f"Dust caused minimum_trade_unit rejection: {rejected_reasons}"
+    
+    # Position should be cleanly closed
+    assert len(result["executions"]) == 2
+    assert result["executions"][0]["side"] == "buy"
+    assert result["executions"][1]["side"] == "sell"
+
+
+def test_crypto_min_notional_rejection():
+    """
+    Test that orders below MIN_NOTIONAL are rejected.
+    """
+    prices = [100, 100, 100]
+    index = pd.date_range("2026-01-01", periods=len(prices), freq="1min")
+    frame = pd.DataFrame({
+        "open": prices,
+        "high": prices,
+        "low": prices,
+        "close": prices,
+        "volume": [10000] * len(prices),
+    }, index=index)
+    
+    code = """
+def initialize(context):
+    g.symbol = "Crypto:BTC/USDT@swap"
+    g.sent = False
+    context.set_universe([g.symbol])
+    context.subscribe(frequency="1m")
+
+def handle_data(context, data):
+    if not g.sent:
+        order_target_value(g.symbol, 50, reason="entry")  # Below min notional of 100
+        g.sent = True
+"""
+    result = StrategyV2BacktestRunner(
+        code=code,
+        frames={"Crypto:BTC/USDT@swap": frame},
+        initial_capital=10_000,
+        commission=0.0005,
+        slippage=0.0005,
+        instrument_rules=_rules(
+            "Crypto:BTC/USDT@swap", amount_step=0.01, min_notional=100.0
+        ),
+    ).run()
+    
+    # Order should be rejected due to min_notional
+    rejected_reasons = [item["statusReason"] for item in result["orderLedger"] if item["status"] == "rejected"]
+    assert "min_notional" in rejected_reasons, f"Expected min_notional rejection, got: {rejected_reasons}"
+
+
+def test_crypto_min_notional_does_not_block_full_close():
+    prices = [10, 10, 4, 4]
+    index = pd.date_range("2026-01-01", periods=len(prices), freq="1min")
+    frame = pd.DataFrame({
+        "open": prices,
+        "high": prices,
+        "low": prices,
+        "close": prices,
+        "volume": [1000] * len(prices),
+    }, index=index)
+
+    code = """
+def initialize(context):
+    g.symbol = "Crypto:TUT/USDT@swap"
+    g.step = 0
+    context.set_universe([g.symbol])
+    context.subscribe(frequency="1m")
+
+def handle_data(context, data):
+    if g.step == 0:
+        order(g.symbol, 1, reason="entry")
+    elif g.step == 1:
+        order_target_value(g.symbol, 0, reason="exit")
+    g.step += 1
+"""
+    result = StrategyV2BacktestRunner(
+        code=code,
+        frames={"Crypto:TUT/USDT@swap": frame},
+        initial_capital=100,
+        commission=0.0,
+        slippage=0.0,
+        instrument_rules=_rules(
+            "Crypto:TUT/USDT@swap", amount_step=1.0, min_notional=5.0
+        ),
+    ).run()
+
+    assert result["totalExecutions"] == 2
+    assert result["totalTrades"] == 1
+    assert not result["positions"]
+    assert result["orderLedger"][-1]["status"] == "filled"
+
+
+def test_crypto_spot_close_still_obeys_min_notional():
+    prices = [10, 10, 4, 4]
+    index = pd.date_range("2026-01-01", periods=len(prices), freq="1min")
+    frame = pd.DataFrame({
+        "open": prices,
+        "high": prices,
+        "low": prices,
+        "close": prices,
+        "volume": [1000] * len(prices),
+    }, index=index)
+
+    code = """
+def initialize(context):
+    g.symbol = "Crypto:TUT/USDT@spot"
+    g.step = 0
+    context.set_universe([g.symbol])
+    context.subscribe(frequency="1m")
+
+def handle_data(context, data):
+    if g.step == 0:
+        order(g.symbol, 1, reason="entry")
+    elif g.step == 1:
+        order_target_value(g.symbol, 0, reason="exit")
+    g.step += 1
+"""
+    result = StrategyV2BacktestRunner(
+        code=code,
+        frames={"Crypto:TUT/USDT@spot": frame},
+        initial_capital=100,
+        commission=0.0,
+        slippage=0.0,
+        instrument_rules=_rules(
+            "Crypto:TUT/USDT@spot", amount_step=1.0, min_notional=5.0
+        ),
+    ).run()
+
+    assert result["totalExecutions"] == 1
+    assert result["positions"]
+    assert result["orderLedger"][-1]["statusReason"] == "min_notional"
+
+
+def test_crypto_min_notional_uses_cash_capped_fill_quantity():
+    prices = [10, 10, 10]
+    index = pd.date_range("2026-01-01", periods=len(prices), freq="1min")
+    frame = pd.DataFrame({
+        "open": prices,
+        "high": prices,
+        "low": prices,
+        "close": prices,
+        "volume": [1000] * len(prices),
+    }, index=index)
+
+    code = """
+def initialize(context):
+    g.symbol = "Crypto:TUT/USDT@swap"
+    g.sent = False
+    context.set_universe([g.symbol])
+    context.subscribe(frequency="1m")
+
+def handle_data(context, data):
+    if not g.sent:
+        order(g.symbol, 10, reason="entry")
+        g.sent = True
+"""
+    result = StrategyV2BacktestRunner(
+        code=code,
+        frames={"Crypto:TUT/USDT@swap": frame},
+        initial_capital=20,
+        commission=0.0,
+        slippage=0.0,
+        instrument_rules=_rules(
+            "Crypto:TUT/USDT@swap", amount_step=1.0, min_notional=50.0
+        ),
+    ).run()
+
+    assert result["totalExecutions"] == 0
+    assert not result["positions"]
+    assert result["orderLedger"][0]["statusReason"] == "min_notional"
+
+
+def test_crypto_target_zero_reconciles_a_real_sub_lot_residual():
+    symbol = "Crypto:BTC/USDT@swap"
+    frame = _frame([100, 100])
+    portal = MultiAssetDataPortal({symbol: frame})
+    broker = MultiAssetSimulationBroker(
+        initial_capital=10_000,
+        commission=0.0,
+        slippage=0.0,
+        instrument_rules=_rules(symbol, amount_step=0.1, min_notional=1.0),
+    )
+    broker.portfolio.positions[symbol] = Position(
+        symbol=symbol,
+        amount=0.25,
+        avg_cost=100,
+        last_price=100,
+    )
+
+    timestamp = frame.index[0]
+    portal.set_clock(timestamp, include_current=True)
+    broker.execute([OrderIntent(symbol, "target_quantity", 0.0)], portal, timestamp)
+
+    assert broker.executions[-1]["quantity"] == pytest.approx(0.25)
+    assert not broker.portfolio.positions
+
+
+def test_backtest_results_independent_of_initial_capital():
+    """
+    Test that backtest execution results are independent of initial capital
+    (the core issue from #219: larger positions hit liquidity cap more often,
+    leaving more dust with hardcoded 1e-8 lot_size).
+    """
+    prices = [50000, 51000, 52000, 53000]
+    index = pd.date_range("2026-01-01", periods=len(prices), freq="1min")
+    frame = pd.DataFrame({
+        "open": prices,
+        "high": [p * 1.001 for p in prices],
+        "low": [p * 0.999 for p in prices],
+        "close": prices,
+        "volume": [0.2] * len(prices),  # Very low volume -> tight liquidity cap (0.02 BTC per bar)
+    }, index=index)
+    
+    code = """
+def initialize(context):
+    g.symbol = "Crypto:BTC/USDT@swap"
+    g.step = 0
+    context.set_universe([g.symbol])
+    context.subscribe(frequency="1m")
+
+def handle_data(context, data):
+    if g.step == 0:
+        order_target_value(g.symbol, 100000, reason="entry")  # 2 BTC
+    elif g.step == 1:
+        order_target_value(g.symbol, 0, reason="exit")  # Full close
+    g.step += 1
+"""
+    # Run with different initial capitals
+    result_small = StrategyV2BacktestRunner(
+        code=code,
+        frames={"Crypto:BTC/USDT@swap": frame},
+        initial_capital=50_000,  # Can only afford ~1 BTC
+        commission=0.0005,
+        slippage=0.0005,
+        instrument_rules=_rules(
+            "Crypto:BTC/USDT@swap", amount_step=0.001, min_notional=5.0
+        ),
+    ).run()
+    
+    result_large = StrategyV2BacktestRunner(
+        code=code,
+        frames={"Crypto:BTC/USDT@swap": frame},
+        initial_capital=500_000,  # Can afford 10 BTC
+        commission=0.0005,
+        slippage=0.0005,
+        instrument_rules=_rules(
+            "Crypto:BTC/USDT@swap", amount_step=0.001, min_notional=5.0
+        ),
+    ).run()
+    
+    # Both should complete the trade (no dust blocking)
+    assert result_small["totalTrades"] == 1, f"Small capital: {result_small['totalTrades']} trades"
+    assert result_large["totalTrades"] == 1, f"Large capital: {result_large['totalTrades']} trades"
+    
+    # Both should have no minimum_trade_unit rejections
+    for result in [result_small, result_large]:
+        rejected = [item["statusReason"] for item in result["orderLedger"] if item["status"] == "rejected"]
+        assert "minimum_trade_unit" not in rejected, f"Dust rejection: {rejected}"
 
 
 def test_strategy_can_cancel_a_resting_limit_before_a_later_bar_crosses_it():

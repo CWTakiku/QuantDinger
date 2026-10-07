@@ -6,7 +6,7 @@ from datetime import datetime
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Dict, Any, List, Optional, Tuple
 
-from app.utils.db import get_db_connection
+from app.utils.db import get_db_connection, get_db_transaction
 from app.utils.logger import get_logger
 from app.services.billing_service import get_billing_service
 from app.services.community_kpis import (
@@ -15,16 +15,28 @@ from app.services.community_kpis import (
     summarise_backtest_runs,
 )
 from app.services.indicator_translator import pick_localized
+from app.services.script_source import get_script_source_service
+from app.services.strategy_marketplace_contract import (
+    adapt_parameterized_source,
+    compatibility_for_target,
+    derive_marketplace_contract,
+)
 
 logger = get_logger(__name__)
 
 
-def _strategy_contract_payload(
+def _marketplace_contract_payload(
     manifest: Dict[str, Any],
     param_schema: Dict[str, Any],
     *,
     source: str,
+    code: str = '',
 ) -> Optional[Dict[str, Any]]:
+    if str(code or '').strip():
+        try:
+            return derive_marketplace_contract(code, param_schema, source=source)
+        except Exception:
+            logger.debug("Marketplace strategy contract derivation failed", exc_info=True)
     if not isinstance(manifest, dict) or not manifest:
         return None
 
@@ -58,15 +70,55 @@ def _strategy_contract_payload(
             if field_name and field_name not in data_fields:
                 data_fields.append(field_name)
 
+    instrument_keys = []
+    for item in instruments:
+        if not isinstance(item, dict):
+            continue
+        market = str(item.get('market') or '').strip()
+        symbol = str(item.get('symbol') or item.get('instrument_id') or '').strip()
+        exchange = str(item.get('exchange_id') or '').strip().lower()
+        market_type = str(item.get('market_type') or '').strip().lower()
+        if not symbol:
+            continue
+        suffix = f"@{exchange}:{market_type}" if exchange and market_type else (
+            f"@{exchange}" if exchange else (f"@{market_type}" if market_type else '')
+        )
+        instrument_keys.append(f"{market}:{symbol}{suffix}" if market else f"{symbol}{suffix}")
+    market_types = sorted({
+        str(item.get('market_type') or '').strip().lower()
+        for item in instruments if isinstance(item, dict) and item.get('market_type')
+    })
+    universe_reference = str(universe.get('reference') or '')
+    binding_mode = 'universe' if universe_reference else ('portfolio' if len(instrument_keys) > 1 else 'fixed')
+    frequencies = list(manifest.get('frequencies') or [])
+    execution_frequency = str(
+        manifest.get('drivingFrequency') or manifest.get('primaryFrequency') or ''
+    )
     return {
+        'contract_version': 2,
+        'contract_hash': str(manifest.get('codeHash') or ''),
         'source': source,
         'api_version': int(manifest.get('apiVersion') or 2),
+        'binding_mode': binding_mode,
+        'instrument_binding': '',
         'strategy_type': str(manifest.get('strategyType') or 'cta'),
-        'primary_frequency': str(manifest.get('primaryFrequency') or ''),
+        'direction_mode': str(manifest.get('directionMode') or ''),
+        'execution_mode': 'bar',
+        'execution_frequency': execution_frequency,
+        'confirmation_frequencies': [
+            value for value in frequencies if value != execution_frequency
+        ],
+        'frequencies': frequencies,
+        'primary_frequency': execution_frequency,
+        'driving_frequency': execution_frequency,
         'markets': list(manifest.get('markets') or []),
         'universe_kind': str(universe.get('kind') or 'static'),
-        'universe_reference': str(universe.get('reference') or ''),
+        'universe_reference': universe_reference,
         'instruments': [dict(item) for item in instruments if isinstance(item, dict)],
+        'bound_instruments': instrument_keys,
+        'supported_markets': list(manifest.get('markets') or []),
+        'market_types': market_types,
+        'supported_market_types': market_types,
         'benchmark': dict(benchmark) if benchmark else None,
         'leverage_allowed': bool(manifest.get('leverageAllowed') or False),
         'max_leverage': float(manifest.get('maxLeverage') or 1.0),
@@ -76,6 +128,11 @@ def _strategy_contract_payload(
         'data_fields': data_fields,
         'parameters': normalized_parameters,
     }
+
+
+# Deprecated internal alias retained for compatibility with integrations that
+# imported the helper before the marketplace naming was clarified.
+_strategy_contract_payload = _marketplace_contract_payload
 
 
 def _marketplace_platform_fee_rate() -> Decimal:
@@ -113,6 +170,75 @@ def _split_marketplace_amounts(gross: Any) -> Tuple[Decimal, Decimal, Decimal, D
     return gross_amount, platform_fee, seller_amount, fee_rate
 
 
+def _lock_marketplace_accounts(cur, buyer_id: int, seller_id: int) -> Dict[int, Decimal]:
+    """Lock marketplace accounts in a stable order and return current balances."""
+    account_ids = sorted({int(buyer_id), int(seller_id)})
+    placeholders = ', '.join('?' for _ in account_ids)
+    cur.execute(
+        f"SELECT id, credits FROM qd_users WHERE id IN ({placeholders}) ORDER BY id FOR UPDATE",
+        tuple(account_ids),
+    )
+    balances = {
+        int(row['id']): Decimal(str(row.get('credits') or 0))
+        for row in (cur.fetchall() or [])
+    }
+    if set(balances) != set(account_ids):
+        raise ValueError('marketplace_account_not_found')
+    return balances
+
+
+def _debit_marketplace_buyer(cur, buyer_id: int, amount: Decimal) -> Optional[Decimal]:
+    """Atomically debit a buyer and return the resulting balance."""
+    cur.execute(
+        """
+        UPDATE qd_users
+        SET credits = credits - ?, updated_at = NOW()
+        WHERE id = ? AND credits >= ?
+        RETURNING credits
+        """,
+        (amount, int(buyer_id), amount),
+    )
+    row = cur.fetchone()
+    return Decimal(str(row['credits'])) if row else None
+
+
+def _credit_marketplace_seller(cur, seller_id: int, amount: Decimal) -> Decimal:
+    """Atomically credit a seller and return the resulting balance."""
+    cur.execute(
+        """
+        UPDATE qd_users
+        SET credits = credits + ?, updated_at = NOW()
+        WHERE id = ?
+        RETURNING credits
+        """,
+        (amount, int(seller_id)),
+    )
+    row = cur.fetchone()
+    if not row:
+        raise ValueError('marketplace_seller_not_found')
+    return Decimal(str(row['credits']))
+
+
+def _contract_index_values(contract: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    value = contract if isinstance(contract, dict) else {}
+    encode = lambda items: '|' + '|'.join(str(item) for item in (items or []) if str(item).strip()) + '|'
+    return {
+        'contract_json': json.dumps(value, ensure_ascii=False) if value else None,
+        'contract_version': int(value.get('contract_version') or 0) or None,
+        'contract_hash': str(value.get('contract_hash') or '') or None,
+        'binding_mode': str(value.get('binding_mode') or '') or None,
+        'strategy_type': str(value.get('strategy_type') or '') or None,
+        'direction_mode': str(value.get('direction_mode') or '') or None,
+        'execution_mode': str(value.get('execution_mode') or 'bar') or None,
+        'execution_frequency': str(
+            value.get('execution_frequency') or value.get('primary_frequency') or ''
+        ) or None,
+        'confirmation_frequencies': encode(value.get('confirmation_frequencies')),
+        'markets': encode(value.get('supported_markets') or value.get('markets')),
+        'market_types': encode(value.get('supported_market_types') or value.get('market_types')),
+    }
+
+
 class CommunityService:
     """Marketplace service for indicators, script templates, purchases, and reviews."""
     
@@ -136,6 +262,12 @@ class CommunityService:
         user_id: int = None,       # Current user id, used to mark purchased items.
         accept_language: str = 'en-US',  # Select name_i18n / description_i18n.
         asset_type: str = None,    # 'indicator' / 'script_template' / None(all)
+        market: str = None,
+        market_type: str = None,
+        binding_mode: str = None,
+        strategy_type: str = None,
+        direction_mode: str = None,
+        leverage: str = None,
     ) -> Dict[str, Any]:
         """获取市场上已发布的指标列表
 
@@ -225,6 +357,27 @@ class CommunityService:
                     where_clauses.append("(COALESCE(i.asset_type, 'indicator') = ?)")
                     params.append(str(asset_type).strip())
 
+                if str(asset_type or '').strip() == 'script_template':
+                    if market:
+                        where_clauses.append("COALESCE(i.marketplace_markets, '') ILIKE ?")
+                        params.append(f"%|{str(market).strip()}|%")
+                    if market_type:
+                        where_clauses.append("COALESCE(i.marketplace_market_types, '') ILIKE ?")
+                        params.append(f"%|{str(market_type).strip().lower()}|%")
+                    if binding_mode:
+                        where_clauses.append("i.marketplace_binding_mode = ?")
+                        params.append(str(binding_mode).strip().lower())
+                    if strategy_type:
+                        where_clauses.append("i.marketplace_strategy_type = ?")
+                        params.append(str(strategy_type).strip().lower())
+                    if direction_mode:
+                        where_clauses.append("i.marketplace_direction_mode = ?")
+                        params.append(str(direction_mode).strip().lower())
+                    if str(leverage or '').strip().lower() in {'yes', 'true', '1', 'leveraged'}:
+                        where_clauses.append("COALESCE((i.marketplace_contract->>'leverage_allowed')::boolean, FALSE) = TRUE")
+                    elif str(leverage or '').strip().lower() in {'no', 'false', '0', 'spot'}:
+                        where_clauses.append("COALESCE((i.marketplace_contract->>'leverage_allowed')::boolean, FALSE) = FALSE")
+
                 where_sql = " AND ".join(where_clauses)
 
                 # SQL-friendly sorts:
@@ -284,6 +437,9 @@ class CommunityService:
                             i.preview_image, i.purchase_count, i.avg_rating, i.rating_count,
                             i.view_count, i.created_at, i.updated_at,
                             i.source_language, i.name_i18n, i.description_i18n,
+                            i.marketplace_contract, i.marketplace_binding_mode, i.marketplace_strategy_type,
+                            i.marketplace_direction_mode, i.marketplace_execution_mode,
+                            i.marketplace_execution_frequency, i.marketplace_confirmation_frequencies,
                             ss.description as source_description,
                             u.id as author_id, u.username as author_username,
                             u.nickname as author_nickname, u.avatar as author_avatar
@@ -308,6 +464,9 @@ class CommunityService:
                             i.preview_image, i.purchase_count, i.avg_rating, i.rating_count,
                             i.view_count, i.created_at, i.updated_at,
                             i.source_language, i.name_i18n, i.description_i18n,
+                            i.marketplace_contract, i.marketplace_binding_mode, i.marketplace_strategy_type,
+                            i.marketplace_direction_mode, i.marketplace_execution_mode,
+                            i.marketplace_execution_frequency, i.marketplace_confirmation_frequencies,
                             ss.description as source_description,
                             u.id as author_id, u.username as author_username,
                             u.nickname as author_nickname, u.avatar as author_avatar
@@ -363,6 +522,8 @@ class CommunityService:
                         'name': localized_name,
                         'description': localized_desc[:200] if localized_desc else '',
                         'asset_type': row_asset_type,
+                        'source_script_source_id': row.get('source_script_source_id'),
+                        'source_strategy_id': row.get('source_strategy_id'),
                         'pricing_type': row['pricing_type'] or 'free',
                         'price': float(row['price'] or 0),
                         'vip_free': bool(row.get('vip_free') or False),
@@ -392,9 +553,24 @@ class CommunityService:
                         'max_drawdown': kpi['max_drawdown'],
                         'win_rate_backtest': kpi['win_rate'],
                         'profit_factor': kpi['profit_factor'],
+                        'profit_loss_ratio': kpi['profit_loss_ratio'],
+                        'winning_trades': kpi['winning_trades'],
+                        'losing_trades': kpi['losing_trades'],
                         'sample_size': kpi['sample_size'],
                         'applicable_symbols': kpi['symbols'],
                         'applicable_timeframes': kpi['timeframes'],
+                        'tested_instruments': kpi['symbols'],
+                        'marketplace_contract': self._parse_json_dict(row.get('marketplace_contract')),
+                        'strategy_contract': self._parse_json_dict(row.get('marketplace_contract')),
+                        'binding_mode': row.get('marketplace_binding_mode') or '',
+                        'strategy_type': row.get('marketplace_strategy_type') or '',
+                        'direction_mode': row.get('marketplace_direction_mode') or '',
+                        'execution_mode': row.get('marketplace_execution_mode') or 'bar',
+                        'execution_frequency': row.get('marketplace_execution_frequency') or '',
+                        'primary_frequency': row.get('marketplace_execution_frequency') or '',
+                        'confirmation_frequencies': self._decode_index_values(
+                            row.get('marketplace_confirmation_frequencies')
+                        ),
                     })
 
                 return {
@@ -429,6 +605,7 @@ class CommunityService:
         is_admin: bool = False,
         existing_indicator_id: int = 0,
         source_id: int = 0,
+        param_schema: Optional[Dict[str, Any]] = None,
     ) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
         """Publish Strategy API V2 code to the marketplace as a script template."""
         code = (code or '').strip()
@@ -446,11 +623,56 @@ class CommunityService:
 
         review_status = 'approved' if is_admin else 'pending'
         now_ts = int(time.time())
+        try:
+            marketplace_contract = derive_marketplace_contract(
+                code,
+                param_schema or {},
+                source='published_code',
+            )
+        except Exception as exc:
+            return False, str(exc), None
+        contract_index = _contract_index_values(marketplace_contract)
 
         try:
             with get_db_connection() as db:
                 cur = db.cursor()
-                if existing_indicator_id and existing_indicator_id > 0:
+                source_id_value = int(source_id or 0) or None
+                target_indicator_id = 0
+
+                # A script source is the stable marketplace identity.  The UI
+                # does not retain a marketplace row id between publish flows,
+                # so relying only on ``existing_indicator_id`` made every
+                # re-publish create a duplicate card.  Serialize publishes for
+                # the same owner/source pair, then resolve the existing row on
+                # the server before deciding between UPDATE and INSERT.
+                if source_id_value:
+                    cur.execute(
+                        "SELECT pg_advisory_xact_lock(?, ?)",
+                        (int(user_id), source_id_value),
+                    )
+                    cur.execute(
+                        """
+                        SELECT id
+                        FROM qd_indicator_codes
+                        WHERE user_id = ? AND source_script_source_id = ?
+                          AND COALESCE(asset_type, 'indicator') = 'script_template'
+                        ORDER BY CASE WHEN publish_to_community = 1 THEN 0 ELSE 1 END,
+                                 COALESCE(purchase_count, 0) DESC,
+                                 COALESCE(view_count, 0) DESC,
+                                 id ASC
+                        LIMIT 1
+                        """,
+                        (int(user_id), source_id_value),
+                    )
+                    existing_source_row = cur.fetchone()
+                    if existing_source_row:
+                        target_indicator_id = int(
+                            existing_source_row.get('id')
+                            if isinstance(existing_source_row, dict)
+                            else existing_source_row[0]
+                        )
+
+                if existing_indicator_id and existing_indicator_id > 0 and not target_indicator_id:
                     cur.execute(
                         """
                         SELECT id FROM qd_indicator_codes
@@ -458,9 +680,14 @@ class CommunityService:
                         """,
                         (existing_indicator_id, user_id),
                     )
-                    if not cur.fetchone():
+                    explicit_row = cur.fetchone()
+                    if not explicit_row:
                         cur.close()
                         return False, 'template not found', None
+                    target_indicator_id = int(existing_indicator_id)
+
+                publication_action = 'updated' if target_indicator_id else 'created'
+                if target_indicator_id:
                     cur.execute(
                         """
                         UPDATE qd_indicator_codes
@@ -469,6 +696,10 @@ class CommunityService:
                             is_encrypted = ?, vip_free = ?,
                             asset_type = 'script_template',
                             source_script_source_id = ?, source_strategy_id = ?,
+                            marketplace_contract = ?::jsonb, marketplace_contract_version = ?, marketplace_contract_hash = ?,
+                            marketplace_binding_mode = ?, marketplace_strategy_type = ?, marketplace_direction_mode = ?,
+                            marketplace_execution_mode = ?, marketplace_execution_frequency = ?,
+                            marketplace_confirmation_frequencies = ?, marketplace_markets = ?, marketplace_market_types = ?,
                             source_language = NULL, name_i18n = NULL, description_i18n = NULL,
                             review_status = ?, review_note = '', reviewed_at = NOW(), reviewed_by = ?,
                             updatetime = ?, updated_at = NOW()
@@ -477,12 +708,16 @@ class CommunityService:
                         (
                             name, code, description, pricing_type, price,
                             1 if code_hidden else 0, bool(vip_free),
-                            int(source_id or 0) or None, int(strategy_id or 0) or None,
+                            source_id_value, int(strategy_id or 0) or None,
+                            contract_index['contract_json'], contract_index['contract_version'], contract_index['contract_hash'],
+                            contract_index['binding_mode'], contract_index['strategy_type'], contract_index['direction_mode'],
+                            contract_index['execution_mode'], contract_index['execution_frequency'],
+                            contract_index['confirmation_frequencies'], contract_index['markets'], contract_index['market_types'],
                             review_status, user_id if is_admin else None,
-                            now_ts, existing_indicator_id, user_id,
+                            now_ts, target_indicator_id, user_id,
                         ),
                     )
-                    indicator_id = existing_indicator_id
+                    indicator_id = target_indicator_id
                 else:
                     cur.execute(
                         """
@@ -490,15 +725,26 @@ class CommunityService:
                           (user_id, is_buy, end_time, name, code, description,
                            publish_to_community, pricing_type, price, is_encrypted, vip_free, asset_type,
                            source_script_source_id, source_strategy_id, review_status,
+                           marketplace_contract, marketplace_contract_version, marketplace_contract_hash,
+                           marketplace_binding_mode, marketplace_strategy_type, marketplace_direction_mode,
+                           marketplace_execution_mode, marketplace_execution_frequency,
+                           marketplace_confirmation_frequencies, marketplace_markets, marketplace_market_types,
                            source_language, name_i18n, description_i18n,
                            createtime, updatetime, created_at, updated_at)
-                        VALUES (?, 0, 1, ?, ?, ?, 1, ?, ?, ?, ?, 'script_template', ?, ?, ?, NULL, NULL, NULL, ?, ?, NOW(), NOW())
+                        VALUES (?, 0, 1, ?, ?, ?, 1, ?, ?, ?, ?, 'script_template', ?, ?, ?,
+                                ?::jsonb, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                                NULL, NULL, NULL, ?, ?, NOW(), NOW())
                         """,
                         (
                             user_id, name, code, description, pricing_type, price,
                             1 if code_hidden else 0, bool(vip_free),
-                            int(source_id or 0) or None, int(strategy_id or 0) or None,
-                            review_status, now_ts, now_ts,
+                            source_id_value, int(strategy_id or 0) or None,
+                            review_status,
+                            contract_index['contract_json'], contract_index['contract_version'], contract_index['contract_hash'],
+                            contract_index['binding_mode'], contract_index['strategy_type'], contract_index['direction_mode'],
+                            contract_index['execution_mode'], contract_index['execution_frequency'],
+                            contract_index['confirmation_frequencies'], contract_index['markets'], contract_index['market_types'],
+                            now_ts, now_ts,
                         ),
                     )
                     indicator_id = int(cur.lastrowid or 0)
@@ -512,6 +758,9 @@ class CommunityService:
                 'asset_type': 'script_template',
                 'strategy_id': strategy_id,
                 'source_id': int(source_id or 0),
+                'publication_action': publication_action,
+                'marketplace_contract': marketplace_contract,
+                'strategy_contract': marketplace_contract,
             }
         except Exception as e:
             logger.error(f"publish_script_template_from_strategy failed: {e}")
@@ -529,6 +778,10 @@ class CommunityService:
             except Exception:
                 pass
         return {}
+
+    @staticmethod
+    def _decode_index_values(raw: Any) -> List[str]:
+        return [value for value in str(raw or '').strip('|').split('|') if value]
 
     def get_indicator_detail(
         self,
@@ -551,7 +804,11 @@ class CommunityService:
                         i.view_count, i.publish_to_community, i.created_at, i.updated_at,
                         i.user_id, i.review_status, COALESCE(i.is_encrypted, 0) as is_encrypted,
                         COALESCE(i.asset_type, 'indicator') as asset_type,
+                        i.source_script_source_id, i.source_strategy_id,
                         i.source_language, i.name_i18n, i.description_i18n,
+                        i.marketplace_contract, i.marketplace_binding_mode, i.marketplace_strategy_type,
+                        i.marketplace_direction_mode, i.marketplace_execution_mode,
+                        i.marketplace_execution_frequency, i.marketplace_confirmation_frequencies,
                         ss.description as source_description,
                         u.id as author_id, u.username as author_username, 
                         u.nickname as author_nickname, u.avatar as author_avatar
@@ -709,12 +966,151 @@ class CommunityService:
                     'local_copy_id': local_copy_id,
                     'asset_type': detail_asset_type,
                     'purchased_strategy_id': purchased_strategy_id,
-                    'script_source_id': purchased_script_source_id,
+                    'script_source_id': purchased_script_source_id or (
+                        row.get('source_script_source_id') if row['user_id'] == user_id else None
+                    ),
+                    'marketplace_contract': self._parse_json_dict(row.get('marketplace_contract')),
+                    'strategy_contract': self._parse_json_dict(row.get('marketplace_contract')),
+                    'binding_mode': row.get('marketplace_binding_mode') or '',
+                    'strategy_type': row.get('marketplace_strategy_type') or '',
+                    'direction_mode': row.get('marketplace_direction_mode') or '',
+                    'execution_mode': row.get('marketplace_execution_mode') or 'bar',
+                    'execution_frequency': row.get('marketplace_execution_frequency') or '',
+                    'primary_frequency': row.get('marketplace_execution_frequency') or '',
+                    'confirmation_frequencies': self._decode_index_values(
+                        row.get('marketplace_confirmation_frequencies')
+                    ),
                 }
                 
         except Exception as e:
             logger.error(f"get_indicator_detail failed: {e}")
             return None
+
+    def check_strategy_compatibility(
+        self,
+        indicator_id: int,
+        *,
+        target_instrument: str = '',
+    ) -> Optional[Dict[str, Any]]:
+        try:
+            with get_db_connection() as db:
+                cur = db.cursor()
+                cur.execute("""
+                    SELECT code, marketplace_contract, COALESCE(asset_type, 'indicator') AS asset_type
+                    FROM qd_indicator_codes
+                    WHERE id = ? AND publish_to_community = 1
+                      AND (review_status = 'approved' OR review_status IS NULL)
+                """, (int(indicator_id),))
+                row = cur.fetchone()
+                cur.close()
+            if not row or str(row.get('asset_type') or '') != 'script_template':
+                return None
+            contract = self._parse_json_dict(row.get('marketplace_contract'))
+            if not contract:
+                contract = derive_marketplace_contract(str(row.get('code') or ''), source='compatibility_fallback')
+            result = compatibility_for_target(
+                contract,
+                target_instrument=target_instrument,
+            )
+            result['contract'] = contract
+            return result
+        except Exception as exc:
+            logger.error("check_strategy_compatibility failed: %s", exc)
+            return None
+
+    def adapt_marketplace_strategy(
+        self,
+        user_id: int,
+        indicator_id: int,
+        *,
+        target_instrument: str,
+    ) -> Tuple[bool, str, Dict[str, Any]]:
+        try:
+            with get_db_connection() as db:
+                cur = db.cursor()
+                cur.execute("""
+                    SELECT i.id, i.user_id, i.name, i.description, i.code, i.is_encrypted,
+                           i.marketplace_contract, i.source_script_source_id,
+                           ss.param_schema, ss.template_key
+                    FROM qd_indicator_codes i
+                    LEFT JOIN qd_script_sources ss ON ss.id = i.source_script_source_id
+                    WHERE i.id = ? AND COALESCE(i.asset_type, 'indicator') = 'script_template'
+                      AND i.publish_to_community = 1
+                      AND (i.review_status = 'approved' OR i.review_status IS NULL)
+                """, (int(indicator_id),))
+                row = cur.fetchone()
+                if not row:
+                    cur.close()
+                    return False, 'indicator_not_found', {}
+                is_owner = int(row.get('user_id') or 0) == int(user_id)
+                if not is_owner:
+                    cur.execute(
+                        "SELECT id FROM qd_indicator_purchases WHERE indicator_id = ? AND buyer_id = ? LIMIT 1",
+                        (int(indicator_id), int(user_id)),
+                    )
+                    if not cur.fetchone():
+                        cur.close()
+                        return False, 'purchase_required', {}
+                cur.close()
+
+            contract = self._parse_json_dict(row.get('marketplace_contract'))
+            if not contract:
+                schema = self._parse_json_dict(row.get('param_schema'))
+                contract = derive_marketplace_contract(str(row.get('code') or ''), schema, source='adaptation_fallback')
+            compatibility = compatibility_for_target(
+                contract,
+                target_instrument=target_instrument,
+            )
+            if not compatibility['compatible']:
+                return False, 'strategy_incompatible', compatibility
+            if str(contract.get('binding_mode') or '') != 'parameterized':
+                return False, 'strategy_not_parameterized', compatibility
+
+            adapted_code = adapt_parameterized_source(
+                str(row.get('code') or ''), contract, target_instrument,
+            )
+            adapted_contract = derive_marketplace_contract(
+                adapted_code,
+                self._parse_json_dict(row.get('param_schema')),
+                source='marketplace_adaptation',
+            )
+            from app.services.script_source import get_script_source_service
+            from app.services.strategy_v2 import canonical_source_metadata
+
+            metadata, _manifest = canonical_source_metadata(adapted_code, {
+                'from_marketplace': True,
+                'code_hidden': bool(row.get('is_encrypted') or 0),
+                'marketplace_adaptation': {
+                    'indicator_id': int(indicator_id),
+                    'target_instrument': compatibility['target_instrument'],
+                    'source_contract_hash': str(contract.get('contract_hash') or ''),
+                    'requires_backtest': True,
+                },
+            })
+            source_id = get_script_source_service().create_source({
+                'user_id': int(user_id),
+                'name': f"{row.get('name') or 'Strategy'} · {compatibility['target_instrument']}",
+                'description': row.get('description') or '',
+                'code': adapted_code,
+                'asset_type': 'script',
+                'template_key': row.get('template_key') or '',
+                'param_schema': self._parse_json_dict(row.get('param_schema')),
+                'source_marketplace_indicator_id': int(indicator_id),
+                'source_script_source_id': int(row.get('source_script_source_id') or 0) or None,
+                'visibility': 'private',
+                'status': 'draft',
+                'metadata': metadata,
+            })
+            return True, 'success', {
+                **compatibility,
+                'script_source_id': source_id,
+                'requires_backtest': True,
+                'marketplace_contract': adapted_contract,
+                'strategy_contract': adapted_contract,
+            }
+        except Exception as exc:
+            logger.error("adapt_marketplace_strategy failed: %s", exc, exc_info=True)
+            return False, str(exc), {}
     
     # ==========================================
     # ==========================================
@@ -727,13 +1123,14 @@ class CommunityService:
             (success, message, data)
         """
         try:
-            with get_db_connection() as db:
+            with get_db_transaction() as db:
                 cur = db.cursor()
                 
                 cur.execute("""
                     SELECT id, user_id, name, code, description, pricing_type, price, COALESCE(vip_free, FALSE) as vip_free,
                            preview_image, is_encrypted,
-                           COALESCE(asset_type, 'indicator') as asset_type
+                           COALESCE(asset_type, 'indicator') as asset_type,
+                           source_script_source_id, marketplace_contract, marketplace_strategy_type
                     FROM qd_indicator_codes
                     WHERE id = ? AND publish_to_community = 1
                       AND (review_status = 'approved' OR review_status IS NULL)
@@ -760,6 +1157,8 @@ class CommunityService:
                 if seller_id == buyer_id:
                     cur.close()
                     return False, 'cannot_buy_own', {}
+
+                account_balances = _lock_marketplace_accounts(cur, buyer_id, seller_id)
                 
                 cur.execute(
                     "SELECT id FROM qd_indicator_purchases WHERE indicator_id = ? AND buyer_id = ?",
@@ -770,7 +1169,7 @@ class CommunityService:
                     return False, 'already_purchased', {}
                 
                 if pricing_type != 'free' and gross_price > 0:
-                    buyer_credits = self.billing.get_user_credits(buyer_id)
+                    buyer_credits = account_balances[int(buyer_id)]
                     if buyer_credits < gross_price:
                         cur.close()
                         return False, 'insufficient_credits', {
@@ -778,11 +1177,13 @@ class CommunityService:
                             'current': float(buyer_credits)
                         }
                     
-                    new_buyer_balance = buyer_credits - gross_price
-                    cur.execute(
-                        "UPDATE qd_users SET credits = ?, updated_at = NOW() WHERE id = ?",
-                        (float(new_buyer_balance), buyer_id)
-                    )
+                    new_buyer_balance = _debit_marketplace_buyer(cur, buyer_id, gross_price)
+                    if new_buyer_balance is None:
+                        cur.close()
+                        return False, 'insufficient_credits', {
+                            'required': float(gross_price),
+                            'current': float(buyer_credits)
+                        }
                     
                     cur.execute("""
                         INSERT INTO qd_credits_log 
@@ -796,12 +1197,7 @@ class CommunityService:
                         f"Marketplace purchase: {indicator['name']}",
                     ))
                     
-                    seller_credits = self.billing.get_user_credits(seller_id)
-                    new_seller_balance = seller_credits + seller_amount
-                    cur.execute(
-                        "UPDATE qd_users SET credits = ?, updated_at = NOW() WHERE id = ?",
-                        (float(new_seller_balance), seller_id)
-                    )
+                    new_seller_balance = _credit_marketplace_seller(cur, seller_id, seller_amount)
                     
                     cur.execute("""
                         INSERT INTO qd_credits_log 
@@ -850,6 +1246,9 @@ class CommunityService:
                             'description': indicator['description'],
                             'code': indicator['code'],
                             'is_encrypted': indicator.get('is_encrypted') or 0,
+                            'source_script_source_id': indicator.get('source_script_source_id'),
+                            'marketplace_contract': self._parse_json_dict(indicator.get('marketplace_contract')),
+                            'strategy_type': indicator.get('marketplace_strategy_type') or '',
                         },
                     )
                 else:
@@ -955,6 +1354,9 @@ class CommunityService:
                 'description': original.get('description') or '',
                 'code': original.get('code') or '',
                 'is_encrypted': original.get('is_encrypted') or 0,
+                'source_script_source_id': original.get('source_script_source_id'),
+                'marketplace_contract': self._parse_json_dict(original.get('marketplace_contract')),
+                'strategy_type': original.get('marketplace_strategy_type') or '',
             },
         )
         return {
@@ -1050,7 +1452,8 @@ class CommunityService:
                            COALESCE(pricing_type, 'free') as pricing_type,
                            COALESCE(vip_free, FALSE) as vip_free,
                            publish_to_community, review_status, updated_at,
-                           COALESCE(asset_type, 'indicator') as asset_type
+                           COALESCE(asset_type, 'indicator') as asset_type,
+                           source_script_source_id, marketplace_contract, marketplace_strategy_type
                     FROM qd_indicator_codes
                     WHERE id = ?
                     """,
@@ -1177,23 +1580,24 @@ class CommunityService:
                     metadata['code_hidden'] = original_hidden
                     metadata['from_marketplace'] = True
                     metadata['asset_type'] = 'script_template'
-                    cur.execute(
-                        """
-                        UPDATE qd_script_sources
-                        SET code = ?, name = ?, description = ?, metadata = ?::jsonb, updated_at = NOW()
-                        WHERE id = ? AND user_id = ?
-                        """,
-                        (
-                            original['code'],
-                            original['name'],
-                            original.get('description') or '',
-                            json.dumps(metadata, ensure_ascii=False),
-                            local_source['id'],
-                            buyer_id,
-                        ),
-                    )
-                    db.commit()
                     cur.close()
+                    updated = get_script_source_service().update_source(
+                        int(local_source['id']),
+                        int(buyer_id),
+                        {
+                            'name': original['name'],
+                            'description': original.get('description') or '',
+                            'code': original['code'],
+                            'asset_type': (
+                                'portfolio_strategy'
+                                if str(original.get('marketplace_strategy_type') or '').lower() == 'portfolio'
+                                else 'script'
+                            ),
+                            'metadata': metadata,
+                        },
+                    )
+                    if not updated:
+                        return False, 'local_copy_not_found', {}
                     return True, 'success', {
                         'script_source_id': local_source['id'],
                         'updated': True,
@@ -1904,7 +2308,9 @@ class CommunityService:
                 where_clauses = ["i.publish_to_community = 1"]
                 params = []
                 
-                if review_status and review_status != 'all':
+                if review_status == 'approved':
+                    where_clauses.append("(i.review_status = 'approved' OR i.review_status IS NULL)")
+                elif review_status and review_status != 'all':
                     where_clauses.append("i.review_status = ?")
                     params.append(review_status)
 
@@ -2158,19 +2564,46 @@ class CommunityService:
             logger.error(f"admin_delete_indicator failed: {e}")
             return False, f'error: {str(e)}'
     
-    def get_review_stats(self) -> Dict[str, int]:
+    def get_review_stats(
+        self,
+        keyword: str = None,
+        asset_type: str = None,
+        pricing_type: str = None,
+    ) -> Dict[str, int]:
         """获取审核统计"""
         try:
             with get_db_connection() as db:
                 cur = db.cursor()
-                cur.execute("""
+                where_clauses = ["i.publish_to_community = 1"]
+                params = []
+
+                if keyword and keyword.strip():
+                    where_clauses.append("(i.name ILIKE ? OR i.description ILIKE ? OR u.username ILIKE ? OR u.nickname ILIKE ?)")
+                    search_term = f"%{keyword.strip()}%"
+                    params.extend([search_term, search_term, search_term, search_term])
+
+                allowed_asset_types = {'indicator', 'script_template'}
+                if asset_type and str(asset_type).strip() in allowed_asset_types:
+                    where_clauses.append("COALESCE(i.asset_type, 'indicator') = ?")
+                    params.append(str(asset_type).strip())
+
+                if pricing_type == 'free':
+                    where_clauses.append("(i.pricing_type = 'free' OR COALESCE(i.price, 0) <= 0)")
+                elif pricing_type == 'paid':
+                    where_clauses.append("(i.pricing_type != 'free' AND COALESCE(i.price, 0) > 0)")
+                elif pricing_type == 'vip_free':
+                    where_clauses.append("COALESCE(i.vip_free, FALSE) = TRUE")
+
+                where_sql = " AND ".join(where_clauses)
+                cur.execute(f"""
                     SELECT 
-                        COUNT(*) FILTER (WHERE review_status = 'pending') as pending_count,
-                        COUNT(*) FILTER (WHERE review_status = 'approved' OR review_status IS NULL) as approved_count,
-                        COUNT(*) FILTER (WHERE review_status = 'rejected') as rejected_count
-                    FROM qd_indicator_codes
-                    WHERE publish_to_community = 1
-                """)
+                        COUNT(*) FILTER (WHERE i.review_status = 'pending') as pending_count,
+                        COUNT(*) FILTER (WHERE i.review_status = 'approved' OR i.review_status IS NULL) as approved_count,
+                        COUNT(*) FILTER (WHERE i.review_status = 'rejected') as rejected_count
+                    FROM qd_indicator_codes i
+                    LEFT JOIN qd_users u ON i.user_id = u.id
+                    WHERE {where_sql}
+                """, tuple(params))
                 row = cur.fetchone()
                 cur.close()
                 
@@ -2204,6 +2637,9 @@ class CommunityService:
             'sharpe': 0.0,
             'max_drawdown': 0.0,
             'profit_factor': 0.0,
+            'profit_loss_ratio': 0.0,
+            'winning_trades': 0,
+            'losing_trades': 0,
             'win_rate_backtest': 0.0,
             'sample_size': 0,
             'applicable_symbols': [],
@@ -2215,6 +2651,7 @@ class CommunityService:
             'best_run_id': None,
             'best_run_meta': None,
             'equity_curve': [],
+            'marketplace_contract': None,
             'strategy_contract': None,
         }
 
@@ -2230,6 +2667,7 @@ class CommunityService:
                         i.source_script_source_id,
                         i.source_strategy_id,
                         i.code,
+                        i.marketplace_contract,
                         ss.param_schema
                     FROM qd_indicator_codes i
                     LEFT JOIN qd_script_sources ss ON ss.id = i.source_script_source_id
@@ -2298,10 +2736,11 @@ class CommunityService:
                             'end_date': end_date,
                         }
 
-                strategy_contract = None
+                marketplace_contract = None
                 if str(asset_row.get('asset_type') or '').strip().lower() in {
                     'script_template', 'script', 'strategy'
                 }:
+                    marketplace_contract = self._parse_json_dict(asset_row.get('marketplace_contract')) or None
                     contract_manifest = {}
                     contract_source = 'published_code'
                     try:
@@ -2318,11 +2757,13 @@ class CommunityService:
                         )
                         contract_manifest = best_run_manifest
                         contract_source = 'backtest_snapshot'
-                    strategy_contract = _strategy_contract_payload(
-                        contract_manifest,
-                        self._parse_json_dict(asset_row.get('param_schema')),
-                        source=contract_source,
-                    )
+                    if not marketplace_contract:
+                        marketplace_contract = _marketplace_contract_payload(
+                            contract_manifest,
+                            self._parse_json_dict(asset_row.get('param_schema')),
+                            source=contract_source,
+                            code=str(asset_row.get('code') or '') if contract_source == 'published_code' else '',
+                        )
 
                 # Equity curve for the best run. Pulled from
                 # qd_backtest_equity_points (one row per sample point) so
@@ -2377,7 +2818,7 @@ class CommunityService:
                     total_strategy_count == 0
                     and total_trade_count == 0
                     and not equity_curve
-                    and not strategy_contract
+                    and not marketplace_contract
                 ):
                     return default_result
 
@@ -2395,6 +2836,9 @@ class CommunityService:
                     'sharpe': kpi['sharpe'],
                     'max_drawdown': kpi['max_drawdown'],
                     'profit_factor': kpi['profit_factor'],
+                    'profit_loss_ratio': kpi['profit_loss_ratio'],
+                    'winning_trades': kpi['winning_trades'],
+                    'losing_trades': kpi['losing_trades'],
                     'win_rate_backtest': kpi['win_rate'],
                     'sample_size': kpi['sample_size'],
                     'applicable_symbols': kpi['symbols'],
@@ -2409,7 +2853,8 @@ class CommunityService:
                     'best_run_id': kpi['best_run_id'],
                     'best_run_meta': best_run_meta,
                     'equity_curve': equity_curve,
-                    'strategy_contract': strategy_contract,
+                    'marketplace_contract': marketplace_contract,
+                    'strategy_contract': marketplace_contract,
                 }
 
         except Exception as e:

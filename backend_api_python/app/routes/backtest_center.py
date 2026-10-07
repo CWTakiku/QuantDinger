@@ -1,12 +1,8 @@
-"""Strategy backtest and parameter search API."""
+"""Strategy backtest API."""
 
 from __future__ import annotations
 
-from copy import deepcopy
-from datetime import datetime, timedelta
-import itertools
-import math
-import random
+from datetime import datetime
 from typing import Any
 from uuid import uuid4
 
@@ -135,6 +131,9 @@ def _prepare_run(payload: dict[str, Any], user_id: int) -> dict[str, Any]:
         "strategy_id": strategy_id,
         "source_id": source_id,
         "strategy_name": strategy_name,
+        "instrument_rules_snapshot_id": str(
+            payload.get("instrumentRulesSnapshotId") or ""
+        ).strip(),
     }
 
 
@@ -333,11 +332,15 @@ def run_factor_research():
             source_id=source_id,
             source_name=source_name,
             market=",".join(manifest.get("markets") or []),
-            timeframe=str(manifest.get("primaryFrequency") or ""),
+            timeframe=str(
+                manifest.get("drivingFrequency")
+                or manifest.get("primaryFrequency")
+                or ""
+            ),
             start_date=start_raw,
             end_date=end_raw,
             factor_id=factor_id,
-            groups=groups,
+            groups=int(result.get("effectiveGroups") or groups),
             holding_period=holding_period,
             commission=commission,
             slippage=slippage,
@@ -628,97 +631,3 @@ def _positive_int(value: Any) -> int | None:
         return parsed if parsed > 0 else None
     except (TypeError, ValueError):
         return None
-
-
-def _parameter_space(value: Any) -> dict[str, list[Any]]:
-    if not isinstance(value, dict):
-        return {}
-    output: dict[str, list[Any]] = {}
-    for key, values in value.items():
-        if not isinstance(values, list) or not values:
-            raise ValueError(f"strategyV2.invalidParameterValues:{key}")
-        output[str(key)] = values
-    return output
-
-
-def _candidates(space: dict[str, list[Any]], *, method: str, limit: int) -> list[dict[str, Any]]:
-    keys = list(space)
-    combinations = [dict(zip(keys, values)) for values in itertools.product(*(space[key] for key in keys))]
-    if method == "grid":
-        return combinations[:limit]
-    if method == "random":
-        random.Random(42).shuffle(combinations)
-        return combinations[:limit]
-    raise ValueError("strategyV2.tuningMethodUnsupported")
-
-
-def _metrics(result: dict[str, Any]) -> dict[str, float]:
-    raw = result.get("metrics") if isinstance(result.get("metrics"), dict) else result
-    annual_return = raw.get("annualReturn")
-    if annual_return is None:
-        annual_return = raw.get("annualizedReturn")
-    if annual_return is None:
-        annual_return = raw.get("annual_return")
-    return {
-        "totalReturn": _number(raw.get("totalReturn", raw.get("total_return"))),
-        "annualReturn": _number(annual_return),
-        "maxDrawdown": _number(raw.get("maxDrawdown", raw.get("max_drawdown"))),
-        "sharpeRatio": _number(raw.get("sharpeRatio", raw.get("sharpe_ratio"))),
-        "winRate": _number(raw.get("winRate", raw.get("win_rate"))),
-        "profitFactor": _number(raw.get("profitFactor", raw.get("profit_factor"))),
-        "totalTrades": _number(raw.get("totalTrades", raw.get("total_trades"))),
-    }
-
-
-def _score(result: dict[str, Any]) -> dict[str, float]:
-    metrics = _metrics(result)
-    drawdown = abs(metrics["maxDrawdown"])
-    score = (
-        metrics["annualReturn"] * 0.35
-        + metrics["sharpeRatio"] * 15
-        + metrics["winRate"] * 0.15
-        + min(metrics["profitFactor"], 5) * 5
-        - drawdown * 0.3
-    )
-    if metrics["totalTrades"] < 5:
-        score -= 20
-    return {"overallScore": round(score, 6), "maxDrawdown": drawdown}
-
-
-def _out_of_sample(payload: dict[str, Any], user_id: int, params: dict[str, Any]) -> dict[str, Any]:
-    start = datetime.strptime(str(payload.get("startDate")), "%Y-%m-%d")
-    end = datetime.strptime(str(payload.get("endDate")), "%Y-%m-%d")
-    if end <= start:
-        return {"enabled": False, "reason": "strategyV2.rangeTooShort"}
-    split = start + timedelta(seconds=int((end - start).total_seconds() * 0.7))
-    validation_start = split + timedelta(days=1)
-    if validation_start > end:
-        return {"enabled": False, "reason": "strategyV2.rangeTooShort"}
-    train_payload = {
-        **payload,
-        "startDate": start.date().isoformat(),
-        "endDate": split.date().isoformat(),
-        "params": params,
-    }
-    validation_payload = {
-        **payload,
-        "startDate": validation_start.date().isoformat(),
-        "endDate": end.date().isoformat(),
-        "params": params,
-    }
-    _, train = _run(train_payload, user_id, persist=False)
-    _, validation = _run(validation_payload, user_id, persist=False)
-    return {
-        "enabled": True,
-        "splitDate": split.date().isoformat(),
-        "train": {"metrics": _metrics(train), "score": _score(train)},
-        "validation": {"metrics": _metrics(validation), "score": _score(validation)},
-    }
-
-
-def _number(value: Any) -> float:
-    try:
-        number = float(value or 0)
-        return number if math.isfinite(number) else 0.0
-    except (TypeError, ValueError):
-        return 0.0

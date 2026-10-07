@@ -20,7 +20,7 @@ if [ ! -f /app/.env ]; then
             echo "[WARNING] Cannot create /app/.env: $(cat /tmp/quantdinger-env-copy.err)"
             echo "[WARNING] Continuing with container environment variables only."
             echo "[TIP] Create the host env file before starting Docker:"
-            echo "      cp backend_api_python/env.example backend_api_python/.env"
+            echo "      cp .env.example .env"
             rm -f /tmp/quantdinger-env-copy.err
         fi
     else
@@ -41,7 +41,7 @@ if [ -z "$CURRENT_SECRET" ]; then
     else
         export SECRET_KEY="$NEW_SECRET"
         echo "[AUTO] Generated random in-memory SECRET_KEY (no writable .env)."
-        echo "[TIP]  Set a persistent SECRET_KEY in backend_api_python/.env for production."
+        echo "[TIP]  Set a persistent SECRET_KEY in the project-root .env for production."
     fi
     CURRENT_SECRET="$NEW_SECRET"
 fi
@@ -60,11 +60,11 @@ if [ "$CURRENT_SECRET" = "$DEFAULT_SECRET" ]; then
         cat "$TMP" > /app/.env
         rm -f "$TMP"
         echo "[AUTO] Generated random SECRET_KEY (was default)."
-        echo "[TIP]  For production, set a persistent SECRET_KEY in backend_api_python/.env"
+        echo "[TIP]  For production, set a persistent SECRET_KEY in the project-root .env"
     else
         export SECRET_KEY="$NEW_SECRET"
         echo "[AUTO] Generated random in-memory SECRET_KEY (default value, no writable .env)."
-        echo "[TIP]  Set a persistent SECRET_KEY in backend_api_python/.env for production."
+        echo "[TIP]  Set a persistent SECRET_KEY in the project-root .env for production."
     fi
     CURRENT_SECRET="$NEW_SECRET"
 fi
@@ -111,7 +111,26 @@ fi
 # Runtime processes do not need root privileges. The entrypoint keeps root only
 # long enough to initialize bind-mounted secrets and volume ownership.
 if [ "$(id -u)" = "0" ] && id quantdinger >/dev/null 2>&1; then
-    chown -R quantdinger:quantdinger /app/logs /app/data 2>/dev/null || true
+    # Do not recursively chown runtime volumes on every container start. These
+    # directories can contain years of market/backtest data, and every backend
+    # service used to walk the same trees concurrently before its command could
+    # even start. On production volumes that made `docker compose up` appear to
+    # hang at the migration dependency for several minutes.
+    #
+    # Owning the volume root and its immediate children is sufficient for the
+    # normal append/create paths while keeping startup work bounded. Operators
+    # upgrading an old volume that contains root-owned nested files can opt in
+    # to the one-time recursive repair with FIX_RUNTIME_VOLUME_OWNERSHIP_RECURSIVE=1.
+    for RUNTIME_DIR in /app/logs /app/data; do
+        mkdir -p "$RUNTIME_DIR"
+        chown quantdinger:quantdinger "$RUNTIME_DIR" 2>/dev/null || true
+        find "$RUNTIME_DIR" -mindepth 1 -maxdepth 1 \
+            -exec chown quantdinger:quantdinger {} + 2>/dev/null || true
+    done
+    if [ "${FIX_RUNTIME_VOLUME_OWNERSHIP_RECURSIVE:-0}" = "1" ]; then
+        echo "[INFO] Repairing runtime volume ownership recursively (one-time maintenance)."
+        chown -R quantdinger:quantdinger /app/logs /app/data 2>/dev/null || true
+    fi
     if [ -f /app/.env ]; then
         if chown quantdinger:quantdinger /app/.env 2>/dev/null; then
             chmod 600 /app/.env 2>/dev/null || \

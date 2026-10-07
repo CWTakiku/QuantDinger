@@ -18,7 +18,7 @@ from app.services.live_trading.okx import OkxClient
 from app.services.live_trading.bitget import BitgetMixClient
 from app.services.live_trading.bitget_spot import BitgetSpotClient
 from app.services.live_trading.bybit import BybitClient
-from app.services.live_trading.gate import GateSpotClient, GateUsdtFuturesClient
+from app.services.live_trading.gate import GateSpotClient, GateStockClient, GateUsdtFuturesClient
 
 # Lazy import HTX
 HtxClient = None
@@ -100,6 +100,7 @@ def place_order_from_signal(
     exchange_config: Optional[Dict[str, Any]] = None,
     client_order_id: Optional[str] = None,
     quote_amount: float = 0,
+    spot_buy_by_quantity: bool = False,
 ) -> LiveOrderResult:
     if amount is None:
         amount = 0.0
@@ -134,23 +135,21 @@ def place_order_from_signal(
             qty, _meta = clamp_spot_close_quantity(client, symbol=symbol, requested_qty=qty)
             if qty <= 0:
                 raise LiveTradingError(
-                    "Insufficient spot base balance to close (fees or balance mismatch)"
+                    "strategyRuntime.spotBalanceInsufficient"
                 )
         elif side == "buy" and not reduce_only:
-            if quote_amt <= 0 and qty > 0:
-                quote_amt = _quote_amount_from_base_qty(client, symbol=symbol, base_qty=qty)
-            quote_amt = normalize_spot_quote_amount(client, symbol=symbol, quote_amount=quote_amt)
-            if quote_amt <= 0:
-                raise LiveTradingError("Invalid spot buy quote amount (below min/precision)")
-            # BinanceSpot now uses ``quoteOrderQty`` for market BUY, so the
-            # base ``quantity`` no longer needs to satisfy LOT_SIZE — keep it
-            # only as a fallback for clients that still want base sizing.
-            if isinstance(client, BinanceSpotClient) and quote_amt <= 0:
+            if spot_buy_by_quantity:
                 qty = normalize_spot_base_quantity(
                     client, symbol=symbol, quantity=qty, for_market=True
                 )
                 if qty <= 0:
                     raise LiveTradingError("Invalid spot order quantity (below lot step/minQty)")
+            else:
+                if quote_amt <= 0 and qty > 0:
+                    quote_amt = _quote_amount_from_base_qty(client, symbol=symbol, base_qty=qty)
+                quote_amt = normalize_spot_quote_amount(client, symbol=symbol, quote_amount=quote_amt)
+                if quote_amt <= 0:
+                    raise LiveTradingError("Invalid spot buy quote amount (below min/precision)")
         else:
             qty = normalize_spot_base_quantity(
                 client, symbol=symbol, quantity=qty, for_market=True
@@ -202,7 +201,7 @@ def place_order_from_signal(
     if isinstance(client, BinanceSpotClient):
         # Prefer ``quoteOrderQty`` for market BUY (Binance recommended) so we
         # never trip LOT_SIZE / NOTIONAL filters; SELL still uses base qty.
-        if side == "buy" and quote_amt > 0:
+        if side == "buy" and quote_amt > 0 and not spot_buy_by_quantity:
             return client.place_market_order(
                 symbol=symbol,
                 side="BUY",
@@ -217,7 +216,13 @@ def place_order_from_signal(
         )
     if isinstance(client, BitgetSpotClient):
         spot_size = quote_amt if (side == "buy" and quote_amt > 0) else qty
-        if side == "buy" and spot_size <= 0:
+        if side == "buy" and spot_buy_by_quantity:
+            spot_size = normalize_spot_quote_amount(
+                client,
+                symbol=symbol,
+                quote_amount=_quote_amount_from_base_qty(client, symbol=symbol, base_qty=qty),
+            )
+        elif side == "buy" and spot_size <= 0:
             spot_size = _quote_amount_from_base_qty(client, symbol=symbol, base_qty=qty)
         return client.place_market_order(
             symbol=symbol,
@@ -234,11 +239,20 @@ def place_order_from_signal(
             pos_side=pos_side,
             client_order_id=client_order_id,
         )
+    if isinstance(client, GateStockClient):
+        return client.place_market_order(
+            symbol=symbol,
+            side=side,
+            size=qty,
+            client_order_id=client_order_id,
+        )
     if isinstance(client, GateSpotClient):
         gate_size = qty
         if side == "buy":
-            gate_size = quote_amt if quote_amt > 0 else _quote_amount_from_base_qty(
-                client, symbol=symbol, base_qty=qty
+            gate_size = quote_amt if quote_amt > 0 and not spot_buy_by_quantity else normalize_spot_quote_amount(
+                client,
+                symbol=symbol,
+                quote_amount=_quote_amount_from_base_qty(client, symbol=symbol, base_qty=qty),
             )
         return client.place_market_order(symbol=symbol, side=side, size=gate_size, client_order_id=client_order_id)
     if isinstance(client, GateUsdtFuturesClient):

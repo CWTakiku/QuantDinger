@@ -15,9 +15,31 @@ from app.services.ai_skill_registry import (
     render_prompt_template,
 )
 from app.services.ai_tool_registry import MCP_AGENT_TOOLS, TOOLS
+from app.services.billing_config import DEFAULT_BILLING_CONFIG, FEATURE_NAMES
+from app.routes.settings import CONFIG_SCHEMA
 
 
 BACKEND_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _local_markdown_targets(document: Path) -> set[Path]:
+    text = document.read_text(encoding="utf-8")
+    targets: set[Path] = set()
+    for raw_target in re.findall(r"\[[^\]]+\]\(([^)]+)\)", text):
+        target = raw_target.split("#", 1)[0].strip()
+        if target and "://" not in target:
+            targets.add((document.parent / target).resolve())
+    for raw_target in re.findall(r"(?m)^@([^\s]+)$", text):
+        targets.add((document.parent / raw_target.strip()).resolve())
+    return targets
+
+
+def test_repository_agent_instruction_references_exist():
+    documents = (BACKEND_ROOT / "AGENTS.md", BACKEND_ROOT / "CLAUDE.md")
+    for document in documents:
+        assert document.is_file(), document
+        for target in _local_markdown_targets(document):
+            assert target.exists(), f"{document.relative_to(BACKEND_ROOT)} references missing {target}"
 
 
 def _mcp_tool_names() -> set[str]:
@@ -101,6 +123,67 @@ def test_builtin_skill_registry_does_not_advertise_retired_experiments():
     assert "experiment" not in by_id["job_monitor"]["description"].lower()
     assert "symbol" not in by_id["backtest_runner"]["requires"]
     assert "timeframe" not in by_id["backtest_runner"]["requires"]
+
+
+def test_retired_parameter_tuning_is_not_exposed_or_billable(app):
+    assert "/api/backtest/tune" not in {rule.rule for rule in app.url_map.iter_rules()}
+    assert "cost_ai_tuning" not in DEFAULT_BILLING_CONFIG
+    assert "ai_tuning" not in FEATURE_NAMES
+
+    human_paths = yaml.safe_load(
+        (BACKEND_ROOT / "docs" / "api" / "openapi.yaml").read_text(encoding="utf-8")
+    )["paths"]
+    assert "/api/backtest/tune" not in human_paths
+
+
+def test_billing_settings_only_expose_costs_with_real_charge_paths():
+    billing_keys = {
+        item["key"]
+        for item in CONFIG_SCHEMA["billing"]["items"]
+        if item["key"].startswith("BILLING_COST_")
+    }
+    assert billing_keys == {
+        "BILLING_COST_BACKTEST",
+        "BILLING_COST_AI_REVIEW",
+        "BILLING_COST_AI_ANALYSIS",
+        "BILLING_COST_AI_CODE_GEN",
+        "BILLING_COST_AI_COPILOT_CHAT",
+        "BILLING_COST_AI_COPILOT_IMAGE",
+        "BILLING_COST_AI_DECISION_FILTER",
+        "BILLING_COST_EVENT_RADAR",
+    }
+    assert set(DEFAULT_BILLING_CONFIG) == {
+        "enabled",
+        "cost_backtest",
+        "cost_ai_review",
+        "cost_ai_analysis",
+        "cost_ai_code_gen",
+        "cost_ai_copilot_chat",
+        "cost_ai_copilot_image",
+        "cost_ai_decision_filter",
+        "cost_event_radar",
+    }
+    assert "ai_indicator_to_strategy" not in FEATURE_NAMES
+    assert "ai_copilot_radar" not in FEATURE_NAMES
+
+    charge_paths = {
+        "backtest": "app/routes/backtest_center.py",
+        "ai_review": "app/routes/strategy_review_routes.py",
+        "ai_analysis": "app/routes/fast_analysis.py",
+        "ai_code_gen": "app/routes/strategy.py",
+        "ai_copilot_chat": "app/routes/ai_chat.py",
+        "ai_copilot_image": "app/routes/ai_chat.py",
+        "ai_decision_filter": "app/services/ai_decision_filter.py",
+        "event_radar": "app/services/event_radar.py",
+    }
+    backend_root = BACKEND_ROOT / "backend_api_python"
+    for feature, relative_path in charge_paths.items():
+        source = (backend_root / relative_path).read_text(encoding="utf-8")
+        billing_call = (
+            rf"(?:get_feature_cost|check_and_consume)\("
+            rf"[\s\S]{{0,160}}?(?:feature\s*=\s*)?['\"]{feature}['\"]"
+        )
+        assert re.search(billing_call, source), f"{feature} no longer has a runtime billing path"
 
 
 def test_prompt_skill_manifest_rejects_executable_or_action_fields():

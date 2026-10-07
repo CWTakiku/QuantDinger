@@ -81,8 +81,28 @@ class StrategyCommandRepository:
                 )
                 row = cur.fetchone()
                 if row:
+                    command = StrategyCommand.from_row(dict(row))
+                    if (
+                        command_type == "stop"
+                        and bool((payload or {}).get("close_positions"))
+                        and not bool(command.payload.get("close_positions"))
+                    ):
+                        cur.execute(
+                            """
+                            UPDATE qd_strategy_commands
+                            SET payload_json = COALESCE(payload_json, '{}'::jsonb)
+                                || %s::jsonb,
+                                updated_at = NOW()
+                            WHERE id = %s
+                            RETURNING *
+                            """,
+                            (json.dumps({"close_positions": True}), command.id),
+                        )
+                        upgraded = cur.fetchone()
+                        if upgraded:
+                            command = StrategyCommand.from_row(dict(upgraded))
                     db.commit()
-                    return StrategyCommand.from_row(dict(row))
+                    return command
 
                 cur.execute(
                     """
@@ -122,7 +142,7 @@ class StrategyCommandRepository:
                             (command.status = 'processing' AND command.lease_expires_at < NOW())
                           )
                           AND (
-                            command.command_type IN ('start', 'reconcile')
+                            command.command_type IN ('start', 'stop', 'reconcile')
                             OR lease.strategy_id IS NULL
                             OR lease.owner_id = %s
                             OR lease.lease_expires_at < NOW()
@@ -228,6 +248,20 @@ class StrategyCommandRepository:
             finally:
                 cur.close()
 
+    def has_pending_stop(self, strategy_id: int) -> bool:
+        with get_db_connection() as db:
+            cur = db.cursor()
+            try:
+                cur.execute(
+                    """SELECT 1 FROM qd_strategy_commands
+                       WHERE strategy_id = %s AND command_type = 'stop'
+                         AND status IN ('pending', 'processing') LIMIT 1""",
+                    (int(strategy_id),),
+                )
+                return cur.fetchone() is not None
+            finally:
+                cur.close()
+
     def acquire_strategy_lease(self, *, strategy_id: int, owner_id: str, lease_seconds: int) -> int | None:
         with get_db_connection() as db:
             cur = db.cursor()
@@ -287,10 +321,39 @@ class StrategyCommandRepository:
             cur = db.cursor()
             try:
                 cur.execute(
-                    "DELETE FROM qd_strategy_runtime_leases WHERE strategy_id = %s AND owner_id = %s",
+                    """
+                    UPDATE qd_strategy_runtime_leases
+                    SET owner_id = '',
+                        lease_expires_at = NOW() - INTERVAL '1 second',
+                        heartbeat_at = NOW(),
+                        updated_at = NOW()
+                    WHERE strategy_id = %s AND owner_id = %s
+                    """,
                     (int(strategy_id), owner_id),
                 )
                 db.commit()
+            finally:
+                cur.close()
+
+    def revoke_strategy_lease(self, *, strategy_id: int) -> bool:
+        with get_db_connection() as db:
+            cur = db.cursor()
+            try:
+                cur.execute(
+                    """
+                    UPDATE qd_strategy_runtime_leases
+                    SET owner_id = '',
+                        fencing_token = fencing_token + 1,
+                        lease_expires_at = NOW() - INTERVAL '1 second',
+                        heartbeat_at = NOW(),
+                        updated_at = NOW()
+                    WHERE strategy_id = %s
+                    """,
+                    (int(strategy_id),),
+                )
+                revoked = cur.rowcount == 1
+                db.commit()
+                return revoked
             finally:
                 cur.close()
 
@@ -313,6 +376,7 @@ class StrategyCommandRepository:
                     SET role = EXCLUDED.role, status = 'running',
                         metadata_json = EXCLUDED.metadata_json,
                         heartbeat_at = NOW(), updated_at = NOW()
+                    RETURNING worker_id
                     """,
                     (worker_id, role, json.dumps(metadata or {}, default=str)),
                 )

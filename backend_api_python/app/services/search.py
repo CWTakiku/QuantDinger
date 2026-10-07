@@ -5,7 +5,7 @@ import json
 import time
 import re
 from datetime import datetime
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Callable
 from app.services.search_models import BaseSearchProvider, SearchResponse, SearchResult
 
 from app.utils.logger import get_logger
@@ -666,49 +666,34 @@ class DuckDuckGoSearchProvider(BaseSearchProvider):
             )
             
         except Exception as e:
-            return SearchResponse(
-                query=query,
-                results=[],
-                provider=self.name,
-                success=False,
-                error_message=str(e)
-            )
+            results = self._search_html(query, max_results)
+            return SearchResponse(query=query, results=results, provider=self.name,
+                                  success=bool(results), error_message=None if results else str(e))
     
     def _search_html(self, query: str, max_results: int) -> List[SearchResult]:
-        """DuckDuckGo HTML 搜索备选"""
+        """Parse public HTML results without depending on attribute order."""
+        from bs4 import BeautifulSoup
+        from urllib.parse import parse_qs, urljoin, urlsplit
         try:
-            url = "https://lite.duckduckgo.com/lite/"
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            }
-            data = {'q': query}
-            
-            response = requests.post(url, headers=headers, data=data, timeout=10)
+            response = requests.get("https://lite.duckduckgo.com/lite/",
+                headers={"User-Agent": "Mozilla/5.0"}, params={"q": query}, timeout=8)
             response.raise_for_status()
-            
+            soup = BeautifulSoup(response.text, "html.parser")
             results = []
-            html = response.text
-            
-            link_pattern = r'<a[^>]*class="result-link"[^>]*href="([^"]*)"[^>]*>([^<]*)</a>'
-            snippet_pattern = r'<td[^>]*class="result-snippet"[^>]*>([^<]*)</td>'
-            
-            links = re.findall(link_pattern, html)
-            snippets = re.findall(snippet_pattern, html)
-            
-            for i, (link, title) in enumerate(links[:max_results]):
-                snippet = snippets[i] if i < len(snippets) else ''
-                if link and title:
-                    results.append(SearchResult(
-                        title=title.strip(),
-                        snippet=snippet.strip(),
-                        url=link,
-                        source='DuckDuckGo',
-                    ))
-            
+            snippets = soup.select(".result-snippet")
+            for index, anchor in enumerate(soup.select("a.result-link")[:max_results]):
+                link = urljoin("https://duckduckgo.com", anchor.get("href", ""))
+                redirected = parse_qs(urlsplit(link).query).get("uddg")
+                if redirected:
+                    link = redirected[0]
+                if urlsplit(link).scheme not in {"https", "http"}:
+                    continue
+                results.append(SearchResult(title=anchor.get_text(" ", strip=True),
+                    snippet=snippets[index].get_text(" ", strip=True) if index < len(snippets) else "",
+                    url=link, source="DuckDuckGo"))
             return results
-            
-        except Exception as e:
-            logger.debug(f"DuckDuckGo HTML search failed: {e}")
+        except Exception as exc:
+            logger.debug("DuckDuckGo HTML search failed: %s", type(exc).__name__)
             return []
 
 
@@ -857,6 +842,20 @@ class SearchService:
         response = self.search_with_fallback(query, limit, days)
         return response.to_list()
     
+    def search_research(self, query: str, max_results: int = 5) -> List[Dict[str, Any]]:
+        """Use general web engines for filings, company facts and historical research."""
+        for provider in self._providers:
+            if not provider.is_available or provider.name in {"GDELT", "AlphaVantage"}:
+                continue
+            try:
+                response = provider.search(query, max_results, days=3650)
+            except Exception as exc:
+                logger.info("Research search provider %s failed: %s", provider.name, type(exc).__name__)
+                continue
+            if response.success and response.results:
+                return response.to_list()
+        return []
+
     def search_with_fallback(self, query: str, max_results: int = 5, days: int = 7) -> SearchResponse:
         """
         执行搜索（带自动故障转移）
@@ -886,6 +885,44 @@ class SearchService:
             provider="None",
             success=False,
             error_message="所有搜索引擎都不可用或搜索失败"
+        )
+
+    def search_free_first(
+        self,
+        query: str,
+        max_results: int = 5,
+        days: int = 7,
+        result_filter: Optional[Callable[[SearchResult], bool]] = None,
+    ) -> SearchResponse:
+        """Prefer no-key providers before the configured commercial search chain."""
+        free_names = ("GDELT", "DuckDuckGo")
+        providers = [provider for name in free_names for provider in self._providers if provider.name == name]
+        providers.extend(provider for provider in self._providers if provider.name not in free_names)
+        for provider in providers:
+            if not provider.is_available:
+                continue
+            try:
+                response = provider.search(query, max_results, days)
+            except Exception as exc:
+                logger.warning("Event search provider %s failed: %s", provider.name, exc)
+                continue
+            if response.success and response.results:
+                if result_filter is None:
+                    return response
+                filtered = [result for result in response.results if result_filter(result)]
+                if filtered:
+                    return SearchResponse(
+                        query=query,
+                        results=filtered,
+                        provider=response.provider,
+                        success=True,
+                    )
+        return SearchResponse(
+            query=query,
+            results=[],
+            provider="None",
+            success=False,
+            error_message="No search provider returned event data",
         )
     
     def search_stock_news(

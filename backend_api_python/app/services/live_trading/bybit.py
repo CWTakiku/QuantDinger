@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlencode
 
 from app.services.live_trading.base import BaseRestClient, LiveOrderResult, LiveTradingError
+from app.utils.numeric_precision import floor_decimal_to_step, format_decimal
 
 logger = logging.getLogger(__name__)
 from app.services.live_trading.symbols import to_bybit_symbol
@@ -157,21 +158,7 @@ class BybitClient(BaseRestClient):
 
     @staticmethod
     def _floor_to_step(value: Decimal, step: Decimal) -> Decimal:
-        if step is None:
-            return value
-        if value <= 0:
-            return Decimal("0")
-        try:
-            st = Decimal(step)
-        except Exception:
-            st = Decimal("0")
-        if st <= 0:
-            return value
-        try:
-            n = (value / st).to_integral_value(rounding=ROUND_DOWN)
-            return n * st
-        except Exception:
-            return Decimal("0")
+        return floor_decimal_to_step(value, step)
 
     def _sign(self, prehash: str) -> str:
         return hmac.new(self.secret_key.encode("utf-8"), prehash.encode("utf-8"), hashlib.sha256).hexdigest()
@@ -536,26 +523,19 @@ class BybitClient(BaseRestClient):
         except Exception:
             info = {}
         lot = (info.get("lotSizeFilter") if isinstance(info, dict) else None) or {}
-        step = self._to_dec((lot or {}).get("qtyStep") or "0")
+        step = self._to_dec((lot or {}).get("qtyStep") or (lot or {}).get("basePrecision") or "0")
         mn = self._to_dec((lot or {}).get("minOrderQty") or "0")
         if step > 0:
             q = self._floor_to_step(q, step)
         
-        # Infer precision from qtyStep
+        # Infer precision from qtyStep. Decimal.normalize() renders small steps in
+        # scientific notation, so derive precision from the Decimal exponent.
         qty_precision = None
         if step > 0:
             try:
-                step_normalized = step.normalize()
-                step_str = str(step_normalized)
-                if '.' in step_str:
-                    decimal_part = step_str.split('.')[1]
-                    qty_precision = len(decimal_part)
-                    if qty_precision < 0:
-                        qty_precision = 0
-                    if qty_precision > 18:
-                        qty_precision = 18
-                else:
-                    qty_precision = 0
+                exp = step.normalize().as_tuple().exponent
+                if isinstance(exp, int):
+                    qty_precision = min(max(0, -exp), 18)
             except Exception:
                 pass
         
@@ -565,6 +545,27 @@ class BybitClient(BaseRestClient):
             # Avoid sending unrounded base qty when instrument metadata is missing.
             qty_precision = 4
         return (q, qty_precision)
+
+    def _validate_spot_limit_order(self, *, symbol: str, qty: Decimal, price: Decimal) -> None:
+        if self.category != "spot":
+            return
+        try:
+            info = self.get_instrument_info(category=self.category, symbol=to_bybit_symbol(symbol)) or {}
+        except Exception:
+            return
+        lot = (info.get("lotSizeFilter") if isinstance(info, dict) else None) or {}
+        min_order_amount = self._to_dec(lot.get("minOrderAmt") or lot.get("minNotionalValue") or "0")
+        max_limit_qty = self._to_dec(lot.get("maxLimitOrderQty") or lot.get("maxOrderQty") or "0")
+        if min_order_amount > 0 and qty * price < min_order_amount:
+            raise LiveTradingError(
+                "Invalid spot limit notional (below minOrderAmt): "
+                f"notional={self._dec_str(qty * price)} min={self._dec_str(min_order_amount)}"
+            )
+        if max_limit_qty > 0 and qty > max_limit_qty:
+            raise LiveTradingError(
+                "Invalid spot limit qty (above maxLimitOrderQty): "
+                f"qty={self._dec_str(qty)} max={self._dec_str(max_limit_qty)}"
+            )
 
     def _normalize_quantity(
         self,
@@ -650,16 +651,9 @@ class BybitClient(BaseRestClient):
         price_precision = None
         if tick > 0:
             try:
-                tick_normalized = tick.normalize()
-                tick_str = str(tick_normalized)
-                if "." in tick_str:
-                    price_precision = len(tick_str.split(".")[1])
-                    if price_precision < 0:
-                        price_precision = 0
-                    if price_precision > 18:
-                        price_precision = 18
-                else:
-                    price_precision = 0
+                exp = tick.normalize().as_tuple().exponent
+                if isinstance(exp, int):
+                    price_precision = min(max(0, -exp), 18)
             except Exception:
                 pass
         return (p, price_precision)
@@ -681,7 +675,9 @@ class BybitClient(BaseRestClient):
         q_req = float(qty or 0.0)
         q_dec, qty_precision = self._normalize_qty(symbol=symbol, qty=q_req)
         if float(q_dec or 0) <= 0:
-            raise LiveTradingError(f"Invalid qty (below step/min): requested={q_req}")
+            raise LiveTradingError(
+                f"Invalid qty (below step/min): requested={format_decimal(q_req)}"
+            )
         body: Dict[str, Any] = {
             "category": self.category,
             "symbol": sym,
@@ -725,9 +721,14 @@ class BybitClient(BaseRestClient):
         q_dec, qty_precision = self._normalize_qty(symbol=symbol, qty=q_req)
         px_dec, price_precision = self._normalize_price(symbol=symbol, price=px_req)
         if float(q_dec or 0) <= 0:
-            raise LiveTradingError(f"Invalid qty (below step/min): requested={q_req}")
+            raise LiveTradingError(
+                f"Invalid qty (below step/min): requested={format_decimal(q_req)}"
+            )
         if float(px_dec or 0) <= 0:
-            raise LiveTradingError(f"Invalid price (below tick/min): requested={px_req}")
+            raise LiveTradingError(
+                f"Invalid price (below tick/min): requested={format_decimal(px_req)}"
+            )
+        self._validate_spot_limit_order(symbol=symbol, qty=q_dec, price=px_dec)
         body: Dict[str, Any] = {
             "category": self.category,
             "symbol": sym,
@@ -793,7 +794,18 @@ class BybitClient(BaseRestClient):
             params["symbol"] = to_bybit_symbol(symbol)
         else:
             raise LiveTradingError("Bybit get_executions requires an order id or symbol")
-        return self._signed_request("GET", "/v5/execution/list", params=params)
+        rows = []
+        for _ in range(10):
+            raw = self._signed_request('GET', '/v5/execution/list', params=params)
+            result = raw.get('result') or {}
+            rows.extend(result.get('list') or [])
+            cursor = result.get('nextPageCursor')
+            if not cursor:
+                return {**raw, 'result': {**result, 'list': rows}}
+            if cursor == params.get('cursor'):
+                break
+            params['cursor'] = cursor
+        raise LiveTradingError('strategyRuntime.fillSnapshotNotReady')
 
     def _execution_fee_breakdown(
         self,
@@ -811,18 +823,19 @@ class BybitClient(BaseRestClient):
         fees: Dict[str, float] = {}
         if not isinstance(rows, list):
             return fees
-        default_ccy = "USDT" if self.category == "linear" else ""
+        from app.services.live_trading.fee_quote import symbol_currencies
+        default_ccy = symbol_currencies(symbol)[1] if self.category == "linear" else ""
         for row in rows:
             if not isinstance(row, dict):
+                continue
+            if row.get("execType") not in (None, "", "Trade"):
                 continue
             if order_id and str(row.get("orderId") or "") != str(order_id):
                 continue
             try:
-                amount = abs(float(row.get("execFee") or 0.0))
+                amount = float(row.get("execFee") or 0.0)
             except (TypeError, ValueError):
                 amount = 0.0
-            if amount <= 0:
-                continue
             currency = str(row.get("feeCurrency") or default_ccy).strip().upper() or "UNKNOWN"
             fees[currency] = fees.get(currency, 0.0) + amount
         return fees
@@ -862,24 +875,25 @@ class BybitClient(BaseRestClient):
             if isinstance(fee_detail, dict) and fee_detail:
                 for k, v in fee_detail.items():
                     try:
-                        fv = abs(float(v or 0.0))
+                        fv = float(v or 0.0)
                     except Exception:
                         fv = 0.0
-                    if fv > 0:
+                    if v is not None:
                         key = str(k or "").strip().upper() or "UNKNOWN"
                         fees_by_ccy[key] = fees_by_ccy.get(key, 0.0) + fv
                 fee = sum(fees_by_ccy.values())
                 if len(fees_by_ccy) == 1:
                     fee_ccy = next(iter(fees_by_ccy))
-            if fee <= 0:
+            if not fees_by_ccy:
                 try:
-                    fee = abs(float(last.get("cumExecFee") or 0.0))
+                    fee = float(last.get("cumExecFee") or 0.0)
                 except Exception:
                     fee = 0.0
-                if fee > 0 and self.category == "linear":
-                    fee_ccy = "USDT"
+                if fee != 0 and self.category == "linear":
+                    from app.services.live_trading.fee_quote import symbol_currencies
+                    fee_ccy = symbol_currencies(symbol)[1] or "UNKNOWN"
                     fees_by_ccy = {fee_ccy: fee}
-            if filled > 0:
+            if filled > 0 and not fees_by_ccy:
                 try:
                     execution_fees = self._execution_fee_breakdown(
                         symbol=symbol,
@@ -894,12 +908,12 @@ class BybitClient(BaseRestClient):
                     logger.debug("Bybit execution fee query failed for order %s: %s", order_id, exc)
             # cumExecFee / cumFeeDetail can lag slightly after fill shows up.
             if filled > 0 and avg_price > 0:
-                if fee <= 0 and not timed_out:
+                if not fees_by_ccy and not timed_out:
                     time.sleep(float(poll_interval_sec or 0.5))
                     continue
                 return {"filled": filled, "avg_price": avg_price, "fee": fee, "fee_ccy": fee_ccy, "fees_by_ccy": fees_by_ccy, "status": status, "order": last}
             if status.lower() in ("filled", "cancelled", "canceled", "rejected"):
-                if fee <= 0 and filled > 0 and avg_price > 0 and not timed_out:
+                if not fees_by_ccy and filled > 0 and avg_price > 0 and not timed_out:
                     time.sleep(float(poll_interval_sec or 0.5))
                     continue
                 return {"filled": filled, "avg_price": avg_price, "fee": fee, "fee_ccy": fee_ccy, "fees_by_ccy": fees_by_ccy, "status": status, "order": last}

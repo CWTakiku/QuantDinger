@@ -20,11 +20,10 @@ from app.services.live_trading.binance import BinanceFuturesClient
 from app.services.live_trading.bitget import BitgetMixClient
 from app.services.live_trading.bybit import BybitClient
 from app.services.live_trading.factory import create_client
-from app.services.live_trading.gate import GateUsdtFuturesClient
+from app.services.live_trading.gate import GateStockClient, GateUsdtFuturesClient
 from app.services.live_trading.leg_context import credential_id_from_exchange_config
 from app.services.live_trading.okx import OkxClient
 from app.services.live_trading.records import normalize_strategy_symbol, strategy_allowed_symbols
-from app.services.live_trading.strategy_position_sync import strategy_uses_fill_ledger
 from app.services.pending_orders.position_sync_cache import (
     exchange_sync_backoff_sec,
     get_position_sync_snapshot,
@@ -34,6 +33,7 @@ from app.services.pending_orders.position_sync_cache import (
     set_exchange_sync_backoff,
     set_position_sync_snapshot,
 )
+from app.services.pending_orders.live_order_support import bind_instrument_product_contract
 from app.services.strategy_lifecycle import (
     auto_stop_live_strategy,
     is_fatal_exchange_error,
@@ -74,11 +74,10 @@ def _activate_position_sync_fd_backoff(reason: str) -> None:
 class PendingOrderPositionSyncMixin:
     def _sync_positions_best_effort(self, target_strategy_id: Optional[int] = None) -> None:
         """
-        Best-effort reconciliation:
-        - If exchange position is flat, delete local row from qd_strategy_positions.
-        - If exchange position size differs, update local size (optional best-effort).
+        Refresh the account-level exchange mirror without changing strategy ledgers.
 
-        This prevents "ghost positions" when positions are closed externally on the exchange.
+        L1 account positions come from exchange snapshots. L3 strategy positions are
+        produced only by strategy-owned fills, including fill-ledger strategies.
         """
         if _is_position_sync_fd_backoff_active():
             logger.debug("[PositionSync] skipped: file-descriptor backoff active")
@@ -149,18 +148,15 @@ class PendingOrderPositionSyncMixin:
                 continue
             try:
                 sc = load_strategy_configs(int(sid))
-                exec_mode = (sc.get("execution_mode") or "").strip().lower()
-                bot_type = str(
-                    sc.get("bot_type")
-                    or (sc.get("trading_config") or {}).get("bot_type")
-                    or ""
-                ).strip().lower()
-                if strategy_uses_fill_ledger(sc):
+                strategy_status = str(sc.get("status") or "").strip().lower()
+                if strategy_status != "running":
                     logger.debug(
-                        "[PositionSync] Strategy %s skipped: fill-ledger strategy (L3)",
+                        "[PositionSync] Strategy %s skipped: status='%s'",
                         sid,
+                        strategy_status,
                     )
                     continue
+                exec_mode = (sc.get("execution_mode") or "").strip().lower()
                 if exec_mode != "live":
                     logger.debug(f"[PositionSync] Strategy {sid} skipped: execution_mode='{exec_mode}'")
                     continue
@@ -178,6 +174,32 @@ class PendingOrderPositionSyncMixin:
                 market_type = str(market_type or "swap").strip().lower()
                 if market_type in ("futures", "future", "perp", "perpetual"):
                     market_type = "swap"
+                if exchange_id == "alpaca":
+                    market_type = "spot"
+
+                trading_config = (
+                    sc.get("trading_config") if isinstance(sc.get("trading_config"), dict) else {}
+                )
+                instrument_products = trading_config.get("instrument_products") or []
+                product = next(
+                    (
+                        item
+                        for item in instrument_products
+                        if isinstance(item, dict)
+                        and str(item.get("product_type") or "crypto").strip().lower() != "crypto"
+                        and str(item.get("exchange_id") or "").strip().lower() == exchange_id
+                        and str(item.get("market_type") or "spot").strip().lower() == market_type
+                    ),
+                    None,
+                )
+                if product:
+                    exchange_config = bind_instrument_product_contract(
+                        exchange_config,
+                        trading_config,
+                        symbol=str(product.get("symbol") or ""),
+                        exchange_id=exchange_id,
+                        market_type=market_type,
+                    )
 
                 # Get strategy's trading symbol(s) to filter positions
                 # Only sync positions for symbols that this strategy actually trades
@@ -417,6 +439,24 @@ class PendingOrderPositionSyncMixin:
                                 except Exception:
                                     pass
 
+                    elif isinstance(client, GateStockClient) and market_type == "spot":
+                        resp = client.get_positions()
+                        for p in client._rows(resp):
+                            ticker = str(p.get("symbol") or "").strip().upper()
+                            try:
+                                quantity = float(p.get("volume") or 0.0)
+                                entry_price = float(p.get("avg_cost_price") or p.get("diluted_cost_price") or 0.0)
+                            except Exception:
+                                quantity = 0.0
+                                entry_price = 0.0
+                            if not ticker or quantity <= 0:
+                                continue
+                            canonical = f"{ticker}/{str(p.get('quote_currency') or 'USD').upper()}"
+                            exch_size.setdefault(canonical, {"long": 0.0, "short": 0.0})["long"] = quantity
+                            exch_inst_id.setdefault(canonical, {"long": "", "short": ""})["long"] = ticker
+                            if entry_price > 0:
+                                exch_entry_price.setdefault(canonical, {"long": 0.0, "short": 0.0})["long"] = entry_price
+
                     elif isinstance(client, GateUsdtFuturesClient) and market_type == "swap":
                         resp = client.get_positions()
                         items = resp if isinstance(resp, list) else []
@@ -502,7 +542,7 @@ class PendingOrderPositionSyncMixin:
                         # "BTC/USD" is the same format the strategy stores, so no extra
                         # normalization is needed here.
                         try:
-                            positions = client.get_positions() or []
+                            positions = client.get_positions(raise_on_error=True)
                         except Exception as e:
                             if is_file_descriptor_exhausted(e):
                                 set_exchange_sync_backoff(cache_key, seconds=_position_sync_fd_backoff_sec())
@@ -574,20 +614,21 @@ class PendingOrderPositionSyncMixin:
                         continue
 
                     set_position_sync_snapshot(cache_key, exch_size, exch_entry_price, exch_inst_id)
-                    try:
-                        cred_id = credential_id_from_exchange_config(exchange_config)
-                        legs = account_legs_from_exchange_maps(
-                            exch_size, exch_entry_price, exch_inst_id
-                        )
-                        sync_account_positions(
-                            user_id=int(sync_user_id),
-                            credential_id=cred_id,
-                            exchange_id=str(exchange_id or ""),
-                            market_type=str(market_type or "swap"),
-                            legs=legs,
-                        )
-                    except Exception as l1_err:
-                        logger.warning("[PositionSync] L1 account sync failed key=%s: %s", cache_key, l1_err)
+
+                try:
+                    cred_id = credential_id_from_exchange_config(exchange_config)
+                    legs = account_legs_from_exchange_maps(
+                        exch_size, exch_entry_price, exch_inst_id
+                    )
+                    sync_account_positions(
+                        user_id=int(sync_user_id),
+                        credential_id=cred_id,
+                        exchange_id=str(exchange_id or ""),
+                        market_type=str(market_type or "swap"),
+                        legs=legs,
+                    )
+                except Exception as l1_err:
+                    logger.warning("[PositionSync] L1 account sync failed key=%s: %s", cache_key, l1_err)
 
                 # [DEBUG] Log all normalized exchange keys for inspection
                 logger.debug(f"[PositionSync] Strategy {sid} Exchange Keys: {list(exch_size.keys())}")

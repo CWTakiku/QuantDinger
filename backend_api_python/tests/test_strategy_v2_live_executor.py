@@ -1,6 +1,7 @@
 import inspect
 
 import pandas as pd
+import pytest
 import app.services.trading_executor as trading_executor
 
 from app.services.strategy_v2 import OrderIntent
@@ -16,30 +17,52 @@ g.target_value += float(AMOUNTS[g.next_level] or 0.0)
 
     class _Sources:
         @staticmethod
-        def get_source(_source_id, user_id=None):
-            return {"code": legacy}
+        def get_version(_version_id, user_id=None):
+            return {"id": 109, "source_id": 9, "code": legacy}
 
     logs = []
     monkeypatch.setattr(trading_executor, "get_script_source_service", lambda: _Sources())
     monkeypatch.setattr(trading_executor, "append_strategy_log", lambda *args: logs.append(args))
 
-    source_id, code = TradingExecutor._load_source({
+    source_version_id, code = TradingExecutor._load_source({
         "id": 11,
         "user_id": 7,
         "template_key": "robot_v2_layered_martingale",
-        "trading_config": {"script_source_id": 9, "executor_type": "layered_martingale"},
+        "source_version_id": 109,
+        "trading_config": {
+            "script_source_id": 9,
+            "script_source_version_id": 109,
+            "executor_type": "layered_martingale",
+        },
     })
 
-    assert source_id == 9
+    assert source_version_id == 109
     assert "AMOUNT_WEIGHTS = [0.25, 0.75]" in code
     assert "AMOUNTS" not in code
     assert logs and logs[0][0] == 11
+
+
+def test_load_source_requires_the_deployment_pinned_version():
+    with pytest.raises(RuntimeError, match="strategyV2.sourceVersionRequired"):
+        TradingExecutor._load_source({
+            "id": 11,
+            "user_id": 7,
+            "trading_config": {"script_source_id": 9},
+        })
 
 
 def test_live_history_lookback_is_frequency_aware():
     assert live_history_days("1m", 2) == 1
     assert live_history_days("4h", 100) == 50
     assert live_history_days("1d", 50) == 150
+
+
+def test_live_history_lookback_covers_stock_sessions_and_weekends():
+    candidates = [{"market": "Crypto", "api_family": "stock", "underlying_market": "USStock"}]
+
+    assert live_history_days("1m", 500, candidates) == 7
+    assert live_history_days("3m", 500, candidates) == 7
+    assert live_history_days("5m", 5000, candidates) == 59
 
 
 def test_intent_signal_timestamp_prefers_scheduled_wall_clock():
@@ -112,6 +135,41 @@ def test_target_percent_opens_position_with_explicit_quantity():
     assert captured["strategy_run_id"] == 42
 
 
+def test_live_target_percent_compounds_with_strategy_equity():
+    executor = TradingExecutor.__new__(TradingExecutor)
+    executor._get_current_positions = lambda *_args: []
+    captured = {}
+
+    def execute_signal(**kwargs):
+        captured.update(kwargs)
+        return True
+
+    executor._execute_signal = execute_signal
+    intent = OrderIntent(symbol=_member()["key"], kind="target_percent", value=0.25)
+
+    result = executor._execute_strategy_v2_intent(
+        strategy_id=7,
+        strategy_name="V2 CTA",
+        intent=intent,
+        frames={_member()["key"]: _frame()},
+        candidates=[_member()],
+        initial_capital=10_000.0,
+        strategy_equity=12_000.0,
+        leverage=2.0,
+        execution_mode="live",
+        notification_config={},
+        trading_config={},
+        exchange_config={},
+        signal_ts=1,
+        strategy_run_id=42,
+    )
+
+    assert result is True
+    assert captured["script_base_qty"] == 60.0
+    assert captured["initial_capital"] == 10_000.0
+    assert captured["strategy_equity"] == 12_000.0
+
+
 def test_spot_target_percent_does_not_expand_with_leverage():
     intent = OrderIntent(symbol="USStock:AAPL", kind="target_percent", value=0.25)
 
@@ -154,6 +212,10 @@ def test_direction_constraints_convert_opposite_targets_to_flat():
     assert TradingExecutor._direction_constrained_target(
         -2.0,
         direction_mode="both",
+    ) == -2.0
+    assert TradingExecutor._direction_constrained_target(
+        -2.0,
+        direction_mode="one_way",
     ) == -2.0
 
 
@@ -347,8 +409,15 @@ def test_target_rebalance_skips_sub_dollar_dust_order():
     assert calls == []
 
 
-def test_live_order_carries_run_sizing_diagnostics():
-    executor = TradingExecutor.__new__(TradingExecutor)
+@pytest.mark.parametrize("lease_owned", [None, True, False])
+def test_live_order_carries_run_sizing_diagnostics(lease_owned):
+    executor = TradingExecutor()
+    guard_calls = []
+    if lease_owned is not None:
+        def guard(strategy_id):
+            guard_calls.append(strategy_id)
+            return lease_owned
+        executor.runtime_guard = guard
     executor._load_strategy = lambda _strategy_id: {"user_id": 12}
     captured = {}
 
@@ -373,6 +442,10 @@ def test_live_order_carries_run_sizing_diagnostics():
     )
 
     assert result is False
+    assert guard_calls == ([] if lease_owned is None else [7])
+    if lease_owned is False:
+        assert captured == {}
+        return
     assert captured["request"].sizing == {
         "initial_capital": 100.0,
         "entry_pct": 30.0,
@@ -417,6 +490,122 @@ def test_live_order_is_not_submitted_when_position_leg_has_inflight_work():
     assert result is False
 
 
+def test_stopped_live_strategy_does_not_queue_remaining_callback_orders():
+    executor = TradingExecutor.__new__(TradingExecutor)
+    executor._load_strategy = lambda _strategy_id: {
+        "user_id": 12,
+        "status": "stopped",
+        "trading_config": {},
+    }
+
+    class Gateway:
+        @staticmethod
+        def submit(_request):
+            raise AssertionError("stopped strategy must not submit another order")
+
+    executor.order_gateway = Gateway()
+
+    result = executor._execute_signal(
+        strategy_id=7,
+        strategy_run_id=42,
+        symbol="SOL/USDT",
+        signal_type="add_long",
+        script_base_qty=0.22,
+        current_price=103.0,
+        market_type="swap",
+        execution_mode="live",
+        leverage=3.0,
+        initial_capital=1_000.0,
+        signal_ts=5,
+    )
+
+    assert result is False
+
+
+def test_limit_queue_log_identifies_grid_level_order(monkeypatch):
+    executor = TradingExecutor()
+    executor._load_strategy = lambda _strategy_id: {
+        "user_id": 12,
+        "status": "running",
+        "trading_config": {},
+    }
+    logs = []
+    monkeypatch.setattr(
+        trading_executor,
+        "append_strategy_log",
+        lambda *args: logs.append(args),
+    )
+
+    class Gateway:
+        @staticmethod
+        def submit(_request):
+            return 81
+
+    executor.order_gateway = Gateway()
+
+    result = executor._execute_signal(
+        strategy_id=7,
+        strategy_run_id=42,
+        symbol="SOL/USDT",
+        signal_type="add_long",
+        script_base_qty=0.22,
+        current_price=103.0,
+        market_type="swap",
+        execution_mode="live",
+        leverage=3.0,
+        initial_capital=1_000.0,
+        signal_ts=5,
+        order_type="limit",
+        execution_algo="limit",
+        limit_price=98.7654321,
+        client_order_id="grid-58-long-entry-1",
+    )
+
+    assert result is True
+    assert logs
+    message = logs[-1][2]
+    assert "pending_id=81" in message
+    assert "limit_price=98.7654321" in message
+    assert "client_order_id=grid-58-long-entry-1" in message
+
+
+def test_signal_mode_queue_log_is_not_presented_as_an_exchange_order(monkeypatch):
+    executor = TradingExecutor()
+    executor._load_strategy = lambda _strategy_id: {"user_id": 12, "trading_config": {}}
+    logs = []
+    monkeypatch.setattr(
+        trading_executor,
+        "append_strategy_log",
+        lambda *args: logs.append(args),
+    )
+
+    class Gateway:
+        @staticmethod
+        def submit(_request):
+            return 82
+
+    executor.order_gateway = Gateway()
+
+    result = executor._execute_signal(
+        strategy_id=7,
+        strategy_run_id=42,
+        symbol="BTC/USDT",
+        signal_type="open_long",
+        script_base_qty=0.01,
+        current_price=60_000.0,
+        market_type="swap",
+        execution_mode="signal",
+        leverage=1.0,
+        initial_capital=1_000.0,
+        signal_ts=5,
+    )
+
+    assert result is True
+    assert logs[-1][1] == "signal"
+    assert logs[-1][2].startswith("Signal notification queued:")
+    assert "Order queued:" not in logs[-1][2]
+
+
 def test_demo_account_price_overrides_public_market_price(monkeypatch):
     from app.services.live_trading import factory
 
@@ -442,6 +631,44 @@ def test_demo_account_price_overrides_public_market_price(monkeypatch):
     assert prices["Crypto:BTC/USDT@binance:swap"] == 63_943.1
 
 
+def test_special_equity_price_skips_generic_crypto_quote(monkeypatch):
+    from app.services.live_trading import factory
+
+    class Client:
+        def get_ticker(self, *, symbol):
+            assert symbol == "NVDA/USD"
+            return {"last": 210.25}
+
+    monkeypatch.setattr(factory, "create_client", lambda *_args, **_kwargs: Client())
+    monkeypatch.setattr(
+        TradingExecutor,
+        "_live_prices",
+        staticmethod(
+            lambda _candidates: (_ for _ in ()).throw(
+                AssertionError("generic crypto quote must not run for Gate stocks")
+            )
+        ),
+    )
+    candidates = [{
+        "market": "Crypto",
+        "symbol": "NVDA/USD",
+        "key": "Crypto:NVDA/USD@gate:spot",
+        "exchange_id": "gate",
+        "market_type": "spot",
+        "instrument_id": "NVDA",
+        "product_type": "direct_equity",
+        "api_family": "stock",
+    }]
+
+    prices = TradingExecutor._execution_account_prices(
+        candidates,
+        {"exchange_id": "gate", "environment": "live"},
+        {},
+    )
+
+    assert prices["Crypto:NVDA/USD@gate:spot"] == 210.25
+
+
 def test_live_frame_latest_completed_bar_is_not_overwritten_by_execution_price():
     frame = _frame(price=64_294.6)
     before = frame.iloc[-1][["open", "high", "low", "close"]].tolist()
@@ -457,9 +684,10 @@ def test_live_frame_latest_completed_bar_is_not_overwritten_by_execution_price()
     ]
 
 
-def test_live_loop_does_not_use_realtime_price_hook_for_strategy_orders():
+def test_live_loop_uses_realtime_price_hook_for_realtime_robot_templates():
     source = inspect.getsource(TradingExecutor._run_strategy_loop)
 
-    assert ".evaluate_price_tick(" not in source
+    assert ".evaluate_price_tick(" in source
+    assert 'bot_type in {"martingale", "layered_martingale"}' in source
     assert ".evaluate_equity_risk(" in source
     assert ".evaluate_protections(" in source

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import threading
 import time
 from typing import Any, Dict, Iterable
 
@@ -21,6 +23,21 @@ logger = get_logger(__name__)
 # attention window instead: recurring failures refresh it, while a transient
 # exchange error clears automatically after healthy operation resumes.
 FAILED_ORDER_ATTENTION_WINDOW_SEC = 300
+_heartbeat_lock = threading.Lock()
+_heartbeat_writes: dict[tuple[int, int], tuple[float, tuple[object, ...]]] = {}
+
+
+def _heartbeat_write_interval_seconds() -> float:
+    try:
+        return max(1.0, float(os.getenv("STRATEGY_HEARTBEAT_WRITE_INTERVAL_SEC", "10")))
+    except (TypeError, ValueError):
+        return 10.0
+
+
+def reset_runtime_heartbeat_coalescer() -> None:
+    """Reset process-local heartbeat throttling (used by tests/reloads)."""
+    with _heartbeat_lock:
+        _heartbeat_writes.clear()
 
 
 def load_runtime_health(
@@ -36,6 +53,7 @@ def load_runtime_health(
     placeholders = ",".join(["%s"] * len(ids))
 
     _load_latest_runs(snapshots, placeholders, ids)
+    _load_runtime_leases(snapshots, placeholders, ids)
     _load_health_state(snapshots, placeholders, ids)
     _load_latest_events(snapshots, placeholders, ids)
     _load_pending_orders(snapshots, placeholders, ids)
@@ -84,8 +102,31 @@ def record_runtime_heartbeat(
         return
     from app.services.strategy_runtime.state import RuntimeStateStore
 
-    now = int(time.time())
-    RuntimeStateStore(
+    wall_now = time.time()
+    now = int(wall_now)
+    identity = (int(strategy_id), int(strategy_run_id or 0))
+    critical_signature = (
+        str(status or "healthy"),
+        str(last_error or "")[:1000],
+        str(price_source or ""),
+        str(trigger_mode or ""),
+        str(fill_transport or ""),
+    )
+    with _heartbeat_lock:
+        previous_at, previous_signature = _heartbeat_writes.get(
+            identity,
+            (0.0, ()),
+        )
+        should_write = bool(
+            previous_at <= 0
+            or wall_now - previous_at >= _heartbeat_write_interval_seconds()
+            or critical_signature != previous_signature
+        )
+        if should_write:
+            _heartbeat_writes[identity] = (wall_now, critical_signature)
+    if not should_write:
+        return
+    saved = RuntimeStateStore(
         strategy_id=int(strategy_id),
         strategy_run_id=int(strategy_run_id or 0),
         state_key="health",
@@ -103,6 +144,11 @@ def record_runtime_heartbeat(
         "trigger_mode": str(trigger_mode or ""),
         "fill_transport": str(fill_transport or ""),
     })
+    if saved is False:
+        with _heartbeat_lock:
+            if _heartbeat_writes.get(identity) == (wall_now, critical_signature):
+                _heartbeat_writes.pop(identity, None)
+        return
     # Keep a low-frequency equity mark so tomorrow's P&L can use a real
     # midnight baseline even when nobody has the monitoring page open.
     from app.services.strategy_daily_pnl import maybe_capture_strategy_equity_snapshot
@@ -125,6 +171,9 @@ def _empty_snapshot() -> Dict[str, Any]:
         "price_age_ms": 0,
         "trigger_mode": "",
         "fill_transport": "",
+        "runtime_lease_active": False,
+        "runtime_owner_id": "",
+        "runtime_lease_expires_at": None,
         "last_event_at": None,
         "last_event_type": "",
         "last_event_severity": "",
@@ -189,6 +238,26 @@ def _load_latest_runs(snapshots, placeholders, ids):
                 "symbol": canonical_symbol(str(row.get("symbol") or "")),
                 "market_type": normalize_market_type(str(row.get("market_type") or "swap")),
             },
+        })
+
+
+def _load_runtime_leases(snapshots, placeholders, ids):
+    rows = _query(
+        f"""
+        SELECT strategy_id, owner_id, lease_expires_at
+        FROM qd_strategy_runtime_leases
+        WHERE strategy_id IN ({placeholders}) AND lease_expires_at >= NOW()
+        """,
+        tuple(ids),
+    )
+    for row in rows:
+        strategy_id = int(row.get("strategy_id") or 0)
+        if strategy_id not in snapshots:
+            continue
+        snapshots[strategy_id].update({
+            "runtime_lease_active": True,
+            "runtime_owner_id": str(row.get("owner_id") or ""),
+            "runtime_lease_expires_at": row.get("lease_expires_at"),
         })
 
 
@@ -300,12 +369,16 @@ def _load_pending_orders(snapshots, placeholders, ids):
 def _load_positions(snapshots, placeholders, ids):
     rows = _query(
         f"""
-        SELECT strategy_id,
-               SUM(CASE WHEN ABS(COALESCE(size, 0)) > 0 THEN 1 ELSE 0 END) AS open_positions,
-               SUM(ABS(COALESCE(size, 0) * COALESCE(current_price, 0))) AS gross_exposure
-        FROM qd_strategy_positions
-        WHERE strategy_id IN ({placeholders})
-        GROUP BY strategy_id
+        SELECT s.id AS strategy_id,
+               SUM(CASE WHEN ABS(COALESCE(lp.size, vp.size, 0)) > 0 THEN 1 ELSE 0 END) AS open_positions,
+               SUM(ABS(COALESCE(lp.size, vp.size, 0) * COALESCE(lp.current_price, vp.current_price, 0))) AS gross_exposure
+        FROM qd_strategies_trading s
+        LEFT JOIN qd_strategy_positions lp
+          ON lp.strategy_id = s.id AND LOWER(COALESCE(s.execution_mode, 'signal')) = 'live'
+        LEFT JOIN qd_strategy_virtual_positions vp
+          ON vp.strategy_id = s.id AND LOWER(COALESCE(s.execution_mode, 'signal')) = 'signal'
+        WHERE s.id IN ({placeholders})
+        GROUP BY s.id
         """,
         tuple(ids),
     )
@@ -321,12 +394,23 @@ def _load_positions(snapshots, placeholders, ids):
 def _load_latest_fills(snapshots, placeholders, ids):
     rows = _query(
         f"""
-        SELECT strategy_id, MAX(filled_at) AS last_fill_at
-        FROM strategy_order_fills
-        WHERE strategy_id IN ({placeholders})
+        SELECT strategy_id, MAX(last_fill_at) AS last_fill_at
+        FROM (
+            SELECT f.strategy_id, f.filled_at AS last_fill_at
+            FROM strategy_order_fills f
+            JOIN qd_strategies_trading s ON s.id = f.strategy_id
+            WHERE f.strategy_id IN ({placeholders})
+              AND LOWER(COALESCE(s.execution_mode, 'signal')) = 'live'
+            UNION ALL
+            SELECT v.strategy_id, v.created_at AS last_fill_at
+            FROM qd_strategy_virtual_trades v
+            JOIN qd_strategies_trading s ON s.id = v.strategy_id
+            WHERE v.strategy_id IN ({placeholders})
+              AND LOWER(COALESCE(s.execution_mode, 'signal')) = 'signal'
+        ) fills
         GROUP BY strategy_id
         """,
-        tuple(ids),
+        tuple(ids + ids),
     )
     for row in rows:
         strategy_id = int(row.get("strategy_id") or 0)
@@ -406,6 +490,11 @@ def _health_state(snapshot: Dict[str, Any], *, strategy_status: str, now: int) -
         or str(snapshot.get("last_error") or "").strip()
     ):
         return "degraded"
+    if (
+        bool(snapshot.get("runtime_lease_active"))
+        and str(snapshot.get("trigger_mode") or "") == "closed_bar_event"
+    ):
+        return "healthy"
     heartbeat = int(snapshot.get("last_heartbeat_at") or 0)
     if heartbeat <= 0:
         return "unknown"

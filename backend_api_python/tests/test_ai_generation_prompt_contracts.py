@@ -5,6 +5,7 @@ from app.services.ai_generation_contracts import (
     INDICATOR_GENERATION_CONTRACT,
     INDICATOR_REPAIR_REQUIREMENTS,
     INDICATOR_SYSTEM_CONTRACT,
+    SCRIPT_STRATEGY_QUICK_TOOL_SYSTEM_PROMPT,
     SCRIPT_STRATEGY_REPAIR_REQUIREMENTS,
     SCRIPT_STRATEGY_SYSTEM_PROMPT,
 )
@@ -17,6 +18,8 @@ def test_strategy_generation_prompt_is_v2_and_source_controlled():
     assert "context.subscribe" in SCRIPT_STRATEGY_SYSTEM_PROMPT
     assert "run panel owns only initial capital" in SCRIPT_STRATEGY_SYSTEM_PROMPT
     assert "handle_data(context, data)" in SCRIPT_STRATEGY_SYSTEM_PROMPT
+    assert "empty or missing existing source as a normal new-strategy state" in SCRIPT_STRATEGY_SYSTEM_PROMPT
+    assert "never ask the user to repeat or reconfirm" in SCRIPT_STRATEGY_SYSTEM_PROMPT
 
 
 def test_strategy_generation_prompt_enforces_crypto_swap_leverage_boundary():
@@ -27,7 +30,7 @@ def test_strategy_generation_prompt_enforces_crypto_swap_leverage_boundary():
 
 
 def test_strategy_generation_prompt_exposes_v2_factor_and_fundamental_contract():
-    assert "129-function adapter" in SCRIPT_STRATEGY_SYSTEM_PROMPT
+    assert "at least 129 functions, not exactly 129" in SCRIPT_STRATEGY_SYSTEM_PROMPT
     assert "get_fundamentals" in SCRIPT_STRATEGY_SYSTEM_PROMPT
     assert "point-in-time" in SCRIPT_STRATEGY_SYSTEM_PROMPT
     assert "get_index_stocks" in SCRIPT_STRATEGY_SYSTEM_PROMPT
@@ -69,6 +72,28 @@ def test_strategy_generation_prompt_documents_parameter_discovery_boundary():
     assert "discovery context used by `initialize(context)` has no `params`" in SCRIPT_STRATEGY_SYSTEM_PROMPT
     assert "Never read `context.params` in `initialize`" in SCRIPT_STRATEGY_REPAIR_REQUIREMENTS
     assert "initial capital, date range, commission, or slippage" in SCRIPT_STRATEGY_REPAIR_REQUIREMENTS
+
+
+def test_strategy_generation_prompt_distinguishes_net_reversal_from_hedge_legs():
+    for prompt in (SCRIPT_STRATEGY_SYSTEM_PROMPT, SCRIPT_STRATEGY_REPAIR_REQUIREMENTS):
+        assert "`long_only`, `short_only`, `one_way`, `both`, or `neutral`" in prompt
+        assert "`one_way`" in prompt
+        assert "`both`" in prompt
+        assert "changing only metadata" in prompt or "changing metadata alone" in prompt
+
+
+def test_strategy_generation_prompt_preserves_native_multi_timeframes():
+    for frequency in ("5m", "15m", "30m", "1h", "4h", "1d", "1w"):
+        assert f"`{frequency}`" in SCRIPT_STRATEGY_SYSTEM_PROMPT
+    assert "preserve every requested timeframe" in SCRIPT_STRATEGY_SYSTEM_PROMPT
+    assert "never collapse `1d + 4h + 1h`" in SCRIPT_STRATEGY_SYSTEM_PROMPT
+    assert "fastest subscribed timeframe drives" in SCRIPT_STRATEGY_SYSTEM_PROMPT
+    assert "monthly bars are not part" in SCRIPT_STRATEGY_SYSTEM_PROMPT
+    assert "Do not collapse, resample" in SCRIPT_STRATEGY_REPAIR_REQUIREMENTS
+    assert "Single-timeframe is the default" in SCRIPT_STRATEGY_SYSTEM_PROMPT
+    assert "A request naming one timeframe must remain single-timeframe" in SCRIPT_STRATEGY_SYSTEM_PROMPT
+    assert "Otherwise generate a single-timeframe strategy" in SCRIPT_STRATEGY_QUICK_TOOL_SYSTEM_PROMPT
+    assert "Keep single-timeframe source single-timeframe" in SCRIPT_STRATEGY_REPAIR_REQUIREMENTS
 
 
 def test_indicator_prompt_remains_chart_only():
@@ -118,11 +143,17 @@ def test_strategy_generator_repairs_invalid_model_output_once(monkeypatch):
 
     compile_calls = []
 
+    class FakeManifest:
+        strategy_type = "cta"
+
+    class FakeProgram:
+        manifest = FakeManifest()
+
     def fake_compile(code):
         compile_calls.append(code)
         if code == "invalid source":
             raise ValueError("missing initialize")
-        return "compiled-program"
+        return FakeProgram()
 
     class FakeLLM:
         def __init__(self):
@@ -138,15 +169,103 @@ def test_strategy_generator_repairs_invalid_model_output_once(monkeypatch):
     monkeypatch.setattr(strategy_route, "compile_strategy_v2", fake_compile)
     llm = FakeLLM()
 
-    code, program = strategy_route._compile_or_repair_generated_strategy(
+    code, program, behavior = strategy_route._compile_or_repair_generated_strategy(
         llm,
         "Build a moving-average strategy",
         "invalid source",
     )
 
     assert code == "repaired source"
-    assert program == "compiled-program"
+    assert isinstance(program, FakeProgram)
+    assert behavior["executed"] is False
     assert compile_calls == ["invalid source", "repaired source"]
     assert len(llm.calls) == 1
     assert llm.calls[0]["temperature"] == 0.15
     assert SCRIPT_STRATEGY_REPAIR_REQUIREMENTS in llm.calls[0]["messages"][1]["content"]
+
+
+def test_strategy_generator_uses_a_bounded_second_error_directed_repair(monkeypatch):
+    from app.routes import strategy as strategy_route
+
+    compile_calls = []
+
+    class FakeManifest:
+        strategy_type = "cta"
+
+    class FakeProgram:
+        manifest = FakeManifest()
+
+    def fake_compile(code):
+        compile_calls.append(code)
+        if code != "valid source":
+            raise ValueError(f"invalid:{code}")
+        return FakeProgram()
+
+    class FakeLLM:
+        def __init__(self):
+            self.calls = []
+
+        def call_llm_api(self, **kwargs):
+            self.calls.append(kwargs)
+            return "still invalid" if len(self.calls) == 1 else "valid source"
+
+        def get_code_generation_model(self):
+            return "test-model"
+
+    monkeypatch.setattr(strategy_route, "compile_strategy_v2", fake_compile)
+    llm = FakeLLM()
+
+    code, _program, _behavior = strategy_route._compile_or_repair_generated_strategy(
+        llm,
+        "Build a moving-average strategy",
+        "first invalid",
+    )
+
+    assert code == "valid source"
+    assert compile_calls == ["first invalid", "still invalid", "valid source"]
+    assert len(llm.calls) == 2
+    assert "invalid:still invalid" in llm.calls[1]["messages"][1]["content"]
+
+
+def test_strategy_generator_repairs_runtime_behavior_failures(monkeypatch):
+    from app.routes import strategy as strategy_route
+
+    class FakeManifest:
+        strategy_type = "cta"
+
+    class FakeProgram:
+        manifest = FakeManifest()
+
+    behavior_calls = []
+
+    def fake_behavior(code, _manifest, _intent):
+        behavior_calls.append(code)
+        if code == "static-only candidate":
+            raise ValueError("strategyV2.aiBehaviorOpenLegMissing:long,short")
+        return {"executed": True}
+
+    class FakeLLM:
+        def __init__(self):
+            self.calls = []
+
+        def call_llm_api(self, **kwargs):
+            self.calls.append(kwargs)
+            return "runtime-valid candidate"
+
+        def get_code_generation_model(self):
+            return "test-model"
+
+    monkeypatch.setattr(strategy_route, "compile_strategy_v2", lambda _code: FakeProgram())
+    monkeypatch.setattr(strategy_route, "validate_strategy_ai_behavior", fake_behavior)
+    llm = FakeLLM()
+
+    code, _program, behavior = strategy_route._compile_or_repair_generated_strategy(
+        llm,
+        "Build a bidirectional Supertrend strategy",
+        "static-only candidate",
+    )
+
+    assert code == "runtime-valid candidate"
+    assert behavior == {"executed": True}
+    assert behavior_calls == ["static-only candidate", "runtime-valid candidate"]
+    assert "aiBehaviorOpenLegMissing" in llm.calls[0]["messages"][1]["content"]

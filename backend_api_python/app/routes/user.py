@@ -888,12 +888,25 @@ def _strategy_v2_admin_metadata(
     config = _safe_json_loads(trading_config, {}) or {}
     source_meta = _safe_json_loads(source_metadata, {}) or {}
     manifest = config.get("strategy_manifest") or source_meta.get("strategy_manifest") or {}
+    manifest_metadata = _safe_json_loads(manifest.get("metadata"), {}) or {}
     api_version = int(config.get("api_version") or manifest.get("apiVersion") or 0)
     is_v2 = str(strategy_type or "").strip().lower() == "strategyv2" or api_version == 2
 
     template_key = str(source_template_key or "").strip()
     source_origin = str(source_meta.get("source") or "").strip().lower()
-    is_robot = template_key.startswith("robot_v2_") or source_origin == "robot_builder"
+    executor_type = str(
+        config.get("bot_type")
+        or config.get("executor_type")
+        or source_meta.get("executor_type")
+        or manifest_metadata.get("executor_type")
+        or manifest_metadata.get("bot_type")
+        or ""
+    ).strip().lower().replace("-", "_")
+    is_robot = (
+        template_key.startswith("robot_v2_")
+        or source_origin == "robot_builder"
+        or executor_type in {"grid", "dca", "martingale", "layered_martingale", "trend"}
+    )
     manifest_type = str(manifest.get("strategyType") or "").strip().lower()
     is_portfolio = (
         not is_robot
@@ -934,6 +947,13 @@ def _strategy_v2_admin_metadata(
         market_types = [str(fallback_market_type).strip().lower()]
 
     primary_frequency = str(manifest.get("primaryFrequency") or fallback_frequency or "").strip()
+    driving_frequency = str(
+        manifest.get("drivingFrequency") or primary_frequency
+    ).strip()
+    frequencies = list(
+        manifest.get("frequencies")
+        or ([driving_frequency] if driving_frequency else [])
+    )
     schedules = [item for item in (manifest.get("schedules") or []) if isinstance(item, dict)]
     normalized_source_id = int(source_id or config.get("script_source_id") or 0)
     contract_ready = bool(
@@ -951,6 +971,7 @@ def _strategy_v2_admin_metadata(
         "source_asset_type": str(source_asset_type or "").strip(),
         "template_key": template_key,
         "strategy_class": strategy_class,
+        "bot_type": executor_type,
         "universe_kind": str(universe.get("kind") or ("reference" if universe_reference else "static")),
         "universe_reference": universe_reference,
         "instrument_count": instrument_count,
@@ -958,6 +979,8 @@ def _strategy_v2_admin_metadata(
         "markets": markets,
         "market_types": market_types,
         "primary_frequency": primary_frequency,
+        "driving_frequency": driving_frequency,
+        "frequencies": frequencies,
         "schedule_count": len(schedules),
         "warmup_bars": int(manifest.get("warmupBars") or 0),
         "leverage_allowed": bool(manifest.get("leverageAllowed")),
@@ -1040,6 +1063,37 @@ def _batch_load_credential_exchange_map(credential_ids: set) -> dict:
     return credential_map
 
 
+def _admin_strategy_ledger_metrics(
+    *,
+    execution_mode: str,
+    strategy_initial_capital: float,
+    positions: list,
+    trade_stats: dict,
+) -> dict:
+    """Build admin metrics from the ledger selected by execution mode."""
+    mode = str(execution_mode or '').strip().lower()
+    initial_capital = float(strategy_initial_capital or 0)
+    if mode == 'signal' and float(trade_stats.get('virtual_initial_capital') or 0) > 0:
+        initial_capital = float(trade_stats['virtual_initial_capital'])
+    total_unrealized_pnl = sum(float(p.get('unrealized_pnl') or 0) for p in positions)
+    total_realized_pnl = float(trade_stats.get('total_realized_pnl') or 0)
+    total_pnl = total_unrealized_pnl + total_realized_pnl
+    total_equity = sum(float(p.get('equity') or 0) for p in positions)
+    if mode == 'signal':
+        total_equity = initial_capital + total_pnl
+    return {
+        'ledger_mode': 'virtual' if mode == 'signal' else 'live',
+        'initial_capital': initial_capital,
+        'position_count': len(positions),
+        'trade_count': int(trade_stats.get('trade_count') or 0),
+        'total_unrealized_pnl': total_unrealized_pnl,
+        'total_realized_pnl': total_realized_pnl,
+        'total_pnl': total_pnl,
+        'total_equity': total_equity,
+        'roi': (total_pnl / initial_capital * 100) if initial_capital > 0 else 0,
+    }
+
+
 @user_blp.route('/system-strategies', methods=['GET'])
 @login_required
 @admin_required
@@ -1089,15 +1143,29 @@ def get_system_strategies():
         }
         sort_expr_map = {
             'total_pnl': (
-                "(COALESCE((SELECT SUM(unrealized_pnl) FROM qd_strategy_positions p WHERE p.strategy_id = s.id), 0)"
-                " + COALESCE((SELECT SUM(COALESCE(t.profit, 0) - COALESCE(t.commission_quote, t.commission, 0)) FROM qd_strategy_trades t WHERE t.strategy_id = s.id), 0)"
-                " + COALESCE((SELECT SUM(COALESCE(f.amount, 0)) FROM qd_strategy_funding_fees f WHERE f.strategy_id = s.id), 0)"
-                " + COALESCE((SELECT SUM(COALESCE(a.amount, 0)) FROM qd_strategy_broker_activities a WHERE a.strategy_id = s.id), 0))"
+                "(CASE WHEN LOWER(COALESCE(s.execution_mode, 'signal')) = 'signal' THEN "
+                "COALESCE((SELECT va.realized_pnl FROM qd_strategy_virtual_accounts va WHERE va.strategy_id = s.id), 0) "
+                "+ COALESCE((SELECT SUM(vp.unrealized_pnl) FROM qd_strategy_virtual_positions vp WHERE vp.strategy_id = s.id), 0) "
+                "ELSE COALESCE((SELECT SUM(p.unrealized_pnl) FROM qd_strategy_positions p WHERE p.strategy_id = s.id), 0) "
+                "+ COALESCE((SELECT SUM(COALESCE(t.profit, 0) - COALESCE(t.commission_quote, t.commission, 0)) FROM qd_strategy_trades t WHERE t.strategy_id = s.id), 0) "
+                "+ COALESCE((SELECT SUM(COALESCE(f.amount, 0)) FROM qd_strategy_funding_fees f WHERE f.strategy_id = s.id), 0) "
+                "+ COALESCE((SELECT SUM(COALESCE(a.amount, 0)) FROM qd_strategy_broker_activities a WHERE a.strategy_id = s.id), 0) END)"
             ),
-            'trade_count': '(SELECT COUNT(*) FROM qd_strategy_trades t WHERE t.strategy_id = s.id)',
-            'position_count': '(SELECT COUNT(*) FROM qd_strategy_positions p WHERE p.strategy_id = s.id)',
+            'trade_count': (
+                "(CASE WHEN LOWER(COALESCE(s.execution_mode, 'signal')) = 'signal' "
+                "THEN (SELECT COUNT(*) FROM qd_strategy_virtual_trades vt WHERE vt.strategy_id = s.id) "
+                "ELSE (SELECT COUNT(*) FROM qd_strategy_trades t WHERE t.strategy_id = s.id) END)"
+            ),
+            'position_count': (
+                "(CASE WHEN LOWER(COALESCE(s.execution_mode, 'signal')) = 'signal' "
+                "THEN (SELECT COUNT(*) FROM qd_strategy_virtual_positions vp WHERE vp.strategy_id = s.id AND ABS(COALESCE(vp.size, 0)) > 0) "
+                "ELSE (SELECT COUNT(*) FROM qd_strategy_positions p WHERE p.strategy_id = s.id AND ABS(COALESCE(p.size, 0)) > 0) END)"
+            ),
             'total_equity': (
-                'COALESCE((SELECT SUM(equity) FROM qd_strategy_positions p WHERE p.strategy_id = s.id), 0)'
+                "(CASE WHEN LOWER(COALESCE(s.execution_mode, 'signal')) = 'signal' THEN "
+                "COALESCE((SELECT va.initial_cash + va.realized_pnl FROM qd_strategy_virtual_accounts va WHERE va.strategy_id = s.id), s.initial_capital, 0) "
+                "+ COALESCE((SELECT SUM(vp.unrealized_pnl) FROM qd_strategy_virtual_positions vp WHERE vp.strategy_id = s.id), 0) "
+                "ELSE COALESCE((SELECT SUM(p.equity) FROM qd_strategy_positions p WHERE p.strategy_id = s.id), 0) END)"
             ),
         }
         direction = 'ASC' if sort_order == 'asc' else 'DESC'
@@ -1226,19 +1294,37 @@ def get_system_strategies():
             # Collect strategy IDs
             strategy_ids = [s['id'] for s in strategies]
 
-            # Batch load positions for these strategies
+            # Batch load the active ledger for each execution mode.
             positions_map = {}
             if strategy_ids:
                 placeholders = ','.join(['?'] * len(strategy_ids))
                 cur.execute(
                     f"""
-                    SELECT strategy_id, symbol, side, size, entry_price, current_price, 
-                           unrealized_pnl, pnl_percent, equity, updated_at
-                    FROM qd_strategy_positions
-                    WHERE strategy_id IN ({placeholders})
+                    SELECT ledger.strategy_id, ledger.symbol, ledger.side, ledger.size,
+                           ledger.entry_price, ledger.current_price, ledger.unrealized_pnl,
+                           ledger.pnl_percent, ledger.equity, ledger.updated_at
+                    FROM (
+                        SELECT p.strategy_id, p.symbol, p.side, p.size, p.entry_price,
+                               p.current_price, p.unrealized_pnl, p.pnl_percent,
+                               p.equity, p.updated_at
+                        FROM qd_strategy_positions p
+                        JOIN qd_strategies_trading s ON s.id = p.strategy_id
+                        WHERE p.strategy_id IN ({placeholders})
+                          AND LOWER(COALESCE(s.execution_mode, 'signal')) = 'live'
+                          AND ABS(COALESCE(p.size, 0)) > 0
+                        UNION ALL
+                        SELECT vp.strategy_id, vp.symbol, vp.side, vp.size, vp.entry_price,
+                               vp.current_price, vp.unrealized_pnl, vp.pnl_percent,
+                               0 AS equity, vp.updated_at
+                        FROM qd_strategy_virtual_positions vp
+                        JOIN qd_strategies_trading s ON s.id = vp.strategy_id
+                        WHERE vp.strategy_id IN ({placeholders})
+                          AND LOWER(COALESCE(s.execution_mode, 'signal')) = 'signal'
+                          AND ABS(COALESCE(vp.size, 0)) > 0
+                    ) ledger
                     ORDER BY strategy_id, updated_at DESC
                     """,
-                    tuple(strategy_ids)
+                    tuple(strategy_ids + strategy_ids)
                 )
                 for pos in (cur.fetchall() or []):
                     sid = pos['strategy_id']
@@ -1246,31 +1332,54 @@ def get_system_strategies():
                         positions_map[sid] = []
                     positions_map[sid].append(dict(pos))
 
-            # Batch load recent trade stats (realized PnL per strategy)
+            # Batch load fill counts and realized PnL from the matching ledger.
             trade_stats_map = {}
             if strategy_ids:
                 placeholders = ','.join(['?'] * len(strategy_ids))
                 cur.execute(
                     f"""
-                    SELECT t.strategy_id,
-                           COUNT(*) as trade_count,
-                           COALESCE(SUM(COALESCE(t.profit, 0) - COALESCE(t.commission_quote, t.commission, 0)), 0)
-                           + COALESCE((SELECT SUM(COALESCE(f.amount, 0))
-                                       FROM qd_strategy_funding_fees f
-                                       WHERE f.strategy_id = t.strategy_id), 0)
-                           + COALESCE((SELECT SUM(COALESCE(a.amount, 0))
-                                       FROM qd_strategy_broker_activities a
-                                       WHERE a.strategy_id = t.strategy_id), 0) AS total_realized_pnl
-                    FROM qd_strategy_trades t
-                    WHERE t.strategy_id IN ({placeholders})
-                    GROUP BY t.strategy_id
+                    WITH live_trades AS (
+                        SELECT t.strategy_id,
+                               COUNT(*) AS trade_count,
+                               COALESCE(SUM(COALESCE(t.profit, 0) - COALESCE(t.commission_quote, t.commission, 0)), 0)
+                               + COALESCE((SELECT SUM(COALESCE(f.amount, 0))
+                                           FROM qd_strategy_funding_fees f
+                                           WHERE f.strategy_id = t.strategy_id), 0)
+                               + COALESCE((SELECT SUM(COALESCE(a.amount, 0))
+                                           FROM qd_strategy_broker_activities a
+                                           WHERE a.strategy_id = t.strategy_id), 0) AS total_realized_pnl
+                        FROM qd_strategy_trades t
+                        WHERE t.strategy_id IN ({placeholders})
+                        GROUP BY t.strategy_id
+                    ), virtual_trades AS (
+                        SELECT vt.strategy_id, COUNT(*) AS trade_count
+                        FROM qd_strategy_virtual_trades vt
+                        WHERE vt.strategy_id IN ({placeholders})
+                        GROUP BY vt.strategy_id
+                    )
+                    SELECT s.id AS strategy_id,
+                           CASE WHEN LOWER(COALESCE(s.execution_mode, 'signal')) = 'signal'
+                                THEN COALESCE(vt.trade_count, 0)
+                                ELSE COALESCE(lt.trade_count, 0) END AS trade_count,
+                           CASE WHEN LOWER(COALESCE(s.execution_mode, 'signal')) = 'signal'
+                                THEN COALESCE(va.realized_pnl, 0)
+                                ELSE COALESCE(lt.total_realized_pnl, 0) END AS total_realized_pnl,
+                           COALESCE(va.initial_cash, s.initial_capital, 0) AS virtual_initial_capital,
+                           COALESCE(va.cash_balance, 0) AS virtual_cash_balance
+                    FROM qd_strategies_trading s
+                    LEFT JOIN live_trades lt ON lt.strategy_id = s.id
+                    LEFT JOIN virtual_trades vt ON vt.strategy_id = s.id
+                    LEFT JOIN qd_strategy_virtual_accounts va ON va.strategy_id = s.id
+                    WHERE s.id IN ({placeholders})
                     """,
-                    tuple(strategy_ids)
+                    tuple(strategy_ids + strategy_ids + strategy_ids)
                 )
                 for row in (cur.fetchall() or []):
                     trade_stats_map[row['strategy_id']] = {
                         'trade_count': row['trade_count'],
-                        'total_realized_pnl': float(row['total_realized_pnl'] or 0)
+                        'total_realized_pnl': float(row['total_realized_pnl'] or 0),
+                        'virtual_initial_capital': float(row['virtual_initial_capital'] or 0),
+                        'virtual_cash_balance': float(row['virtual_cash_balance'] or 0),
                     }
 
             cur.close()
@@ -1317,21 +1426,16 @@ def get_system_strategies():
                 user_id=int(s.get('user_id') or 0),
             )
 
-            # Positions data
+            # Positions and PnL from the ledger selected by execution mode.
             positions = positions_map.get(sid, [])
-            total_unrealized_pnl = sum(float(p.get('unrealized_pnl') or 0) for p in positions)
-            total_equity = sum(float(p.get('equity') or 0) for p in positions)
-            position_count = len(positions)
-
-            # Trade stats
             trade_stats = trade_stats_map.get(sid, {'trade_count': 0, 'total_realized_pnl': 0})
-            total_realized_pnl = trade_stats['total_realized_pnl']
-            trade_count = trade_stats['trade_count']
-
-            # Calculate total PnL and ROI
-            initial_capital = float(s.get('initial_capital') or 0)
-            total_pnl = total_unrealized_pnl + total_realized_pnl
-            roi = (total_pnl / initial_capital * 100) if initial_capital > 0 else 0
+            execution_mode = str(s.get('execution_mode') or '').strip().lower()
+            ledger = _admin_strategy_ledger_metrics(
+                execution_mode=execution_mode,
+                strategy_initial_capital=float(s.get('initial_capital') or 0),
+                positions=positions,
+                trade_stats=trade_stats,
+            )
 
             # Timestamps are emitted as UTC ISO by SafeJSONProvider; pass
             # datetime objects straight through.
@@ -1347,22 +1451,23 @@ def get_system_strategies():
                 'strategy_type': s.get('strategy_type') or '',
                 'market_category': s.get('market_category') or '',
                 'execution_mode': s.get('execution_mode') or '',
+                'ledger_mode': ledger['ledger_mode'],
                 'status': s.get('status') or 'stopped',
                 'symbol': s.get('symbol') or '',
                 'timeframe': s.get('timeframe') or '',
-                'initial_capital': initial_capital,
+                'initial_capital': ledger['initial_capital'],
                 'leverage': int(s.get('leverage') or 1),
                 'market_type': s.get('market_type') or '',
                 'indicator_name': indicator_name,
                 'exchange_name': exchange_name,
                 'data_poll_seconds': trading_config.get('data_poll_seconds') or 5,
-                'position_count': position_count,
-                'total_unrealized_pnl': round(total_unrealized_pnl, 4),
-                'total_realized_pnl': round(total_realized_pnl, 4),
-                'total_pnl': round(total_pnl, 4),
-                'total_equity': round(total_equity, 4),
-                'roi': round(roi, 2),
-                'trade_count': trade_count,
+                'position_count': ledger['position_count'],
+                'total_unrealized_pnl': round(ledger['total_unrealized_pnl'], 4),
+                'total_realized_pnl': round(ledger['total_realized_pnl'], 4),
+                'total_pnl': round(ledger['total_pnl'], 4),
+                'total_equity': round(ledger['total_equity'], 4),
+                'roi': round(ledger['roi'], 2),
+                'trade_count': ledger['trade_count'],
                 'positions': positions,
                 'created_at': created_at,
                 'updated_at': updated_at,
@@ -1402,13 +1507,23 @@ def get_system_strategies():
             cur.execute(agg_sql, tuple(params))
             agg_row = cur.fetchone() or {}
 
-            # Aggregate unrealized pnl from current positions.
+            # Aggregate unrealized PnL from the ledger matching each mode.
             unreal_sql = f"""
-                SELECT COALESCE(SUM(p.unrealized_pnl), 0) AS total_unrealized,
-                       COALESCE(SUM(CASE WHEN s.execution_mode = 'live' THEN p.unrealized_pnl ELSE 0 END), 0) AS live_unrealized,
-                       COALESCE(SUM(CASE WHEN s.execution_mode = 'signal' THEN p.unrealized_pnl ELSE 0 END), 0) AS signal_unrealized
-                FROM qd_strategy_positions p
-                JOIN qd_strategies_trading s ON s.id = p.strategy_id
+                SELECT
+                    COALESCE(SUM(CASE
+                        WHEN LOWER(COALESCE(s.execution_mode, 'signal')) = 'signal' THEN vp.unrealized_pnl
+                        ELSE p.unrealized_pnl END), 0) AS total_unrealized,
+                    COALESCE(SUM(CASE WHEN LOWER(COALESCE(s.execution_mode, 'signal')) = 'live'
+                        THEN p.unrealized_pnl ELSE 0 END), 0) AS live_unrealized,
+                    COALESCE(SUM(CASE WHEN LOWER(COALESCE(s.execution_mode, 'signal')) = 'signal'
+                        THEN vp.unrealized_pnl ELSE 0 END), 0) AS signal_unrealized
+                FROM qd_strategies_trading s
+                LEFT JOIN qd_strategy_positions p
+                  ON p.strategy_id = s.id
+                 AND LOWER(COALESCE(s.execution_mode, 'signal')) = 'live'
+                LEFT JOIN qd_strategy_virtual_positions vp
+                  ON vp.strategy_id = s.id
+                 AND LOWER(COALESCE(s.execution_mode, 'signal')) = 'signal'
                 LEFT JOIN qd_users u ON u.id = s.user_id
                 {source_join_sql}
                 {where_clause}
@@ -1416,13 +1531,25 @@ def get_system_strategies():
             cur.execute(unreal_sql, tuple(params))
             unreal_row = cur.fetchone() or {}
 
-            # Aggregate realized pnl from trade history.
+            # Aggregate realized PnL from live fills or the isolated virtual account.
             realized_sql = f"""
-                SELECT COALESCE(SUM(COALESCE(t.profit, 0) - COALESCE(t.commission_quote, t.commission, 0)), 0) AS total_realized,
-                       COALESCE(SUM(CASE WHEN s.execution_mode = 'live' THEN COALESCE(t.profit, 0) - COALESCE(t.commission_quote, t.commission, 0) ELSE 0 END), 0) AS live_realized,
-                       COALESCE(SUM(CASE WHEN s.execution_mode = 'signal' THEN COALESCE(t.profit, 0) - COALESCE(t.commission_quote, t.commission, 0) ELSE 0 END), 0) AS signal_realized
-                FROM qd_strategy_trades t
-                JOIN qd_strategies_trading s ON s.id = t.strategy_id
+                WITH live_realized_by_strategy AS (
+                    SELECT t.strategy_id,
+                           SUM(COALESCE(t.profit, 0) - COALESCE(t.commission_quote, t.commission, 0)) AS realized
+                    FROM qd_strategy_trades t
+                    GROUP BY t.strategy_id
+                )
+                SELECT
+                    COALESCE(SUM(CASE
+                        WHEN LOWER(COALESCE(s.execution_mode, 'signal')) = 'signal' THEN va.realized_pnl
+                        ELSE lt.realized END), 0) AS total_realized,
+                    COALESCE(SUM(CASE WHEN LOWER(COALESCE(s.execution_mode, 'signal')) = 'live'
+                        THEN lt.realized ELSE 0 END), 0) AS live_realized,
+                    COALESCE(SUM(CASE WHEN LOWER(COALESCE(s.execution_mode, 'signal')) = 'signal'
+                        THEN va.realized_pnl ELSE 0 END), 0) AS signal_realized
+                FROM qd_strategies_trading s
+                LEFT JOIN live_realized_by_strategy lt ON lt.strategy_id = s.id
+                LEFT JOIN qd_strategy_virtual_accounts va ON va.strategy_id = s.id
                 LEFT JOIN qd_users u ON u.id = s.user_id
                 {source_join_sql}
                 {where_clause}
@@ -1430,9 +1557,11 @@ def get_system_strategies():
             cur.execute(realized_sql, tuple(params))
             realized_row = cur.fetchone() or {}
             funding_sql = f"""
-                SELECT COALESCE(SUM(COALESCE(f.amount, 0)), 0) AS total_realized,
-                       COALESCE(SUM(CASE WHEN s.execution_mode = 'live' THEN COALESCE(f.amount, 0) ELSE 0 END), 0) AS live_realized,
-                       COALESCE(SUM(CASE WHEN s.execution_mode = 'signal' THEN COALESCE(f.amount, 0) ELSE 0 END), 0) AS signal_realized
+                SELECT COALESCE(SUM(CASE WHEN LOWER(COALESCE(s.execution_mode, 'signal')) = 'live'
+                                          THEN COALESCE(f.amount, 0) ELSE 0 END), 0) AS total_realized,
+                       COALESCE(SUM(CASE WHEN LOWER(COALESCE(s.execution_mode, 'signal')) = 'live'
+                                          THEN COALESCE(f.amount, 0) ELSE 0 END), 0) AS live_realized,
+                       0 AS signal_realized
                 FROM qd_strategy_funding_fees f
                 JOIN qd_strategies_trading s ON s.id = f.strategy_id
                 LEFT JOIN qd_users u ON u.id = s.user_id
@@ -1442,9 +1571,11 @@ def get_system_strategies():
             cur.execute(funding_sql, tuple(params))
             funding_row = cur.fetchone() or {}
             broker_activity_sql = f"""
-                SELECT COALESCE(SUM(COALESCE(a.amount, 0)), 0) AS total_realized,
-                       COALESCE(SUM(CASE WHEN s.execution_mode = 'live' THEN COALESCE(a.amount, 0) ELSE 0 END), 0) AS live_realized,
-                       COALESCE(SUM(CASE WHEN s.execution_mode = 'signal' THEN COALESCE(a.amount, 0) ELSE 0 END), 0) AS signal_realized
+                SELECT COALESCE(SUM(CASE WHEN LOWER(COALESCE(s.execution_mode, 'signal')) = 'live'
+                                          THEN COALESCE(a.amount, 0) ELSE 0 END), 0) AS total_realized,
+                       COALESCE(SUM(CASE WHEN LOWER(COALESCE(s.execution_mode, 'signal')) = 'live'
+                                          THEN COALESCE(a.amount, 0) ELSE 0 END), 0) AS live_realized,
+                       0 AS signal_realized
                 FROM qd_strategy_broker_activities a
                 JOIN qd_strategies_trading s ON s.id = a.strategy_id
                 LEFT JOIN qd_users u ON u.id = s.user_id
@@ -1556,7 +1687,12 @@ def admin_toggle_system_strategy():
         admin_user_id = getattr(g, 'user_id', None)
 
         if target == 'running':
-            svc.update_strategy_status(strategy_id, 'running')
+            try:
+                svc.update_strategy_status(strategy_id, 'running')
+            except Exception as exc:
+                if str(exc) == 'strategyV2.strategyLimitExceeded':
+                    return jsonify({'code': 0, 'msg': str(exc), 'data': None}), 409
+                raise
             ok = executor.start_strategy(strategy_id)
             if not ok:
                 svc.update_strategy_status(strategy_id, 'stopped')
@@ -1635,17 +1771,27 @@ def admin_delete_system_strategy():
 
         from app import get_trading_executor
         from app.routes.strategy import get_strategy_service
+        from app.services.strategy import StrategyDeleteBlocked
 
         svc = get_strategy_service()
         st = svc.get_strategy(strategy_id)
         if not st:
             return jsonify({'code': 0, 'msg': 'Strategy not found', 'data': None}), 404
 
-        if str(st.get('status') or '').strip().lower() == 'running':
-            svc.update_strategy_status(strategy_id, 'stopped')
-            get_trading_executor().stop_strategy(strategy_id, persist_status=False)
+        executor = get_trading_executor()
+        if str(st.get('status') or '').strip().lower() == 'running' or executor.is_running(strategy_id):
+            stop_result = executor.stop_strategy_with_policy(strategy_id, close_positions=False)
+            if str(stop_result.get('status') or '') != 'stopped':
+                return jsonify({
+                    'code': 0,
+                    'msg': 'strategyV2.stopBeforeDelete',
+                    'data': {'id': strategy_id, **stop_result},
+                }), 409
 
-        ok = svc.delete_strategy(strategy_id)
+        try:
+            ok = svc.delete_strategy(strategy_id)
+        except StrategyDeleteBlocked as exc:
+            return jsonify({'code': 0, 'msg': str(exc), 'data': {'id': strategy_id}}), 409
         if not ok:
             return jsonify({'code': 0, 'msg': 'Failed to delete strategy', 'data': None}), 500
 
@@ -1689,131 +1835,192 @@ def _ensure_usdt_admin_columns():
         logger.debug("ensure_usdt_admin_columns skipped: %s", exc)
 
 
+_ADMIN_ORDERS_CTE = """
+    WITH unified_orders AS (
+        SELECT
+            o.id,
+            LOWER(COALESCE(NULLIF(o.currency, ''), 'USDT')) AS payment_method,
+            o.user_id,
+            o.plan,
+            o.amount_usdt AS amount,
+            UPPER(COALESCE(NULLIF(o.currency, ''), 'USDT')) AS currency,
+            o.chain,
+            o.address,
+            COALESCE(o.tx_hash, '') AS tx_hash,
+            ''::TEXT AS provider_reference,
+            o.status,
+            COALESCE(o.matched_via, '') AS matched_via,
+            COALESCE(o.admin_note, '') AS admin_note,
+            o.manual_confirmed_by,
+            o.created_at,
+            o.paid_at,
+            o.confirmed_at,
+            o.expires_at
+        FROM qd_usdt_orders o
+
+        UNION ALL
+
+        SELECT
+            o.id,
+            'stripe' AS payment_method,
+            o.user_id,
+            o.plan,
+            o.amount_usd AS amount,
+            UPPER(COALESCE(NULLIF(o.currency, ''), 'USD')) AS currency,
+            ''::TEXT AS chain,
+            ''::TEXT AS address,
+            ''::TEXT AS tx_hash,
+            COALESCE(o.stripe_session_id, '') AS provider_reference,
+            CASE
+                WHEN o.status = 'pending' AND o.expires_at IS NOT NULL AND o.expires_at <= NOW() THEN 'expired'
+                ELSE o.status
+            END AS status,
+            CASE WHEN o.status = 'paid' THEN 'stripe_webhook' ELSE '' END AS matched_via,
+            ''::TEXT AS admin_note,
+            NULL::INTEGER AS manual_confirmed_by,
+            o.created_at,
+            o.paid_at,
+            NULL::TIMESTAMP AS confirmed_at,
+            o.expires_at
+        FROM qd_stripe_orders o
+    )
+"""
+
+
+def _admin_order_filters(status_filter: str, payment_method: str, plan_filter: str, search: str):
+    """Build the shared, parameterized filter used by count/list/summary."""
+    conditions = []
+    params = []
+    if status_filter and status_filter != 'all':
+        conditions.append("o.status = ?")
+        params.append(status_filter)
+    if payment_method and payment_method != 'all':
+        conditions.append("o.payment_method = ?")
+        params.append(payment_method)
+    if plan_filter and plan_filter != 'all':
+        conditions.append("o.plan = ?")
+        params.append(plan_filter)
+    if search:
+        like_value = f"%{search}%"
+        conditions.append(
+            "(u.username ILIKE ? OR u.email ILIKE ? OR u.nickname ILIKE ? "
+            "OR CAST(o.id AS TEXT) ILIKE ? OR (o.payment_method || '-' || CAST(o.id AS TEXT)) ILIKE ? "
+            "OR o.plan ILIKE ? OR o.tx_hash ILIKE ? OR o.provider_reference ILIKE ? OR o.address ILIKE ?)"
+        )
+        params.extend([like_value] * 9)
+    return ("WHERE " + " AND ".join(conditions)) if conditions else "", params
+
+
+_ADMIN_PLAN_TABLE = "qd_billing_plans"
+
+
 @user_blp.route('/admin-orders', methods=['GET'])
 @login_required
 @admin_required
 def get_admin_orders():
-    """
-    Get all orders across the system (admin only).
-    Lists USDT on-chain membership orders only (qd_usdt_orders).
-
-    Query params:
-        page: int (default 1)
-        page_size: int (default 20, max 100)
-        status: str (optional, filter by status: paid/pending/confirmed/expired/all)
-        search: str (optional, search by username/email)
-    """
+    """Return one paginated admin view for USDT, USDC and Stripe orders."""
     try:
-        page = request.args.get('page', 1, type=int)
-        page_size = request.args.get('page_size', 20, type=int)
+        page = max(1, request.args.get('page', 1, type=int))
+        page_size = min(100, max(1, request.args.get('page_size', 20, type=int)))
         status_filter = request.args.get('status', '', type=str).strip().lower()
+        payment_method = request.args.get('payment_method', '', type=str).strip().lower()
+        plan_filter = request.args.get('plan', '', type=str).strip().lower()
         search = request.args.get('search', '', type=str).strip()
-        page_size = min(100, max(1, page_size))
         offset = (page - 1) * page_size
 
         _ensure_usdt_admin_columns()
+        where_sql, filter_params = _admin_order_filters(
+            status_filter, payment_method, plan_filter, search,
+        )
+        joined_source = f"""
+            FROM unified_orders o
+            LEFT JOIN qd_users u ON u.id = o.user_id
+            LEFT JOIN {_ADMIN_PLAN_TABLE} p ON p.code = o.plan
+        """
 
         with get_db_connection() as db:
             cur = db.cursor()
-
-            usdt_conditions = []
-            usdt_params = []
-
-            if status_filter and status_filter != 'all':
-                usdt_conditions.append("o.status = ?")
-                usdt_params.append(status_filter)
-
-            if search:
-                usdt_conditions.append("(u.username ILIKE ? OR u.email ILIKE ? OR u.nickname ILIKE ?)")
-                like_val = f"%{search}%"
-                usdt_params.extend([like_val, like_val, like_val])
-
-            usdt_where = ""
-            if usdt_conditions:
-                usdt_where = "WHERE " + " AND ".join(usdt_conditions)
+            cur.execute(
+                f"{_ADMIN_ORDERS_CTE} SELECT COUNT(*) AS cnt {joined_source} {where_sql}",
+                tuple(filter_params),
+            )
+            total = int((cur.fetchone() or {}).get('cnt') or 0)
 
             cur.execute(
-                f"SELECT COUNT(*) as cnt FROM qd_usdt_orders o LEFT JOIN qd_users u ON u.id = o.user_id {usdt_where}",
-                tuple(usdt_params)
-            )
-            total = cur.fetchone()['cnt']
-
-            list_sql = f"""
+                f"""
+                {_ADMIN_ORDERS_CTE}
                 SELECT
-                    o.id,
-                    'usdt' AS order_type,
-                    o.user_id,
+                    o.*,
                     u.username,
                     u.nickname,
                     u.email AS user_email,
-                    o.plan,
-                    o.amount_usdt AS amount,
-                    'USDT' AS currency,
-                    o.chain,
-                    o.address,
-                    o.tx_hash,
-                    o.status,
-                    o.matched_via,
-                    o.admin_note,
-                    o.manual_confirmed_by,
-                    o.created_at,
-                    o.paid_at,
-                    o.confirmed_at,
-                    o.expires_at
-                FROM qd_usdt_orders o
-                LEFT JOIN qd_users u ON u.id = o.user_id
-                {usdt_where}
-                ORDER BY o.created_at DESC
+                    COALESCE(NULLIF(p.name, ''), o.plan) AS plan_name
+                {joined_source}
+                {where_sql}
+                ORDER BY o.created_at DESC, o.payment_method ASC, o.id DESC
                 LIMIT ? OFFSET ?
-            """
-            all_params = list(usdt_params) + [page_size, offset]
-            cur.execute(list_sql, tuple(all_params))
+                """,
+                tuple(list(filter_params) + [page_size, offset]),
+            )
             rows = cur.fetchall() or []
 
-            # Summary stats
             cur.execute(
-                f"""SELECT
+                f"""
+                {_ADMIN_ORDERS_CTE}
+                SELECT
                     COUNT(*) AS total_orders,
-                    COALESCE(SUM(CASE WHEN status IN ('paid','confirmed') THEN 1 ELSE 0 END), 0) AS paid_orders,
-                    COALESCE(SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END), 0) AS pending_orders,
-                    COALESCE(SUM(CASE WHEN status IN ('expired','cancelled','failed') THEN 1 ELSE 0 END), 0) AS failed_orders,
-                    COALESCE(SUM(CASE WHEN status IN ('paid','confirmed') THEN amount_usdt ELSE 0 END), 0) AS total_revenue
-                FROM qd_usdt_orders"""
+                    COALESCE(SUM(CASE WHEN o.status IN ('paid','confirmed') THEN 1 ELSE 0 END), 0) AS paid_orders,
+                    COALESCE(SUM(CASE WHEN o.status = 'pending' THEN 1 ELSE 0 END), 0) AS pending_orders,
+                    COALESCE(SUM(CASE WHEN o.status IN ('expired','cancelled','failed') THEN 1 ELSE 0 END), 0) AS failed_orders,
+                    COALESCE(SUM(CASE WHEN o.status IN ('paid','confirmed') THEN o.amount ELSE 0 END), 0) AS total_revenue
+                {joined_source}
+                {where_sql}
+                """,
+                tuple(filter_params),
             )
             summary_row = cur.fetchone() or {}
 
+            cur.execute(
+                f"""
+                {_ADMIN_ORDERS_CTE}
+                SELECT DISTINCT o.plan, COALESCE(NULLIF(p.name, ''), o.plan) AS plan_name
+                {joined_source}
+                WHERE o.plan <> ''
+                ORDER BY plan_name ASC
+                """
+            )
+            plan_rows = cur.fetchall() or []
             cur.close()
 
         items = []
         for row in rows:
-            # SafeJSONProvider normalizes datetimes to UTC ISO; no manual
-            # conversion needed.
-            created_at = row.get('created_at')
-            paid_at = row.get('paid_at')
-            confirmed_at = row.get('confirmed_at')
-            expires_at = row.get('expires_at')
-
+            method = str(row.get('payment_method') or '').lower()
             items.append({
                 'id': row['id'],
-                'order_type': row.get('order_type') or '',
+                'order_no': f"{method.upper()}-{row['id']}",
+                'order_type': method,
+                'payment_method': method,
                 'user_id': row.get('user_id'),
                 'username': row.get('username') or '',
                 'nickname': row.get('nickname') or '',
                 'user_email': row.get('user_email') or '',
                 'plan': row.get('plan') or '',
+                'plan_name': row.get('plan_name') or row.get('plan') or '',
                 'amount': float(row.get('amount') or 0),
                 'currency': row.get('currency') or '',
                 'chain': row.get('chain') or '',
                 'address': row.get('address') or '',
                 'tx_hash': row.get('tx_hash') or '',
+                'provider_reference': row.get('provider_reference') or '',
+                'payment_reference': row.get('tx_hash') or row.get('provider_reference') or '',
                 'status': row.get('status') or '',
                 'matched_via': row.get('matched_via') or '',
                 'admin_note': row.get('admin_note') or '',
                 'manual_confirmed_by': row.get('manual_confirmed_by'),
-                'created_at': created_at,
-                'paid_at': paid_at,
-                'confirmed_at': confirmed_at,
-                'expires_at': expires_at
+                'created_at': row.get('created_at'),
+                'paid_at': row.get('paid_at'),
+                'confirmed_at': row.get('confirmed_at'),
+                'expires_at': row.get('expires_at'),
             })
 
         return jsonify({
@@ -1829,8 +2036,16 @@ def get_admin_orders():
                     'paid_orders': int(summary_row.get('paid_orders') or 0),
                     'pending_orders': int(summary_row.get('pending_orders') or 0),
                     'failed_orders': int(summary_row.get('failed_orders') or 0),
-                    'total_revenue': round(float(summary_row.get('total_revenue') or 0), 2)
-                }
+                    'total_revenue': round(float(summary_row.get('total_revenue') or 0), 2),
+                    'revenue_currency': 'USD',
+                },
+                'filter_options': {
+                    'payment_methods': ['usdt', 'usdc', 'stripe'],
+                    'plans': [
+                        {'code': row.get('plan') or '', 'name': row.get('plan_name') or row.get('plan') or ''}
+                        for row in plan_rows
+                    ],
+                },
             }
         })
     except Exception as e:

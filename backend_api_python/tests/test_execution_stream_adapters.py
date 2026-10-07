@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
+from types import SimpleNamespace
+from urllib.parse import urlencode
 
 import pytest
 
 from app.services.execution_streams.adapters import (
     ADAPTERS,
     AlpacaExecutionAdapter,
+    BinanceExecutionAdapter,
     BitgetExecutionAdapter,
     BybitExecutionAdapter,
     GateExecutionAdapter,
@@ -17,10 +22,26 @@ from app.services.execution_streams.adapters import (
 
 class FakeSocket:
     def __init__(self) -> None:
-        self.messages: list[dict] = []
+        self.messages: list[object] = []
+        self.closed = False
 
     def send(self, raw: str) -> None:
-        self.messages.append(json.loads(raw))
+        try:
+            self.messages.append(json.loads(raw))
+        except (TypeError, json.JSONDecodeError):
+            self.messages.append(raw)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class StopAfterOneHeartbeat:
+    def __init__(self) -> None:
+        self.waits = 0
+
+    def wait(self, _timeout: float) -> bool:
+        self.waits += 1
+        return self.waits > 1
 
 
 def _adapter(adapter_cls, *, market_type="swap", symbols=()):
@@ -76,12 +97,138 @@ def test_okx_subscribes_only_after_successful_login():
     assert states == ["connected"]
 
 
+def test_okx_and_bitget_use_literal_ping_and_bybit_uses_json_ping():
+    okx, _states = _adapter(OkxExecutionAdapter)
+    bitget, _states = _adapter(BitgetExecutionAdapter)
+    bybit, _states = _adapter(BybitExecutionAdapter)
+
+    assert 0 < okx.application_heartbeat_interval() < 30
+    assert okx.application_heartbeat_payload() == "ping"
+    assert 0 < bitget.application_heartbeat_interval() < 30
+    assert bitget.application_heartbeat_payload() == "ping"
+    assert bybit.application_heartbeat_interval() == 20
+    assert bybit.application_heartbeat_payload() == {"op": "ping"}
+
+
+@pytest.mark.parametrize(
+    ("adapter_cls", "expected"),
+    (
+        (OkxExecutionAdapter, "ping"),
+        (BitgetExecutionAdapter, "ping"),
+        (BybitExecutionAdapter, {"op": "ping"}),
+    ),
+)
+def test_application_heartbeat_sends_venue_payload(adapter_cls, expected):
+    adapter, _states = _adapter(adapter_cls)
+    adapter._last_message_at = -100.0
+    ws = FakeSocket()
+
+    adapter._application_heartbeat_loop(ws, StopAfterOneHeartbeat())
+
+    assert ws.messages == [expected]
+
+
+@pytest.mark.parametrize(("environment", "expected_url"), (
+    ("live", "wss://ws-api.binance.com:443/ws-api/v3"),
+    ("demo", "wss://demo-ws-api.binance.com/ws-api/v3"),
+    ("testnet", "wss://ws-api.testnet.binance.vision/ws-api/v3"),
+))
+def test_binance_spot_uses_signed_websocket_api_subscription(monkeypatch, environment, expected_url):
+    monkeypatch.setattr("app.services.execution_streams.adapters.time.time", lambda: 1_700_000_000.125)
+    monkeypatch.setattr("app.services.execution_streams.adapters.requests.post", lambda *a, **kw: pytest.fail("Spot must not request a listenKey"))
+    adapter, states = _adapter(BinanceExecutionAdapter, market_type="spot")
+    adapter.config["environment"] = environment
+
+    assert adapter.ready_on_open() is False
+    assert adapter.url() == expected_url
+    adapter.prepare()  # Must not call the retired REST listenKey endpoint.
+    request = adapter.on_open_messages()[0]
+    assert request["method"] == "userDataStream.subscribe.signature"
+    params = request["params"]
+    expected_payload = urlencode(sorted({
+        "apiKey": "key",
+        "timestamp": 1_700_000_000_125,
+    }.items()))
+    assert params["signature"] == hmac.new(
+        b"secret", expected_payload.encode(), hashlib.sha256
+    ).hexdigest()
+
+    ws = FakeSocket()
+    assert adapter.handle_control(
+        ws,
+        {"id": request["id"], "status": 200, "result": {"subscriptionId": 0}},
+    )
+    assert adapter.connected
+    assert states == ["connected"]
+
+
+@pytest.mark.parametrize(("environment", "rest_host", "ws_host"), (
+    ("live", "https://fapi.binance.com", "wss://fstream.binance.com/ws"),
+    ("demo", "https://demo-fapi.binance.com", "wss://fstream.binancefuture.com/ws"),
+))
+def test_binance_futures_retains_listen_key_subscription(monkeypatch, environment, rest_host, ws_host):
+    adapter, _states = _adapter(BinanceExecutionAdapter)
+    adapter.config["environment"] = environment
+    calls = []
+    response = SimpleNamespace(raise_for_status=lambda: None, json=lambda: {"listenKey": "stream-key"})
+    monkeypatch.setattr("app.services.execution_streams.adapters.requests.post", lambda url, **kw: calls.append((url, kw)) or response)
+    adapter._keepalive_thread = SimpleNamespace(is_alive=lambda: True)
+
+    adapter.prepare()
+
+    assert calls[0][0] == rest_host + "/fapi/v1/listenKey"
+    assert calls[0][1]["headers"]["X-MBX-APIKEY"] == "key"
+    assert adapter.url() == ws_host + "/stream-key"
+    assert adapter.ready_on_open()
+    assert adapter.on_open_messages() == []
+
+
+def test_binance_websocket_api_event_envelope_is_unwrapped():
+    adapter, _states = _adapter(BinanceExecutionAdapter, market_type="spot")
+    events = adapter.parse({
+        "subscriptionId": 0,
+        "event": {
+            "e": "executionReport",
+            "E": 1_700_000_000_000,
+            "s": "BTCUSDT",
+            "i": 12,
+            "t": 34,
+            "S": "BUY",
+            "X": "FILLED",
+            "L": "100",
+            "l": "0.5",
+            "z": "0.5",
+        },
+    })
+
+    assert len(events) == 1
+    assert events[0].symbol == "BTC/USDT"
+    assert events[0].exchange_order_id == "12"
+
+
+def test_bitget_demo_and_live_use_matching_private_websocket_hosts():
+    demo, _states = _adapter(BitgetExecutionAdapter)
+    live, _states = _adapter(BitgetExecutionAdapter)
+    live.config["environment"] = "live"
+
+    assert demo.url() == "wss://wspap.bitget.com/v2/ws/private"
+    assert live.url() == "wss://ws.bitget.com/v2/ws/private"
+
+
 def test_bybit_subscribes_only_after_successful_authentication():
     adapter, _states = _adapter(BybitExecutionAdapter)
     ws = FakeSocket()
     adapter.handle_control(ws, {"op": "auth", "success": True})
     assert ws.messages == [{"op": "subscribe", "args": ["execution"]}]
     assert adapter.connected
+
+
+def test_bybit_heartbeat_response_does_not_trigger_an_extra_pong():
+    adapter, _states = _adapter(BybitExecutionAdapter)
+    ws = FakeSocket()
+
+    assert adapter.handle_control(ws, {"success": True, "ret_msg": "pong", "op": "ping"})
+    assert ws.messages == []
 
 
 @pytest.mark.parametrize(

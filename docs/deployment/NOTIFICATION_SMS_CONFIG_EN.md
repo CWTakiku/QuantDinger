@@ -1,4 +1,4 @@
-# 📲 SMS Notification Configuration Guide
+# SMS Notification Configuration Guide
 
 > QuantDinger supports SMS notifications via Twilio, ensuring you receive critical trading signals anywhere.
 
@@ -86,7 +86,7 @@ You need a Twilio phone number as the SMS sender:
 
 ### Step 4: Configure Environment Variables
 
-Add Twilio parameters to your `backend_api_python/.env` file:
+Add Twilio parameters to your `.env` file:
 
 ```bash
 # =========================

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
@@ -36,11 +37,23 @@ class OrderIntentService:
         symbol: str,
         signal_type: str,
         signal_ts: int,
+        signal_discriminator: Any = "",
     ) -> str:
-        return (
+        base = (
             f"run:{int(strategy_run_id or 0)}:"
             f"strategy:{int(strategy_id or 0)}:{symbol}:{signal_type}:{int(signal_ts or 0)}"
-        )[:180]
+        )
+        if signal_discriminator not in (None, ""):
+            encoded = json.dumps(
+                signal_discriminator,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+            digest = hashlib.sha256(encoded).hexdigest()[:16]
+            return f"{base[:163]}:{digest}"
+        return base[:180]
 
     def get_by_key(self, idempotency_key: str) -> Optional[OrderIntent]:
         try:
@@ -89,6 +102,7 @@ class OrderIntentService:
         target_notional: Optional[float] = None,
         target_position_qty: Optional[float] = None,
         client_order_id: str = "",
+        runtime_fencing_token: int = 0,
         payload: Dict[str, Any] | None = None,
     ) -> OrderIntent:
         key = str(idempotency_key or "").strip()[:180]
@@ -112,12 +126,12 @@ class OrderIntentService:
                      quantity, notional, limit_price, execution_algo,
                      portfolio_id, universe_id, rebalance_group_id,
                      target_weight, target_notional, target_position_qty,
-                     status, client_order_id, payload_json,
+                     status, client_order_id, runtime_fencing_token, payload_json,
                      created_at, updated_at)
                 VALUES
                     (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
                      %s, %s, %s, %s, %s, %s,
-                     'intent_created', %s, %s, NOW(), NOW())
+                     'intent_created', %s, %s, %s, NOW(), NOW())
                     ON CONFLICT(strategy_run_id, idempotency_key) DO NOTHING
                     """,
                     (
@@ -141,6 +155,7 @@ class OrderIntentService:
                         target_notional,
                         target_position_qty,
                         str(client_order_id or "")[:100],
+                        max(0, int(runtime_fencing_token or 0)),
                         json.dumps(safe_payload, ensure_ascii=False),
                     ),
                 )
@@ -236,6 +251,7 @@ class OrderIntentService:
                 symbol=signal.symbol,
                 signal_type=signal.action,
                 signal_ts=_signal_ts(signal.timestamp),
+                signal_discriminator=signal.to_signal_dict(),
             )
         kwargs = signal.to_order_intent_kwargs(leverage=leverage)
         return self.create_intent(

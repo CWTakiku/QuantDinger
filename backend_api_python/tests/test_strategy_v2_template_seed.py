@@ -25,7 +25,10 @@ def _seed_entries():
 def test_strategy_v2_seed_has_explicit_cta_and_portfolio_catalogs():
     entries = _seed_entries()
     assert len(entries) == 13
-    assert SEED_PATH.read_text(encoding="utf-8").count('"version":11') == 12
+    seed_sql = SEED_PATH.read_text(encoding="utf-8")
+    assert seed_sql.count('"version":11') == 10
+    assert seed_sql.count('"version":12') == 1
+    assert seed_sql.count('"version":13') == 1
     assert sum(item["asset_type"] == "script" for item in entries) == 8
     assert sum(item["asset_type"] == "portfolio_strategy" for item in entries) == 5
 
@@ -59,22 +62,28 @@ def test_strategy_v2_seed_templates_compile_and_expose_parameters():
 def test_strategy_v2_seed_templates_declare_current_direction_contract():
     for item in _seed_entries():
         manifest = compile_strategy_v2(item["code"]).manifest
-        expected = "both" if item["key"] == "strategy_v2_double_ma" else "long_only"
+        expected = "one_way" if item["key"] == "strategy_v2_double_ma" else "long_only"
         assert manifest.direction_mode == expected, item["key"]
 
 
-def test_swap_seed_template_uses_explicit_hedge_legs():
+def test_swap_seed_template_uses_signed_one_way_position():
     entry = next(
         item for item in _seed_entries()
         if item["key"] == "strategy_v2_double_ma"
     )
 
-    assert 'get_position(g.symbol, position_side="long")' in entry["code"]
-    assert 'get_position(g.symbol, position_side="short")' in entry["code"]
-    assert 'position_side="long"' in entry["code"]
-    assert 'position_side="short"' in entry["code"]
+    assert 'get_position(g.symbol)' in entry["code"]
+    assert "position_side=" not in entry["code"]
     assert "dual_ma_close_short" in entry["code"]
     assert "dual_ma_open_long" in entry["code"]
+
+
+def test_swap_seed_templates_advertise_account_mode_compatibility():
+    seed_sql = SEED_PATH.read_text(encoding="utf-8")
+
+    assert seed_sql.count('"positionModeCompatibility":["one_way","hedge"]') == 2
+    assert seed_sql.count('"account-mode-adaptive"') == 2
+    assert '"single-position"' in seed_sql
 
 
 def test_stateful_seed_templates_are_restart_safe():

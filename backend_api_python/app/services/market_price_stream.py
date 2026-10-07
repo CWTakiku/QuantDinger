@@ -70,11 +70,13 @@ class PublicMarketPriceFeed:
         for item in self.instruments:
             key = str(item.get("key") or "")
             symbol = str(item.get("symbol") or "")
+            instrument_id = str(item.get("instrument_id") or "")
             base = symbol.replace("/", "-").upper()
             aliases = {
                 _normalized_symbol(symbol),
                 _normalized_symbol(base),
                 _normalized_symbol(base + ("-SWAP" if self.market_type != "spot" else "")),
+                _normalized_symbol(instrument_id),
             }
             for alias in aliases:
                 if alias:
@@ -88,7 +90,12 @@ class PublicMarketPriceFeed:
 
     @property
     def supported(self) -> bool:
-        return self.exchange_id in self.SUPPORTED_EXCHANGES and bool(self.instruments)
+        has_special_api = any(
+            str(item.get("api_family") or self.market_type).strip().lower()
+            not in {"spot", "swap"}
+            for item in self.instruments
+        )
+        return self.exchange_id in self.SUPPORTED_EXCHANGES and bool(self.instruments) and not has_special_api
 
     def start(self) -> None:
         if not self.supported or (self._thread and self._thread.is_alive()):
@@ -112,7 +119,12 @@ class PublicMarketPriceFeed:
             self._thread.join(timeout=max(0.0, float(timeout or 0.0)))
         self._connected = False
 
-    def snapshot(self, *, max_age_seconds: float = 10.0) -> PriceFeedSnapshot:
+    def snapshot(
+        self,
+        *,
+        max_age_seconds: float = 10.0,
+        rest_fallback: Callable[[], Dict[str, float]] | None = None,
+    ) -> PriceFeedSnapshot:
         now = time.monotonic()
         max_age = max(0.5, float(max_age_seconds or 0.0))
         with self._lock:
@@ -130,9 +142,10 @@ class PublicMarketPriceFeed:
         fallback: Dict[str, float] = {}
         if missing:
             try:
+                fallback_loader = rest_fallback or self.rest_fallback
                 fallback = {
                     str(key): float(value or 0.0)
-                    for key, value in (self.rest_fallback() or {}).items()
+                    for key, value in (fallback_loader() or {}).items()
                     if str(key) in missing and float(value or 0.0) > 0
                 }
             except Exception as exc:
@@ -213,7 +226,10 @@ class PublicMarketPriceFeed:
             backoff = min(30.0, backoff * 2.0)
 
     def _symbols(self) -> list[str]:
-        return [str(item.get("symbol") or "") for item in self.instruments]
+        return [
+            str(item.get("instrument_id") or item.get("symbol") or "")
+            for item in self.instruments
+        ]
 
     def _url(self) -> str:
         swap = self.market_type != "spot"
@@ -238,7 +254,14 @@ class PublicMarketPriceFeed:
         swap = self.market_type != "spot"
         if self.exchange_id == "okx":
             return [{"op": "subscribe", "args": [
-                {"channel": "tickers", "instId": symbol.replace("/", "-").upper() + ("-SWAP" if swap else "")}
+                {
+                    "channel": "tickers",
+                    "instId": (
+                        symbol.replace("/", "-").upper()
+                        if symbol.upper().endswith("-SWAP") or not swap
+                        else symbol.replace("/", "-").upper() + "-SWAP"
+                    ),
+                }
                 for symbol in self._symbols()
             ]}]
         if self.exchange_id == "bybit":
@@ -263,29 +286,58 @@ class PublicMarketPriceFeed:
     def _parse(self, payload: Dict[str, Any]) -> list[tuple[str, float]]:
         if self.exchange_id == "binance":
             data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
-            return [(str(data.get("s") or ""), float(data.get("p") or data.get("c") or 0.0))]
+            price = (
+                (data.get("c") or data.get("p"))
+                if self.market_type == "spot"
+                else (data.get("p") or data.get("c"))
+            )
+            return [(str(data.get("s") or ""), float(price or 0.0))]
         if self.exchange_id == "okx":
             return [
-                (str(item.get("instId") or ""), float(item.get("last") or item.get("markPx") or 0.0))
+                (str(item.get("instId") or ""), float(
+                    (
+                        (item.get("last") or item.get("markPx"))
+                        if self.market_type == "spot"
+                        else (item.get("markPx") or item.get("last"))
+                    ) or 0.0
+                ))
                 for item in payload.get("data") or [] if isinstance(item, dict)
             ]
         if self.exchange_id == "bybit":
             data = payload.get("data") or {}
             rows = data if isinstance(data, list) else [data]
             return [
-                (str(item.get("symbol") or ""), float(item.get("markPrice") or item.get("lastPrice") or 0.0))
+                (str(item.get("symbol") or ""), float(
+                    (
+                        (item.get("lastPrice") or item.get("markPrice"))
+                        if self.market_type == "spot"
+                        else (item.get("markPrice") or item.get("lastPrice"))
+                    ) or 0.0
+                ))
                 for item in rows if isinstance(item, dict)
             ]
         if self.exchange_id == "bitget":
             return [
-                (str(item.get("instId") or ""), float(item.get("markPrice") or item.get("lastPr") or 0.0))
+                (str(item.get("instId") or ""), float(
+                    (
+                        (item.get("lastPr") or item.get("lastPrice") or item.get("markPrice"))
+                        if self.market_type == "spot"
+                        else (item.get("markPrice") or item.get("lastPr") or item.get("lastPrice"))
+                    ) or 0.0
+                ))
                 for item in payload.get("data") or [] if isinstance(item, dict)
             ]
         if self.exchange_id == "gate":
             result = payload.get("result") or []
             rows = result if isinstance(result, list) else [result]
             return [
-                (str(item.get("contract") or item.get("currency_pair") or ""), float(item.get("mark_price") or item.get("last") or 0.0))
+                (str(item.get("contract") or item.get("currency_pair") or ""), float(
+                    (
+                        (item.get("last") or item.get("mark_price"))
+                        if self.market_type == "spot"
+                        else (item.get("mark_price") or item.get("last"))
+                    ) or 0.0
+                ))
                 for item in rows if isinstance(item, dict)
             ]
         tick = payload.get("tick") or {}

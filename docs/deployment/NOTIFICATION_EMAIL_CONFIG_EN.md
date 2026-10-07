@@ -1,4 +1,4 @@
-# 📧 Email SMTP Notification Configuration Guide
+# Email SMTP Notification Configuration Guide
 
 > QuantDinger supports strategy signal notifications via email, ideal for users who need detailed notification records.
 
@@ -66,7 +66,7 @@ QuantDinger supports any standard SMTP protocol email provider, including:
 
 ### Step 2: Configure Environment Variables
 
-Add SMTP parameters to your `backend_api_python/.env` file:
+Add SMTP parameters to your `.env` file:
 
 ```bash
 # =========================

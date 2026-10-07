@@ -18,10 +18,56 @@ from app.services.fast_analysis_tasks import (
 from app.services.fast_analysis import get_fast_analysis_service
 from app.services.analysis_memory import get_analysis_memory
 from app.services.billing_service import get_billing_service
+from app.services.market.instrument_products import PRODUCT_CRYPTO
+from app.services.market.product_catalog import get_catalog_product
 
 logger = get_logger(__name__)
 
 fast_analysis_blp = Blueprint('fast_analysis', __name__)
+
+
+def _resolve_analysis_instrument(
+    *, market: str, symbol: str, exchange_id: str = '', market_type: str = '',
+    instrument_id: str = '',
+) -> tuple[str, str]:
+    if str(market or '').strip() != 'Crypto' or not str(exchange_id or '').strip():
+        return market, symbol
+    try:
+        product = get_catalog_product(
+            market='Crypto',
+            symbol=symbol,
+            exchange_id=exchange_id,
+            market_type=market_type or 'spot',
+            instrument_id=instrument_id,
+        )
+    except Exception:
+        return market, symbol
+    if not product or str(product.get('product_type') or PRODUCT_CRYPTO) == PRODUCT_CRYPTO:
+        return market, symbol
+    underlying_market = str(product.get('underlying_market') or '').strip()
+    underlying_symbol = str(product.get('underlying_symbol') or '').strip()
+    if underlying_market and underlying_symbol:
+        return underlying_market, underlying_symbol
+    return market, symbol
+
+
+def _professional_response_payload(result, credits_charged=0, remaining_credits=None):
+    """Expose the versioned professional contract without legacy report fields."""
+    result = result if isinstance(result, dict) else {}
+    return {
+        'schema_version': 'professional_analysis_envelope_v1',
+        'report': result.get('professional_report'),
+        'runtime': {
+            'memory_id': result.get('memory_id'),
+            'analysis_time_ms': result.get('analysis_time_ms'),
+            'llm_time_ms': result.get('llm_time_ms'),
+            'data_collection_time_ms': result.get('data_collection_time_ms'),
+        },
+        'billing': {
+            'credits_charged': credits_charged,
+            'remaining_credits': remaining_credits,
+        },
+    }
 
 
 @fast_analysis_blp.route('/analyze', methods=['POST'])
@@ -37,22 +83,41 @@ def analyze():
         model (optional): LLM model id, e.g. openai/gpt-5.4
         timeframe (optional, default 1D): Analysis timeframe
         async_submit (optional): Submit as background task
+        response_contract (optional): professional_report_v1 returns only the
+            versioned report artifact plus runtime and billing metadata.
     """
     try:
         data = request.get_json() or {}
         
         market = (data.get('market') or '').strip()
         symbol = (data.get('symbol') or '').strip()
+        exchange_id = (data.get('exchange_id') or data.get('exchangeId') or '').strip().lower()
+        market_type = (data.get('market_type') or data.get('marketType') or 'spot').strip().lower()
+        instrument_id = (data.get('instrument_id') or data.get('instrumentId') or '').strip()
         language = data.get('language', 'en-US')
         model = data.get('model')
         timeframe = data.get('timeframe', '1D')
         async_submit = bool(data.get('async_submit', False))
+        response_contract = str(data.get('response_contract') or 'legacy').strip().lower()
         
         if not market or not symbol:
             return jsonify({
                 'code': 0,
                 'msg': 'market and symbol are required',
                 'data': None
+            }), 400
+        market, symbol = _resolve_analysis_instrument(
+            market=market,
+            symbol=symbol,
+            exchange_id=exchange_id,
+            market_type=market_type,
+            instrument_id=instrument_id,
+        )
+        if response_contract not in {'legacy', 'professional_report_v1'}:
+            return jsonify({
+                'code': 0,
+                'msg': 'response_contract must be legacy or professional_report_v1',
+                'data': None,
             }), 400
         
         # Get current user's ID to associate analysis with user
@@ -61,7 +126,10 @@ def analyze():
             return jsonify({'code': 0, 'msg': 'Unauthorized', 'data': None}), 401
 
         inflight_key = build_inflight_key(user_id, market, symbol, timeframe)
-        if not acquire_inflight(inflight_key, ttl_sec=90):
+        # The client timeout is five minutes; keep the de-duplication lease
+        # alive slightly longer so a slow professional report cannot be charged
+        # and submitted twice while the first run is still active.
+        if not acquire_inflight(inflight_key, ttl_sec=330):
             return jsonify({
                 'code': 0,
                 'msg': 'Analysis already in progress for this symbol/timeframe. Please wait.',
@@ -156,6 +224,11 @@ def analyze():
             timeframe=timeframe,
             user_id=user_id
         )
+
+        if response_contract == 'professional_report_v1':
+            professional_report = result.get('professional_report') if isinstance(result, dict) else None
+            if not isinstance(professional_report, dict) or professional_report.get('schema_version') not in {'professional_report_v1', '1.0'}:
+                result = {**(result or {}), 'error': 'professional_report_v1 generation failed'}
         
         if result.get('error'):
             # Best-effort refund if we already charged but analysis failed.
@@ -178,10 +251,10 @@ def analyze():
         # memory_id is already set in service.analyze() -> _store_analysis_memory()
         # No need to store again here (would create duplicates)
         
-        return jsonify({
-            'code': 1,
-            'msg': 'success',
-            'data': {
+        response_data = (
+            _professional_response_payload(result, credits_charged, remaining_credits)
+            if response_contract == 'professional_report_v1'
+            else {
                 **(result or {}),
                 'market': market,
                 'symbol': symbol,
@@ -189,6 +262,11 @@ def analyze():
                 'credits_charged': credits_charged,
                 'remaining_credits': remaining_credits,
             }
+        )
+        return jsonify({
+            'code': 1,
+            'msg': 'success',
+            'data': response_data,
         })
         
     except Exception as e:
@@ -225,6 +303,48 @@ def analyze():
             pass
 
 
+@fast_analysis_blp.route('/data-sources', methods=['GET'])
+@login_required
+def get_professional_report_data_sources():
+    """List community and professional report providers without secrets."""
+    from app.professional_report.providers import list_providers, provider_configuration_status
+
+    market = request.args.get('market', '').strip() or None
+    capability = request.args.get('capability', '').strip() or None
+    tier = request.args.get('tier', '').strip().lower() or None
+    try:
+        providers = list_providers(market=market, capability=capability, tier=tier)
+    except ValueError as exc:
+        return jsonify({'code': 0, 'msg': str(exc), 'data': None}), 400
+
+    items = []
+    for provider in providers:
+        status = provider_configuration_status(provider)
+        items.append({
+            'key': provider.key,
+            'name': provider.name,
+            'tier': provider.tier,
+            'markets': sorted(provider.markets),
+            'capabilities': sorted(provider.capabilities),
+            'configured': bool(status['configured']),
+            'keyless': provider.keyless,
+            'cost_level': provider.cost_level,
+            'required_env_keys': list(provider.api_env_keys),
+            'missing_env_keys': list(status['missing_env_keys']),
+            'license_warning': provider.license_warning,
+            'integration_status': provider.integration_status,
+        })
+    return jsonify({
+        'code': 1,
+        'msg': 'success',
+        'data': {
+            'items': items,
+            'tiers': ['community', 'professional'],
+            'default_tier': 'community',
+        },
+    })
+
+
 @fast_analysis_blp.route('/history', methods=['GET'])
 @login_required
 def get_history():
@@ -247,7 +367,9 @@ def get_history():
             }), 400
         
         memory = get_analysis_memory()
-        history = memory.get_recent(market, symbol, days, limit)
+        history = memory.get_recent(
+            market, symbol, days, limit, user_id=getattr(g, 'user_id', None)
+        )
         
         return jsonify({
             'code': 1,
@@ -374,7 +496,9 @@ def submit_feedback():
             }), 400
         
         memory = get_analysis_memory()
-        success = memory.record_feedback(memory_id, feedback)
+        success = memory.record_feedback(
+            memory_id, feedback, user_id=getattr(g, 'user_id', None)
+        )
         
         return jsonify({
             'code': 1 if success else 0,
@@ -448,7 +572,9 @@ def get_similar_patterns():
         
         # Find similar patterns
         memory = get_analysis_memory()
-        patterns = memory.get_similar_patterns(market, symbol, indicators)
+        patterns = memory.get_similar_patterns(
+            market, symbol, indicators, user_id=getattr(g, 'user_id', None)
+        )
         
         return jsonify({
             'code': 1,

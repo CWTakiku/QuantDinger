@@ -1,9 +1,37 @@
 from __future__ import annotations
 
+import ast
+import inspect
+import json
+import textwrap
+
 import pytest
 
 from app.services import pending_order_worker as worker_module
-from app.services.pending_orders.sent_order_recovery import is_final_fill, normalize_live_order_status
+from app.services.live_trading.adapters import LiveOrderPhaseAdapter
+from app.services.pending_orders.sent_order_recovery import (
+    is_final_fill,
+    normalize_live_order_status,
+    tracked_fill_baseline,
+)
+
+
+def test_live_order_adapter_call_uses_only_supported_constructor_keywords():
+    """Keep the worker and adapter constructor contract in sync."""
+    source = textwrap.dedent(inspect.getsource(worker_module.PendingOrderWorker._execute_live_order))
+    tree = ast.parse(source)
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "LiveOrderPhaseAdapter"
+    ]
+
+    assert len(calls) == 1
+    passed_keywords = {keyword.arg for keyword in calls[0].keywords if keyword.arg}
+    supported_keywords = set(inspect.signature(LiveOrderPhaseAdapter).parameters)
+    assert passed_keywords <= supported_keywords
 
 
 def _row(*, filled: float, avg_price: float):
@@ -93,6 +121,34 @@ def test_claim_live_sent_order_transitions_the_claimed_row(monkeypatch):
     assert worker._claim_live_sent_order(41) == {"id": 41, "status": "syncing"}
 
 
+def test_fee_reconciliation_is_not_throttled_by_a_healthy_execution_stream():
+    worker = object.__new__(worker_module.PendingOrderWorker)
+
+    assert worker._should_rest_reconcile({"fee_reconciliation_needed": True}) is True
+
+
+def test_fee_reconciliation_limits_each_exchange_account_batch(monkeypatch):
+    worker = object.__new__(worker_module.PendingOrderWorker)
+    worker._fee_sync_batch_per_account = 2
+    rows = [
+        {
+            "id": order_id,
+            "exchange_id": "binance",
+            "credential_id": 7,
+            "market_type": "spot",
+            "fee_reconciliation_needed": True,
+        }
+        for order_id in range(1, 5)
+    ]
+    monkeypatch.setattr(worker, "_fetch_live_sent_orders", lambda limit: rows)
+    synced = []
+    monkeypatch.setattr(worker, "_sync_one_live_sent_order", lambda row: synced.append(row["id"]))
+
+    worker._sync_live_sent_orders()
+
+    assert synced == [1, 2]
+
+
 def test_live_sent_sync_finalizes_after_restart_without_duplicate_fill(monkeypatch):
     row = _row(filled=1.0, avg_price=101.0)
     worker, snapshots, persisted = _worker(
@@ -103,9 +159,74 @@ def test_live_sent_sync_finalizes_after_restart_without_duplicate_fill(monkeypat
 
     worker._sync_one_live_sent_order(row)
 
-    assert persisted == []
+    assert len(persisted) == 1
+    assert persisted[0]["filled"] == 0
+    assert persisted[0]["cumulative_filled"] == pytest.approx(row["filled"])
     assert snapshots[0]["status"] == "filled"
     assert snapshots[0]["exchange_status"] == "filled"
+
+
+def test_live_sent_sync_marks_pending_order_fee_as_actual(monkeypatch):
+    row = _row(filled=1.0, avg_price=101.0)
+    worker, snapshots, persisted = _worker(
+        monkeypatch,
+        row,
+        exchange_fill=(1.0, 101.0, "filled"),
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "wait_live_order_fill",
+        lambda **kwargs: {
+            "filled": 1.0,
+            "avg_price": 101.0,
+            "fees_by_ccy": {"USDT": 0.05},
+            "fee_status": "actual",
+        },
+    )
+
+    worker._sync_one_live_sent_order(row)
+
+    assert len(persisted) == 1
+    assert snapshots[0]["fee_status"] == "actual"
+    assert snapshots[0]["fee_source"] == "rest"
+
+
+def test_stale_zero_sync_marker_cannot_hide_executor_fill_in_row():
+    row = {
+        "exchange_response_json": json.dumps(
+            {"live_fill_sync": {"tracked_filled": 0.0, "tracked_avg_price": 0.0}}
+        )
+    }
+
+    filled, avg = tracked_fill_baseline(
+        row,
+        exchange_order_id="exchange-41",
+        previous_filled=0.1,
+        previous_avg=685.48,
+    )
+
+    assert filled == pytest.approx(0.1)
+    assert avg == pytest.approx(685.48)
+
+
+def test_live_sent_sync_does_not_rebook_fill_hidden_by_stale_marker(monkeypatch):
+    row = _row(filled=0.1, avg_price=685.48)
+    row["exchange_response_json"] = json.dumps(
+        {"live_fill_sync": {"tracked_filled": 0.0, "tracked_avg_price": 0.0}}
+    )
+    worker, snapshots, persisted = _worker(
+        monkeypatch,
+        row,
+        exchange_fill=(0.1, 685.48, "filled"),
+    )
+
+    worker._sync_one_live_sent_order(row)
+
+    assert len(persisted) == 1
+    assert persisted[0]["filled"] == 0
+    assert persisted[0]["cumulative_filled"] == pytest.approx(row["filled"])
+    assert snapshots[0]["status"] == "filled"
+    assert snapshots[0]["filled"] == pytest.approx(0.1)
 
 
 def test_bitget_precision_normalized_fill_releases_residual_sent_order(monkeypatch):
@@ -189,6 +310,22 @@ def test_live_sent_sync_tracks_market_leg_without_overwriting_limit_fill(monkeyp
     assert snapshots[0]["status"] == "filled"
 
 
+def test_restart_after_market_poll_timeout_books_only_the_market_tail(monkeypatch):
+    row = _row(filled=2.0, avg_price=100.0)
+    row["amount"] = 3.0
+    row["exchange_response_json"] = json.dumps({"phases": {"executor": {
+        "limit_summary": {"exchange_order_id": "limit-1", "filled_qty": 2.0, "avg_price": 100.0},
+        "market_summary": {"exchange_order_id": "exchange-41", "filled_qty": 0.0, "avg_price": 0.0},
+    }}})
+    worker, snapshots, persisted = _worker(monkeypatch, row, exchange_fill=(1.0, 101.0, "filled"))
+    worker._sync_one_live_sent_order(row)
+    assert persisted[0]["filled"] == 1.0
+    assert persisted[0]["avg_price"] == 101.0
+    assert snapshots[0]["filled"] == 3.0
+    assert snapshots[0]["avg_price"] == pytest.approx(100 + 1 / 3)
+    assert snapshots[0]["status"] == "filled"
+
+
 def test_live_sent_sync_keeps_terminal_fill_open_when_average_price_is_missing(monkeypatch):
     row = _row(filled=0.0, avg_price=0.0)
     worker, snapshots, persisted = _worker(
@@ -253,6 +390,50 @@ def test_ibkr_submission_never_fabricates_a_fill_from_requested_amount(monkeypat
     assert sent[0]["avg_price"] == 0.0
     assert sent[0]["final_filled"] is False
     assert persisted == []
+
+
+def test_ibkr_accepted_order_with_local_persistence_failure_is_reconciled(monkeypatch):
+    sequence = []
+
+    class Result:
+        success = True
+        order_id = "ibkr-accepted"
+        filled = 0.0
+        avg_price = 0.0
+        status = "Submitted"
+        message = "Order submitted"
+        raw = {"status": "Submitted", "orderRef": "qd_9_52"}
+
+    class Client:
+        def place_market_order(self, **kwargs):
+            assert sequence == ["prepared"]
+            assert kwargs["client_order_id"] == "qd_9_52"
+            sequence.append("submitted")
+            return Result()
+
+    worker = object.__new__(worker_module.PendingOrderWorker)
+    worker._mark_sent = lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("database unavailable"))
+    unknown = []
+    worker._mark_submit_unknown = lambda **kwargs: unknown.append(kwargs)
+    worker._mark_failed = lambda **kwargs: pytest.fail(str(kwargs))
+    monkeypatch.setattr(worker_module, "persist_strategy_fill", lambda **_kwargs: None)
+    monkeypatch.setattr(worker_module, "append_strategy_log", lambda *args, **kwargs: None)
+
+    worker._execute_ibkr_order(
+        order_id=52,
+        order_row={},
+        payload={"signal_type": "open_long", "symbol": "AAPL", "amount": 10, "ref_price": 200},
+        client=Client(),
+        strategy_id=9,
+        exchange_config={"exchange_id": "ibkr", "market_type": "USStock"},
+        client_order_id="qd_9_52",
+        prepare_submission=lambda: sequence.append("prepared"),
+        _notify_live_best_effort=lambda **kwargs: None,
+        _console_print=lambda *args, **kwargs: None,
+    )
+
+    assert unknown == [{"order_id": 52, "error": "ibkr_submit_unknown:database unavailable"}]
+    assert sequence == ["prepared", "submitted"]
 
 
 def test_live_sent_sync_reconciles_ibkr_submitted_order(monkeypatch):

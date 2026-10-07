@@ -87,6 +87,7 @@ class PrivateWebSocketAdapter:
         self._connected = False
         self._reconnects = 0
         self._last_error = ""
+        self._last_message_at = 0.0
 
     @property
     def stream_key(self) -> str:
@@ -150,6 +151,33 @@ class PrivateWebSocketAdapter:
             return True
         return False
 
+    def application_heartbeat_interval(self) -> float:
+        """Return the venue-level heartbeat interval, or 0 when not required."""
+        return 0.0
+
+    def application_heartbeat_payload(self) -> Any:
+        """Return the venue-level heartbeat payload sent after an idle interval."""
+        return None
+
+    def _application_heartbeat_loop(self, ws: Any, connection_stop: threading.Event) -> None:
+        interval = max(0.0, float(self.application_heartbeat_interval() or 0.0))
+        if interval <= 0:
+            return
+        while not self._stop.is_set() and not connection_stop.wait(interval):
+            # Incoming frames must not defer a 20-second ping to the 40-second tick.
+            payload = self.application_heartbeat_payload()
+            if payload is None:
+                return
+            try:
+                if isinstance(payload, str):
+                    ws.send(payload)
+                else:
+                    ws.send(json.dumps(payload, separators=(",", ":")))
+            except Exception:
+                # run_forever owns reconnect/error reporting; a failed heartbeat
+                # only means this connection is already on its way down.
+                return
+
     def prepare(self) -> None:
         return None
 
@@ -161,11 +189,15 @@ class PrivateWebSocketAdapter:
             return
         backoff = 1.0
         while not self._stop.is_set():
+            heartbeat_stop = threading.Event()
+            heartbeat_thread: Optional[threading.Thread] = None
             try:
                 self.prepare()
                 url = self.url()
 
                 def _open(ws):
+                    nonlocal heartbeat_thread
+                    self._last_message_at = time.monotonic()
                     if self.ready_on_open():
                         self.mark_ready()
                     else:
@@ -173,8 +205,17 @@ class PrivateWebSocketAdapter:
                         self.on_state("authenticating", "", self._reconnects > 0)
                     for message in self.on_open_messages():
                         ws.send(json.dumps(message, separators=(",", ":")))
+                    if self.application_heartbeat_interval() > 0:
+                        heartbeat_thread = threading.Thread(
+                            target=self._application_heartbeat_loop,
+                            args=(ws, heartbeat_stop),
+                            name=f"ExecHeartbeat-{self.stream_key}",
+                            daemon=True,
+                        )
+                        heartbeat_thread.start()
 
                 def _message(ws, raw):
+                    self._last_message_at = time.monotonic()
                     payload = _json_message(raw)
                     if not payload or self.handle_control(ws, payload):
                         return
@@ -199,6 +240,7 @@ class PrivateWebSocketAdapter:
 
                 self._ws = websocket.WebSocketApp(
                     url,
+                    header={"X-Gate-Size-Decimal": "1"} if isinstance(self, GateExecutionAdapter) else None,
                     on_open=_open,
                     on_message=_message,
                     on_error=_error,
@@ -210,12 +252,17 @@ class PrivateWebSocketAdapter:
                     sslopt = {"cert_reqs": ssl.CERT_NONE, "check_hostname": False}
                 elif isinstance(verify, str):
                     sslopt = {"ca_certs": verify}
-                self._ws.run_forever(
-                    ping_interval=20,
-                    ping_timeout=10,
-                    sslopt=sslopt,
-                    skip_utf8_validation=True,
-                )
+                try:
+                    self._ws.run_forever(
+                        ping_interval=20,
+                        ping_timeout=10,
+                        sslopt=sslopt,
+                        skip_utf8_validation=True,
+                    )
+                finally:
+                    heartbeat_stop.set()
+                    if heartbeat_thread and heartbeat_thread.is_alive():
+                        heartbeat_thread.join(timeout=1.0)
             except Exception as exc:
                 self._connected = False
                 self.on_state("error", str(exc), False)
@@ -233,6 +280,34 @@ class BinanceExecutionAdapter(PrivateWebSocketAdapter):
         self._listen_key_base = ""
         self._listen_key_path = ""
         self._keepalive_thread: Optional[threading.Thread] = None
+        self._subscription_request_id = ""
+
+    def _uses_spot_ws_api(self) -> bool:
+        return self.market_type == "spot"
+
+    def ready_on_open(self) -> bool:
+        return not self._uses_spot_ws_api()
+
+    def on_open_messages(self) -> List[Dict[str, Any]]:
+        if not self._uses_spot_ws_api():
+            return []
+        timestamp = int(time.time() * 1000)
+        api_key = str(self.config.get("api_key") or self.config.get("apiKey") or "")
+        secret = str(self.config.get("secret_key") or self.config.get("secret") or "")
+        params: Dict[str, Any] = {
+            "apiKey": api_key,
+            "timestamp": timestamp,
+        }
+        signature_payload = urlencode(sorted(params.items()))
+        params["signature"] = hmac.new(
+            secret.encode(), signature_payload.encode(), hashlib.sha256
+        ).hexdigest()
+        self._subscription_request_id = f"qd-user-stream-{self.credential_id}-{timestamp}"
+        return [{
+            "id": self._subscription_request_id,
+            "method": "userDataStream.subscribe.signature",
+            "params": params,
+        }]
 
     def stop(self, timeout: float = 5.0) -> bool:
         main_stopped = super().stop(timeout=timeout)
@@ -242,18 +317,15 @@ class BinanceExecutionAdapter(PrivateWebSocketAdapter):
         return main_stopped and not bool(keepalive and keepalive.is_alive())
 
     def prepare(self) -> None:
+        if self._uses_spot_ws_api():
+            self._listen_key = ""
+            return
         api_key = str(self.config.get("api_key") or self.config.get("apiKey") or "")
         environment = exchange_trading_environment(self.config, "binance")
-        if self.market_type == "spot":
-            base = "https://demo-api.binance.com" if environment != "live" else str(
-                self.config.get("base_url") or "https://api.binance.com"
-            )
-            path = "/api/v3/userDataStream"
-        else:
-            base = "https://demo-fapi.binance.com" if environment != "live" else str(
-                self.config.get("base_url") or "https://fapi.binance.com"
-            )
-            path = "/fapi/v1/listenKey"
+        base = "https://demo-fapi.binance.com" if environment != "live" else str(
+            self.config.get("base_url") or "https://fapi.binance.com"
+        )
+        path = "/fapi/v1/listenKey"
         self._listen_key_base = base.rstrip("/")
         self._listen_key_path = path
         response = requests.post(
@@ -280,7 +352,7 @@ class BinanceExecutionAdapter(PrivateWebSocketAdapter):
                 api_key = str(self.config.get("api_key") or self.config.get("apiKey") or "")
                 response = requests.put(
                     f"{self._listen_key_base}{self._listen_key_path}",
-                    params={"listenKey": self._listen_key} if self.market_type == "spot" else None,
+                    params=None,
                     headers={"X-MBX-APIKEY": api_key, "Connection": "close"},
                     timeout=15,
                     verify=_get_requests_verify(),
@@ -291,19 +363,57 @@ class BinanceExecutionAdapter(PrivateWebSocketAdapter):
 
     def url(self) -> str:
         environment = exchange_trading_environment(self.config, "binance")
-        if self.market_type == "spot":
-            host = "wss://demo-stream.binance.com/ws" if environment != "live" else "wss://stream.binance.com:9443/ws"
-        else:
-            host = "wss://fstream.binancefuture.com/ws" if environment != "live" else "wss://fstream.binance.com/ws"
+        if self._uses_spot_ws_api():
+            if environment == "testnet":
+                return "wss://ws-api.testnet.binance.vision/ws-api/v3"
+            if environment == "demo":
+                return "wss://demo-ws-api.binance.com/ws-api/v3"
+            return "wss://ws-api.binance.com:443/ws-api/v3"
+        host = "wss://fstream.binancefuture.com/ws" if environment != "live" else "wss://fstream.binance.com/ws"
         return f"{host}/{self._listen_key}"
 
+    def handle_control(self, ws: Any, payload: Dict[str, Any]) -> bool:
+        if self._uses_spot_ws_api() and payload.get("id") == self._subscription_request_id:
+            try:
+                status = int(payload.get("status") or 0)
+            except (TypeError, ValueError):
+                status = 0
+            result = payload.get("result") if isinstance(payload.get("result"), dict) else {}
+            if status == 200 and result.get("subscriptionId") is not None:
+                self.mark_ready()
+            else:
+                error = payload.get("error")
+                message = error.get("msg") if isinstance(error, dict) else error
+                self.on_state(
+                    "error",
+                    f"Binance user stream subscription failed: {message or payload}",
+                    False,
+                )
+                try:
+                    ws.close()
+                except Exception:
+                    pass
+            return True
+        return super().handle_control(ws, payload)
+
     def parse(self, payload: Dict[str, Any]) -> List[ExecutionEvent]:
-        return parse_binance(payload, market_type=self.market_type)
+        event = payload.get("event")
+        return parse_binance(
+            event if isinstance(event, dict) else payload,
+            market_type=self.market_type,
+        )
 
 
 class OkxExecutionAdapter(PrivateWebSocketAdapter):
     def ready_on_open(self) -> bool:
         return False
+
+    def application_heartbeat_interval(self) -> float:
+        # OKX requires the literal text frame "ping" before 30 seconds idle.
+        return 20.0
+
+    def application_heartbeat_payload(self) -> str:
+        return "ping"
 
     def url(self) -> str:
         if exchange_trading_environment(self.config, "okx") != "live":
@@ -344,6 +454,12 @@ class BybitExecutionAdapter(PrivateWebSocketAdapter):
     def ready_on_open(self) -> bool:
         return False
 
+    def application_heartbeat_interval(self) -> float:
+        return 20.0
+
+    def application_heartbeat_payload(self) -> Dict[str, str]:
+        return {"op": "ping"}
+
     def url(self) -> str:
         environment = exchange_trading_environment(self.config, "bybit")
         if environment == "demo":
@@ -366,6 +482,8 @@ class BybitExecutionAdapter(PrivateWebSocketAdapter):
         }]
 
     def handle_control(self, ws: Any, payload: Dict[str, Any]) -> bool:
+        if payload.get("op") == "ping" and str(payload.get("ret_msg") or "").lower() == "pong":
+            return True
         if payload.get("op") == "auth":
             if bool(payload.get("success")):
                 self.mark_ready()
@@ -383,7 +501,17 @@ class BitgetExecutionAdapter(PrivateWebSocketAdapter):
     def ready_on_open(self) -> bool:
         return False
 
+    def application_heartbeat_interval(self) -> float:
+        # Bitget recommends a literal text "ping" every 30 seconds.  Use a
+        # small safety margin so scheduling jitter cannot cross the deadline.
+        return 25.0
+
+    def application_heartbeat_payload(self) -> str:
+        return "ping"
+
     def url(self) -> str:
+        if exchange_trading_environment(self.config, "bitget") != "live":
+            return "wss://wspap.bitget.com/v2/ws/private"
         return "wss://ws.bitget.com/v2/ws/private"
 
     def on_open_messages(self) -> List[Dict[str, Any]]:
@@ -513,7 +641,7 @@ class HtxExecutionAdapter(PrivateWebSocketAdapter):
         return False
 
     def url(self) -> str:
-        return "wss://api.htx.com/ws/v2" if self.market_type == "spot" else "wss://api.hbdm.com/swap-notification"
+        return "wss://api.htx.com/ws/v2" if self.market_type == "spot" else "wss://api.hbdm.com/linear-swap-notification"
 
     def _auth_params(self) -> Dict[str, str]:
         parsed = urlparse(self.url())
@@ -524,10 +652,13 @@ class HtxExecutionAdapter(PrivateWebSocketAdapter):
             "SignatureVersion": "2",
             "Timestamp": timestamp,
         }
-        path = parsed.path or ("/ws/v2" if self.market_type == "spot" else "/swap-notification")
+        if self.market_type == 'spot':
+            params = {'accessKey': params['AccessKeyId'], 'signatureMethod': 'HmacSHA256',
+                      'signatureVersion': '2.1', 'timestamp': timestamp}
+        path = parsed.path
         encoded = urlencode(sorted(params.items()))
         payload = f"GET\n{parsed.hostname}\n{path}\n{encoded}"
-        params["Signature"] = _b64_hmac(
+        params['signature' if self.market_type == 'spot' else 'Signature'] = _b64_hmac(
             str(self.config.get("secret_key") or self.config.get("secret") or ""),
             payload,
         )
@@ -712,18 +843,21 @@ class IBKRExecutionAdapter:
                 source="commission_report",
             )
         ]
+        from app.services.execution_streams.reported_pnl import number
+        reported_pnl = number(getattr(report, "realizedPNL", None))
+        reported_pnl = float(reported_pnl) if reported_pnl is not None else None
         event.raw = {
             **base_event.raw,
             "commission": float(getattr(report, "commission", 0) or 0.0),
             "currency": str(getattr(report, "currency", "") or ""),
-            "realizedPNL": float(getattr(report, "realizedPNL", 0) or 0.0),
+            "realizedPNL": reported_pnl,
         }
         event.quantity = 0.0
         event.cumulative_quantity = base_event.cumulative_quantity
         event.is_cumulative = True
         # Commission is a second authoritative update for the same execution.
         event.exchange_fill_id = f"{exec_id}:commission"
-        event.realized_pnl = float(getattr(report, "realizedPNL", 0) or 0.0)
+        event.realized_pnl = reported_pnl
         event.credential_id = self.credential_id
         event.user_id = self.user_id
         self.on_event(event)

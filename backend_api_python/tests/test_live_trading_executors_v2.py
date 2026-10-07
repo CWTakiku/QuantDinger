@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from app.services.live_trading.base import LiveOrderResult
+from app.services.live_trading.base import LiveOrderResult, LiveTradingError
 from app.services.live_trading.contracts import FillSnapshot, OrderIntent
 from app.services.live_trading.executors import (
     LimitThenMarketExecutor,
@@ -29,6 +29,7 @@ class FakeAdapter:
 
     def cancel_order(self, intent, *, order_id: str = ""):
         self.calls.append(("cancel", order_id))
+        self.fill_status = "canceled"
         return {"ok": True}
 
     def wait_for_fill(self, intent, *, order_id: str = "", max_wait_sec: float = 15.0):
@@ -64,6 +65,85 @@ def test_market_order_executor_submits_normalized_intent():
     assert result.exchange_order_id == "m1"
     assert result.fees_by_ccy == {"USDT": 0.2}
     assert adapter.calls == [("market", "BTC/USDT"), ("wait", "m1", 12.0)]
+
+
+def test_market_order_transport_failure_is_left_for_reconciliation():
+    adapter = FakeAdapter()
+
+    def timeout(_intent):
+        raise LiveTradingError("HTTP 504 gateway timeout")
+
+    adapter.place_market_order = timeout
+
+    result = MarketOrderExecutor(adapter).execute(
+        OrderIntent(
+            symbol="BTC/USDT",
+            side="buy",
+            quantity=1,
+            client_order_id="qd_7_11_mkt",
+        )
+    )
+
+    assert result.success is False
+    assert result.status == "unknown"
+    assert result.raw == {
+        "submit_outcome": "unknown",
+        "client_order_id": "qd_7_11_mkt",
+    }
+
+
+def test_limit_then_market_transport_failure_is_left_for_reconciliation():
+    adapter = FakeAdapter()
+
+    def timeout(_intent):
+        raise LiveTradingError("HTTP 504 gateway timeout")
+
+    adapter.place_limit_order = timeout
+
+    result = LimitThenMarketExecutor(adapter).execute(
+        OrderIntent(
+            symbol="BTC/USDT",
+            side="buy",
+            quantity=1,
+            price=90000,
+            client_order_id="qd_7_12_lmt",
+        )
+    )
+
+    assert result.success is False
+    assert result.status == "unknown"
+    assert result.raw["client_order_id"] == "qd_7_12_lmt"
+
+
+def test_limit_then_market_persists_each_client_id_before_submit():
+    prepared = []
+    adapter = FakeAdapter(fill_status="open", fill_qty=0)
+    original_limit = adapter.place_limit_order
+    original_market = adapter.place_market_order
+
+    def prepare_then_limit(intent):
+        prepared.append(intent.client_order_id)
+        return original_limit(intent)
+
+    def prepare_then_market(intent):
+        prepared.append(intent.client_order_id)
+        return original_market(intent)
+
+    adapter.place_limit_order = prepare_then_limit
+    adapter.place_market_order = prepare_then_market
+    result = LimitThenMarketExecutor(adapter, max_wait_sec=1).execute(
+        OrderIntent(
+            symbol="BTC/USDT",
+            side="buy",
+            quantity=1,
+            price=90000,
+            client_order_id="qd_7_13_lmt",
+            fallback_client_order_id="qd_7_13_mkt",
+        )
+    )
+
+    assert result.success is True
+    assert prepared == ["qd_7_13_lmt", "qd_7_13_mkt"]
 
 
 def test_resting_limit_executor_submits_without_waiting_or_cancelling():
@@ -104,6 +184,7 @@ def test_limit_then_market_cancels_and_falls_back_when_unfilled():
         ("limit", "SOL/USDT"),
         ("wait", "l1", 1.0),
         ("cancel", "l1"),
+        ("wait", "l1", 1.0),
         ("market", "SOL/USDT"),
         ("wait", "m1", 12.0),
     ]
@@ -123,6 +204,38 @@ def test_limit_then_market_preserves_partial_limit_fill_and_markets_remaining():
         ("limit", "SOL/USDT"),
         ("wait", "l1", 1.0),
         ("cancel", "l1"),
+        ("wait", "l1", 1.0),
         ("market", "SOL/USDT"),
+        ("wait", "m1", 12.0),
+    ]
+
+
+def test_limit_then_market_falls_back_after_price_band_rejection():
+    adapter = FakeAdapter()
+
+    def reject_limit(intent):
+        adapter.calls.append(("limit", intent.symbol))
+        raise LiveTradingError(
+            "Bybit error: {'retCode': 110003, 'retMsg': 'Order price exceeds the allowable range.'}"
+        )
+
+    adapter.place_limit_order = reject_limit
+    intent = OrderIntent(
+        symbol="ETH/USDT",
+        side="buy",
+        quantity=2,
+        price=2800,
+        client_order_id="limit-id",
+        fallback_client_order_id="market-id",
+    )
+
+    result = LimitThenMarketExecutor(adapter, fallback_to_market=True).execute(intent)
+
+    assert result.success is True
+    assert result.exchange_order_id == "m1"
+    assert "110003" in result.raw["limit_error"]
+    assert adapter.calls == [
+        ("limit", "ETH/USDT"),
+        ("market", "ETH/USDT"),
         ("wait", "m1", 12.0),
     ]

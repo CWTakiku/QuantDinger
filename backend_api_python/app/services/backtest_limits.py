@@ -70,11 +70,11 @@ _MARKET_LIMITS: Dict[str, Dict[str, BacktestRangePolicy]] = {
         "1W": BacktestRangePolicy(2190, "5 years", "CN stock weekly research window"),
     },
     # yfinance intraday endpoints are much narrower than daily/weekly history.
-    # Keep the cap below the upstream hard edge so indicator warmup does not
-    # push an apparently valid user window into an upstream 400.
+    # One-minute requests are split into provider-safe chunks while the total
+    # window remains inside Yahoo's recent intraday retention boundary.
     "USStock": {
-        "1m": BacktestRangePolicy(7, "7 days", "US stock intraday data provider limit"),
-        "3m": BacktestRangePolicy(7, "7 days", "US stock intraday data provider limit"),
+        "1m": BacktestRangePolicy(30, "30 days", "US stock intraday data retention limit"),
+        "3m": BacktestRangePolicy(30, "30 days", "US stock intraday data retention limit"),
         "5m": BacktestRangePolicy(60, "60 days", "US stock intraday data provider limit"),
         "15m": BacktestRangePolicy(60, "60 days", "US stock intraday data provider limit"),
         "30m": BacktestRangePolicy(60, "60 days", "US stock intraday data provider limit"),

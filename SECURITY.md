@@ -93,6 +93,73 @@ in release notes or documentation, if desired.
 
 ---
 
+## Security Advisories
+
+### July 2026 — JWT authentication and authorization bypass (resolved)
+
+A critical vulnerability affected deployments that used the previously
+published default `SECRET_KEY`. Under those conditions, an unauthenticated
+attacker could forge an HS256 access token. The former validation path also
+allowed a token without a `token_version` claim to bypass session-version
+checks and used the role carried in the token for authorization decisions.
+
+The issue was resolved on **July 21, 2026**. QuantDinger now rejects missing,
+known-default, and fewer-than-10-byte signing secrets (32 or more random bytes
+remain strongly recommended); requires the JWT identity and session claims;
+and validates the current user status, token version, and role against the
+authoritative database record before granting access.
+
+Administrators of deployments created before this fix should update to the
+latest supported revision, replace `SECRET_KEY` with a unique high-entropy
+value, and require users to sign in again. If an affected API was reachable by
+untrusted networks, review access logs and rotate any broker, exchange, or
+provider credentials that may have been exposed.
+
+### August 2026 — Strategy and indicator execution isolation
+
+Deployments that accepted untrusted strategy or indicator code before the
+August 2026 hardening update should assume application environment secrets may
+have been exposed. Upgrade to the latest `main` revision, review access logs,
+and rotate JWT/session secrets, database credentials, provider tokens, and
+connected broker or exchange credentials. Preserve access to credentials
+encrypted with the previous `CREDENTIAL_ENCRYPTION_KEY` until they have been
+re-encrypted or re-entered; changing that key without a migration makes stored
+credentials unreadable.
+
+### September 2026 — Broker and strategy execution hardening (resolved)
+
+Two authenticated security issues involving broker endpoint validation and
+strategy compilation resource controls were resolved on **September 29,
+2026**. The update restricts broker connections to approved endpoints and
+enforces process isolation and resource limits during strategy discovery.
+
+Operators should upgrade to the latest supported revision. Deployments that
+allowed untrusted users to access broker configuration before the update
+should review relevant logs and rotate affected broker credentials as a
+precaution. Additional technical details are intentionally limited here to
+support responsible disclosure.
+
+## Security Acknowledgments
+
+- **Risma Ajul**, security researcher — responsibly disclosed the critical JWT
+  authentication and authorization bypass resolved in July 2026. We sincerely
+  thank Risma for the responsible report and for helping make QuantDinger safer.
+- **Satrio**, independent security researcher — responsibly disclosed a
+  critical runtime-built attribute-traversal issue in the strategy and
+  indicator execution boundary in August 2026. The research was performed
+  against the public repository only and did not access the hosted service or
+  real user data.
+- **Jo Arsy**, security researcher — responsibly disclosed an issue involving
+  improper trust of client-supplied proxy IP headers in September 2026. The
+  report helped strengthen QuantDinger's IP-based authentication and anti-abuse
+  controls.
+- **Dan Aridor and the [SPR{K3](https://sprk3.com/) security research team** —
+  responsibly disclosed two backend security issues resolved in September
+  2026. Their clear reports and coordinated-disclosure approach helped us
+  validate and remediate both issues safely.
+
+---
+
 ## ⚠️ Disclaimer
 
 QuantDinger is provided **as-is**, without warranty.

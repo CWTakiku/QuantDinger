@@ -48,7 +48,7 @@ def _seed_default_watchlist(db, user_id: int):
                 instrument_id, created_at, updated_at
             )
             VALUES (?, ?, ?, ?, ?, ?, '', NOW(), NOW())
-            ON CONFLICT (user_id, market, symbol) DO NOTHING
+            ON CONFLICT (user_id, market, symbol, exchange_id, market_type, instrument_id) DO NOTHING
             """,
             (user_id, market, symbol, name, "", "spot"),
         )
@@ -913,7 +913,10 @@ class UserService:
                 cur.execute(
                     """
                     UPDATE qd_users
-                    SET password_hash = ?, password_changed_at = NOW(), updated_at = NOW()
+                    SET password_hash = ?,
+                        password_changed_at = NOW(),
+                        token_version = COALESCE(token_version, 1) + 1,
+                        updated_at = NOW()
                     WHERE id = ?
                     """,
                     (password_hash, user_id),

@@ -98,14 +98,18 @@ def load_strategy_configs(strategy_id: int) -> Dict[str, Any]:
         cur = db.cursor()
         cur.execute(
             """
-            SELECT id, user_id, symbol, exchange_config, trading_config, market_type, leverage, execution_mode, market_category
+            SELECT id, user_id, symbol, exchange_config, trading_config, market_type,
+                   leverage, execution_mode, market_category, status
             FROM qd_strategies_trading
             WHERE id = %s
             """,
             (int(strategy_id),),
         )
-        row = cur.fetchone() or {}
+        row = cur.fetchone()
         cur.close()
+
+    if not row:
+        raise LookupError("strategyV2.strategyNotFound")
 
     exchange_config = _safe_json_loads(row.get("exchange_config"), {})
     trading_config = _safe_json_loads(row.get("trading_config"), {})
@@ -116,7 +120,7 @@ def load_strategy_configs(strategy_id: int) -> Dict[str, Any]:
 
     # market_category MUST come from the strategy row; if it's empty (legacy or
     # corrupt rows), infer from exchange_id rather than silently defaulting to
-    # Crypto — that is what historically caused TSLA to be queried via CCXT.
+    # Crypto; otherwise an equity symbol could be sent to a crypto venue.
     raw_mc = (row.get("market_category") or "").strip()
     if raw_mc:
         market_category = raw_mc
@@ -147,6 +151,7 @@ def load_strategy_configs(strategy_id: int) -> Dict[str, Any]:
         "leverage": leverage,
         "execution_mode": execution_mode,
         "market_category": market_category,
+        "status": str(row.get("status") or "").strip().lower(),
     }
 
 
@@ -156,7 +161,7 @@ def _load_credential_config(credential_id: int, user_id: int = 1) -> Dict[str, A
         cur = db.cursor()
         cur.execute(
             """
-            SELECT encrypted_config
+            SELECT exchange_id, encrypted_config
             FROM qd_exchange_credentials
             WHERE id = %s AND user_id = %s
             """,
@@ -170,7 +175,13 @@ def _load_credential_config(credential_id: int, user_id: int = 1) -> Dict[str, A
     except ValueError as e:
         logger.warning(f"decrypt credential_id={credential_id}: {e}")
         return {}
-    return _safe_json_loads(plain, {}) or {}
+    config = _safe_json_loads(plain, {}) or {}
+    if not isinstance(config, dict):
+        config = {}
+    exchange_id = str(row.get("exchange_id") or "").strip().lower()
+    if exchange_id:
+        config.setdefault("exchange_id", exchange_id)
+    return config
 
 
 def resolve_exchange_config(exchange_config: Dict[str, Any], user_id: int = 1) -> Dict[str, Any]:
@@ -273,5 +284,4 @@ def coalesce_exchange_config_from_payload(payload: Dict[str, Any]) -> Dict[str, 
             ex_cfg["credential_id"] = cred
 
     return ex_cfg
-
 
