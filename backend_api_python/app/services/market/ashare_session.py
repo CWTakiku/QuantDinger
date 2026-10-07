@@ -6,13 +6,61 @@ Independent copy of rdagent-bridge semantics — keep in sync when changing rule
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Callable
 from zoneinfo import ZoneInfo
 
 SH_TZ = ZoneInfo("Asia/Shanghai")
 CLOSE_HOUR = 15
 CLOSE_MINUTE = 5
+
+_XSHG_CALENDAR = None
+
+
+def _xshg_calendar():
+    global _XSHG_CALENDAR
+    if _XSHG_CALENDAR is not None:
+        return _XSHG_CALENDAR
+    try:
+        import exchange_calendars as exchange_calendars
+
+        _XSHG_CALENDAR = exchange_calendars.get_calendar("XSHG")
+    except Exception:
+        _XSHG_CALENDAR = False
+    return _XSHG_CALENDAR
+
+
+def is_ashare_trading_day(
+    as_of: date | str,
+    *,
+    is_open_fn: Callable[[str], bool] | None = None,
+) -> bool:
+    """True when *as_of* is an A-share (XSHG) trading session day."""
+    target = _parse_as_of(as_of)
+    if target is None:
+        return False
+    as_of_s = target.isoformat()
+    if is_open_fn is not None:
+        return bool(is_open_fn(as_of_s))
+    cal = _xshg_calendar()
+    if cal:
+        import pandas as pd
+
+        return bool(cal.is_session(pd.Timestamp(as_of_s)))
+    # Fallback when exchange_calendars is unavailable (unit tests).
+    return target.weekday() < 5
+
+
+def latest_ashare_trading_day(on_or_before: date | str) -> date | None:
+    """Newest A-share session day on/before *on_or_before* (looks back 30 days)."""
+    target = _parse_as_of(on_or_before)
+    if target is None:
+        return None
+    for offset in range(31):
+        day = target - timedelta(days=offset)
+        if is_ashare_trading_day(day):
+            return day
+    return None
 
 
 @dataclass(frozen=True)
@@ -46,11 +94,7 @@ def decide_ashare_daily_sync(
     now_sh = now.astimezone(SH_TZ) if now else datetime.now(SH_TZ)
     today = now_sh.date()
 
-    if is_open_fn is None:
-        # default: Mon–Fri only (tests inject Tushare-backed fn in production path)
-        trading = target.weekday() < 5
-    else:
-        trading = bool(is_open_fn(as_of_s))
+    trading = is_ashare_trading_day(target, is_open_fn=is_open_fn)
 
     if target > today:
         return AshareSyncDecision(False, "future", as_of_s, trading)

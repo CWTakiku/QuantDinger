@@ -40,7 +40,59 @@ def test_build_composition_factor_loop():
     assert out["kind"] == "factor"
     assert out["learner"] is None
     assert out["factors"][0]["name"] == "mom20"
+    assert out["factors"][0]["role"] == "loop"
+    assert out["factor_counts"] == {"total": 1, "sota": 0, "loop_new": 1}
     assert out["bridge_error"] is None
+
+
+def test_build_composition_merges_sota_and_loop_new_factors():
+    """Mirror RD-Agent runner: accepted SOTA + this loop's new factors."""
+    model = {
+        "kind": "factor",
+        "provenance_json": {"session_id": "sess-1", "loop_index": 15, "mode": "factor"},
+    }
+
+    def fake_detail(session_id, include=None):
+        return {
+            "loops": [
+                {
+                    "loop_index": 15,
+                    "kind": "factor",
+                    "artifacts": [
+                        {
+                            "kind": "factor",
+                            "name": "CS_Pooled_OLS_Predicted_Return_60",
+                            "formulation": "pred",
+                            "description": "new",
+                        },
+                        {
+                            "kind": "factor",
+                            "name": "Momentum_5",
+                            "formulation": "updated",
+                            "description": "also in sota",
+                        },
+                    ],
+                }
+            ],
+            "sota_library": [
+                {"name": "Momentum_5", "formulation": "old", "description": "sota"},
+                {"name": "Volatility_10", "formulation": "vol", "description": "sota"},
+            ],
+        }
+
+    out = build_quant_model_composition(model, detail_fetcher=fake_detail)
+    names = [f["name"] for f in out["factors"]]
+    assert names == [
+        "Momentum_5",
+        "Volatility_10",
+        "CS_Pooled_OLS_Predicted_Return_60",
+    ]
+    by_name = {f["name"]: f for f in out["factors"]}
+    assert by_name["Momentum_5"]["role"] == "both"
+    assert by_name["Momentum_5"]["formulation"] == "updated"
+    assert by_name["Volatility_10"]["role"] == "sota"
+    assert by_name["CS_Pooled_OLS_Predicted_Return_60"]["role"] == "loop"
+    assert out["factor_counts"] == {"total": 3, "sota": 2, "loop_new": 1}
 
 
 def test_build_composition_model_loop_with_sota_factors():

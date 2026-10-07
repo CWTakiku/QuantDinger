@@ -14,25 +14,83 @@ def _empty(kind: str, session_id: str, loop_index: int | None, error: str | None
         "loop_index": loop_index,
         "learner": None,
         "factors": [],
+        "factor_counts": {"total": 0, "sota": 0, "loop_new": 0},
         "bridge_error": error,
     }
 
 
-def _factor_rows(items: list[Any] | None) -> list[dict[str, Any]]:
+def _factor_rows(items: list[Any] | None, *, role: str) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for item in items or []:
         if not isinstance(item, dict):
             continue
         if item.get("kind") and item.get("kind") != "factor":
             continue
+        name = item.get("name")
+        if not name:
+            continue
         rows.append(
             {
-                "name": item.get("name"),
+                "name": name,
                 "formulation": item.get("formulation"),
                 "description": item.get("description"),
+                "role": role,
             }
         )
     return rows
+
+
+def _merge_factor_rows(
+    *,
+    loop_rows: list[dict[str, Any]],
+    sota_rows: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Combine accepted SOTA library with this loop's factors (same set runner/infer use).
+
+    Order: SOTA names first (bridge sorted order), then loop-only new factors.
+    role: sota | loop | both
+    """
+    by_name: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+
+    for row in sota_rows:
+        name = str(row.get("name") or "").strip()
+        if not name or name in by_name:
+            continue
+        by_name[name] = {
+            "name": name,
+            "formulation": row.get("formulation"),
+            "description": row.get("description"),
+            "role": "sota",
+        }
+        order.append(name)
+
+    loop_new = 0
+    for row in loop_rows:
+        name = str(row.get("name") or "").strip()
+        if not name:
+            continue
+        existing = by_name.get(name)
+        if existing is None:
+            by_name[name] = {
+                "name": name,
+                "formulation": row.get("formulation"),
+                "description": row.get("description"),
+                "role": "loop",
+            }
+            order.append(name)
+            loop_new += 1
+            continue
+        existing["role"] = "both"
+        if row.get("formulation"):
+            existing["formulation"] = row.get("formulation")
+        if row.get("description"):
+            existing["description"] = row.get("description")
+
+    factors = [by_name[name] for name in order]
+    sota_n = sum(1 for f in factors if f["role"] in ("sota", "both"))
+    counts = {"total": len(factors), "sota": sota_n, "loop_new": loop_new}
+    return factors, counts
 
 
 def _parse_loop_index(raw: Any) -> int | None:
@@ -107,24 +165,23 @@ def build_quant_model_composition(
     loop_kind = str(loop.get("kind") or "").strip().lower()
     effective_kind = loop_kind if loop_kind in ("factor", "model") else kind
 
-    factors: list[dict[str, Any]] = []
-    learner = None
     artifacts = loop.get("artifacts") or loop.get("factors") or []
     sota = detail.get("sota_library") if isinstance(detail, dict) else None
-    if effective_kind == "factor":
-        factors = _factor_rows(artifacts)
-        if not factors:
-            factors = _factor_rows(sota)
-        learner = None
-    else:
+    loop_factor_rows = _factor_rows(artifacts, role="loop")
+    sota_factor_rows = _factor_rows(sota, role="sota")
+
+    learner = None
+    if effective_kind == "model":
         model_art = next(
             (a for a in artifacts if isinstance(a, dict) and a.get("kind") == "model"),
             None,
         )
         learner = _learner_from_artifact(model_art)
-        factors = _factor_rows(artifacts)
-        if not factors:
-            factors = _factor_rows(sota)
+
+    factors, factor_counts = _merge_factor_rows(
+        loop_rows=loop_factor_rows,
+        sota_rows=sota_factor_rows,
+    )
 
     return {
         "available": True,
@@ -133,5 +190,6 @@ def build_quant_model_composition(
         "loop_index": loop_index,
         "learner": learner,
         "factors": factors,
+        "factor_counts": factor_counts,
         "bridge_error": None,
     }

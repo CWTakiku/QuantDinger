@@ -820,6 +820,18 @@ class TradingExecutor:
                 "commission",
                 self._to_ratio(trading_config.get("commission") or 0.001),
             )
+            ashare_only = bool(candidates) and all(
+                str(member.get("market") or "").upper() in {"CNSTOCK", "CN"}
+                for member in candidates
+            )
+            if ashare_only:
+                from app.services.market.ashare_session import is_ashare_trading_day
+
+                schedule_timezone = "Asia/Shanghai"
+                trading_day_fn = is_ashare_trading_day
+            else:
+                schedule_timezone = self._load_schedule_timezone(user_id)
+                trading_day_fn = None
             session = StrategyV2LiveSession(
                 code=code,
                 frames=frames,
@@ -827,7 +839,8 @@ class TradingExecutor:
                 initial_capital=initial_capital,
                 params=runtime_params,
                 universe_resolver=resolve_universe,
-                schedule_timezone=self._load_schedule_timezone(user_id),
+                schedule_timezone=schedule_timezone,
+                trading_day_fn=trading_day_fn,
             )
             primary = candidates[0]
             runtime_run = ensure_strategy_run(

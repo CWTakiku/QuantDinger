@@ -6,8 +6,9 @@ import inspect
 import math
 import calendar
 from dataclasses import dataclass, field, replace
+from datetime import date, timedelta
 from functools import lru_cache
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import pandas as pd
@@ -44,7 +45,7 @@ def _soft_factor_error_code(exc: Exception) -> str:
 
 
 from .contract import CompiledStrategyV2, StrategyV2ContractError, compile_strategy_v2
-from .data import MultiAssetDataPortal
+from .data import MultiAssetDataPortal, StrategyDataError
 from .frequencies import normalize_frequency, periods_per_year
 from .protection import ProtectionDecision, ProtectionEngine, ProtectionSpec, ProtectionState
 from app.markets.cn_stock.lot_rules import cn_stock_lot_spec, cn_stock_min_open
@@ -365,6 +366,8 @@ class StrategyRuntimeContext:
         self.live_order_cancellation = False
         self._last_exit_reasons: dict[str, str] = {}
         self._enhanced_index_records: list[dict[str, Any]] = []
+        # Live sessions: one symbol without market data must not abort a rebalance.
+        self.skip_unavailable_orders = False
         self.logger = StrategyRuntimeLogger(self.log)
 
     def invoke_handler(self, name: str, handler: Any, args: tuple[Any, ...]) -> Any:
@@ -709,7 +712,13 @@ class StrategyRuntimeContext:
         value: object,
         kwargs: Mapping[str, Any],
     ) -> str | None:
-        key = self.portal.resolve_key(symbol)
+        try:
+            key = self.portal.resolve_key(symbol)
+        except StrategyDataError:
+            if not self.skip_unavailable_orders:
+                raise
+            self.logger.warning(f"Order skipped: no market data for {symbol}")
+            return None
         try:
             number = float(value)
         except Exception as exc:
@@ -2489,6 +2498,7 @@ class StrategyV2LiveSession:
         params: Mapping[str, Any] | None = None,
         universe_resolver=None,
         schedule_timezone: str = "UTC",
+        trading_day_fn: Callable[[date], bool] | None = None,
     ) -> None:
         self.program = compile_strategy_v2(code)
         self._universe_resolver = universe_resolver
@@ -2501,6 +2511,12 @@ class StrategyV2LiveSession:
         self.portfolio = PortfolioState(initial_capital, initial_capital, total_value=initial_capital)
         self.context = StrategyRuntimeContext(portal=self.portal, portfolio=self.portfolio, params=params)
         self.context.live_order_cancellation = True
+        self.context.skip_unavailable_orders = True
+        # When set, schedules follow this exchange calendar: each period fires
+        # once on its first session day on/after the nominal day, including a
+        # same-day catch-up when the session starts after the scheduled time.
+        self.trading_day_fn = trading_day_fn
+        self.fired_schedule_periods: dict[str, str] = {}
         self.persist_strategy_state = (
             _truthy(self.program.namespace.get("PERSIST_RUNTIME_STATE"))
             or _truthy(self.context.params.get("persist_runtime_state"))
@@ -2545,7 +2561,16 @@ class StrategyV2LiveSession:
             self._invoke("before_trading_start", self.context, self.context.data)
 
         previous_schedule_check = self.last_schedule_check
-        if previous_schedule_check is not None and schedule_clock > previous_schedule_check:
+        if self.trading_day_fn is not None:
+            for index, schedule in enumerate(self.program.manifest.schedules):
+                period = self._calendar_schedule_period_due(schedule, schedule_clock)
+                key = self._schedule_key(index, schedule)
+                if period is None or self.fired_schedule_periods.get(key) == period:
+                    continue
+                self.fired_schedule_periods[key] = period
+                self.context.current_dt = schedule_clock
+                self._invoke(schedule.callback, self.context, self.context.data)
+        elif previous_schedule_check is not None and schedule_clock > previous_schedule_check:
             self.context.current_dt = schedule_clock
             for schedule in self.program.manifest.schedules:
                 if StrategyV2BacktestRunner._schedule_due(
@@ -2568,6 +2593,37 @@ class StrategyV2LiveSession:
         if bar_advanced:
             self.last_processed = timestamp
         return orders, logs, timestamp
+
+    @staticmethod
+    def _schedule_key(index: int, schedule) -> str:
+        return f"{index}:{schedule.callback}:{schedule.frequency}"
+
+    def _calendar_schedule_period_due(self, schedule, clock: pd.Timestamp) -> str | None:
+        """Period id when *schedule* is due at *clock* under the trading calendar."""
+        today = clock.date()
+        if schedule.frequency == "daily":
+            period = today.isoformat()
+            candidates = [today]
+        elif schedule.frequency == "weekly":
+            iso_year, iso_week, iso_weekday = today.isocalendar()
+            period = f"{iso_year}-W{iso_week:02d}"
+            target = max(1, min(7, int(schedule.weekday or 1)))
+            nominal = today + timedelta(days=target - iso_weekday)
+            candidates = [nominal + timedelta(days=i) for i in range(8 - target)]
+        elif schedule.frequency == "monthly":
+            period = f"{today.year}-{today.month:02d}"
+            last_day = calendar.monthrange(today.year, today.month)[1]
+            target = min(max(1, int(schedule.monthday or 1)), last_day)
+            candidates = [date(today.year, today.month, d) for d in range(target, last_day + 1)]
+        else:
+            return None
+        effective = next((day for day in candidates if self.trading_day_fn(day)), None)
+        if effective != today:
+            return None
+        scheduled_at = clock.normalize() + _parse_schedule_time(schedule.time)
+        if clock < scheduled_at:
+            return None
+        return period
 
     def _schedule_clock(self, value: Any = None) -> pd.Timestamp:
         if value is None:
@@ -2777,6 +2833,8 @@ class StrategyV2LiveSession:
         }
         if self.context._cancelled_order_ids:
             snapshot["cancelRequests"] = sorted(self.context._cancelled_order_ids)
+        if self.fired_schedule_periods:
+            snapshot["firedSchedulePeriods"] = dict(self.fired_schedule_periods)
         if self.persist_strategy_state:
             snapshot.update({
                 "strategyState": _snapshot_state_value(
@@ -2808,6 +2866,9 @@ class StrategyV2LiveSession:
         elif "states" in raw or "specs" in raw:
             # Backward compatibility with the old protection-only snapshot.
             self.restore_protection_snapshot(raw)
+        fired = raw.get("firedSchedulePeriods")
+        if isinstance(fired, Mapping):
+            self.fired_schedule_periods = {str(k): str(v) for k, v in fired.items()}
         if self.persist_strategy_state:
             strategy_state = raw.get("strategyState")
             if isinstance(strategy_state, Mapping):

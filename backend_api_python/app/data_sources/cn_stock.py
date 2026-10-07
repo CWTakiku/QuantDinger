@@ -70,12 +70,14 @@ class CNStockDataSource(BaseDataSource):
         tf = normalize_chart_timeframe(timeframe)
         lim = max(int(limit or 300), 1)
 
-        # Tier 0: Tushare daily when it already includes today's Shanghai bar.
+        # Tier 0: Tushare daily when it already includes the latest session bar.
         # Otherwise fall through — Tushare often lags the live session vs Tencent.
+        tushare_rows: List[Dict[str, Any]] = []
         if tf in ("1D",) and is_tushare_configured():
             rows = fetch_tushare_daily_klines(
                 tencent_code=code, limit=lim, before_time=before_time
             )
+            tushare_rows = rows or []
             if rows and (before_time is not None or daily_bars_cover_today(rows)):
                 return self.filter_and_limit(
                     rows,
@@ -137,6 +139,8 @@ class CNStockDataSource(BaseDataSource):
             )
         else:
             rows = []
+        if not rows:
+            rows = tushare_rows
 
         return self.filter_and_limit(
             rows,

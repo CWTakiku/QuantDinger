@@ -30,6 +30,7 @@ def test_get_kline_falls_through_when_tushare_stale(monkeypatch):
     fresh = [{"time": _today_shanghai_midnight_unix(), "open": 2, "high": 3, "low": 1, "close": 2.5, "volume": 20}]
     src = CNStockDataSource()
     with patch("app.data_sources.cn_stock.fetch_tushare_daily_klines", return_value=stale), \
+         patch("app.data_sources.cn_stock.daily_bars_cover_today", return_value=False), \
          patch("app.data_sources.cn_stock.fetch_twelvedata_klines", return_value=[]), \
          patch("app.data_sources.cn_stock.fetch_kline", return_value=[[]]), \
          patch("app.data_sources.cn_stock.tencent_kline_rows_to_dicts", return_value=fresh), \
@@ -38,3 +39,19 @@ def test_get_kline_falls_through_when_tushare_stale(monkeypatch):
          patch("app.data_sources.cn_stock.fetch_akshare_weekly_klines", return_value=[]):
         out = src.get_kline("600519.SH", "1d", 10)
     assert out[0]["close"] == 2.5
+
+
+def test_get_kline_returns_stale_tushare_when_other_sources_empty(monkeypatch):
+    monkeypatch.setenv("TUSHARE_TOKEN", "dummy")
+    stale = [{"time": _today_shanghai_midnight_unix() - 86400, "open": 1, "high": 2, "low": 0.5, "close": 1.5, "volume": 10}]
+    src = CNStockDataSource()
+    with patch("app.data_sources.cn_stock.fetch_tushare_daily_klines", return_value=stale), \
+         patch("app.data_sources.cn_stock.daily_bars_cover_today", return_value=False), \
+         patch("app.data_sources.cn_stock.fetch_twelvedata_klines", return_value=[]), \
+         patch("app.data_sources.cn_stock.fetch_kline", return_value=[]), \
+         patch("app.data_sources.cn_stock.tencent_kline_rows_to_dicts", return_value=[]), \
+         patch("app.data_sources.cn_stock.fetch_yfinance_klines", return_value=[]), \
+         patch("app.data_sources.cn_stock.fetch_akshare_minute_klines", return_value=[]), \
+         patch("app.data_sources.cn_stock.fetch_akshare_weekly_klines", return_value=[]):
+        out = src.get_kline("600519.SH", "1d", 10)
+    assert [r["close"] for r in out] == [1.5]

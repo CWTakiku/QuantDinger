@@ -37,17 +37,23 @@ def test_trade_date_maps_to_shanghai_midnight():
     assert local.hour == 0 and local.minute == 0
 
 
-def test_daily_bars_cover_today():
-    today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
-    today_ts = int(
-        datetime(today.year, today.month, today.day, tzinfo=ZoneInfo("Asia/Shanghai")).timestamp()
-    )
+def test_daily_bars_cover_today(monkeypatch):
+    sh = ZoneInfo("Asia/Shanghai")
+
+    class _FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 10, 9, 15, 30, tzinfo=sh)
+
+    monkeypatch.setattr(tushare_cn, "datetime", _FrozenDatetime)
+    today_ts = int(datetime(2026, 10, 9, tzinfo=sh).timestamp())
     assert daily_bars_cover_today([{"time": today_ts}]) is True
     assert daily_bars_cover_today([{"time": today_ts - 86400}]) is False
     assert daily_bars_cover_today([]) is False
 
 
 def test_build_pro_uses_token_and_custom_http_url(monkeypatch):
+    monkeypatch.delenv("TUSHARE_API_KEY", raising=False)
     monkeypatch.setenv("TUSHARE_TOKEN", "dummy-token")
     monkeypatch.setenv("TUSHARE_HTTP_URL", "https://example.test/api")
     tushare_cn._pro_cache.clear()

@@ -126,7 +126,6 @@ def test_all_present_skips_infer(monkeypatch):
 
 
 def test_weekend_as_of_covered_by_prior_trading_day(monkeypatch):
-    """Sunday lag dates are covered when Friday scores exist (PIT)."""
     _patch_qlib(monkeypatch)
     monkeypatch.setattr(
         "app.services.quant_models.ensure_scores.load_external_alpha_scores_as_of",
@@ -152,6 +151,84 @@ def test_weekend_as_of_covered_by_prior_trading_day(monkeypatch):
     assert out["missing_before"] == []
     assert out["still_missing"] == []
     assert out["effective_as_ofs"] == ["2025-08-08"]
+
+
+def test_holiday_as_ofs_do_not_block_ensure(monkeypatch):
+    """National-day lag dates are PIT-served; ensure must not fail the backtest job."""
+    _patch_qlib(monkeypatch)
+    monkeypatch.setattr(
+        "app.services.quant_models.ensure_scores.load_external_alpha_scores_as_of",
+        lambda as_of, **kwargs: (
+            pd.Series({f"CNStock:60000{i}.SH": 1.0 for i in range(15)})
+            if str(as_of)[:10] >= "2025-09-30"
+            else pd.Series(dtype=float)
+        ),
+    )
+    monkeypatch.setattr(
+        "app.services.quant_models.ensure_scores.list_external_alpha_as_ofs",
+        lambda **kwargs: ["2025-09-30"],
+    )
+    monkeypatch.setattr(
+        "app.services.quant_models.ensure_scores.infer_and_import_session_scores",
+        lambda *args, **kwargs: pytest.fail("should not infer — holiday uses PIT"),
+    )
+
+    requested = [
+        date(2025, 10, 1),
+        date(2025, 10, 2),
+        date(2025, 10, 3),
+        date(2025, 10, 6),
+    ]
+    out = ensure_quant_model_scores(_sample_model(), requested)
+    assert out["missing_before"] == []
+    assert out["still_missing"] == []
+    assert out["effective_as_ofs"] == ["2025-09-30"]
+
+
+def test_sunday_lag_date_without_pit_does_not_block(monkeypatch):
+    """Sunday score-as_of with no prior panel must not fail ensure (PIT at runtime)."""
+    _patch_qlib(monkeypatch)
+    monkeypatch.setattr(
+        "app.services.quant_models.ensure_scores.load_external_alpha_scores_as_of",
+        lambda as_of, **kwargs: pd.Series(dtype=float),
+    )
+    monkeypatch.setattr(
+        "app.services.quant_models.ensure_scores.list_external_alpha_as_ofs",
+        lambda **kwargs: [],
+    )
+    monkeypatch.setattr(
+        "app.services.quant_models.ensure_scores.infer_and_import_session_scores",
+        lambda *args, **kwargs: pytest.fail("non-session date must not infer"),
+    )
+    out = ensure_quant_model_scores(_sample_model(), [date(2025, 8, 3)])
+    assert out["missing_before"] == []
+    assert out["still_missing"] == []
+
+
+def test_candidate_as_ofs_skips_holiday_holes(monkeypatch):
+    from app.services.quant_models.ensure_scores import _candidate_as_ofs
+
+    panel = ["2025-09-30", "2025-10-09"]
+    requested = ["2025-10-09"]
+    candidates = _candidate_as_ofs(requested, panel)
+    assert "2025-10-01" not in candidates
+    assert "2025-10-02" not in candidates
+    assert "2025-10-06" not in candidates
+    assert "2025-09-30" in candidates
+    assert "2025-10-09" in candidates
+
+
+def test_holiday_only_request_skips_infer(monkeypatch):
+    """Holiday-only gaps should not enter missing_before or still_missing."""
+    _patch_qlib(monkeypatch)
+    _patch_pit_coverage(monkeypatch, {"2025-09-30"})
+    monkeypatch.setattr(
+        "app.services.quant_models.ensure_scores.infer_and_import_session_scores",
+        lambda *args, **kwargs: pytest.fail("holiday-only request must not infer"),
+    )
+    out = ensure_quant_model_scores(_sample_model(), [date(2025, 10, 1)])
+    assert out["missing_before"] == []
+    assert out["still_missing"] == []
 
 
 def test_ensure_not_closed_skips_infer(monkeypatch):

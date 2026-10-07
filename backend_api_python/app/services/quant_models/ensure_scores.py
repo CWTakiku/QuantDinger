@@ -10,7 +10,7 @@ from app.services.external_alpha.store import (
     list_external_alpha_as_ofs,
     load_external_alpha_scores_as_of,
 )
-from app.services.market.ashare_session import decide_ashare_daily_sync
+from app.services.market.ashare_session import decide_ashare_daily_sync, is_ashare_trading_day
 from app.services.rdagent_bridge.client import RdAgentBridgeClient
 from app.services.rdagent_bridge.errors import RdAgentBridgeError
 from app.services.rdagent_bridge.import_session import infer_and_import_session_scores
@@ -55,15 +55,16 @@ def _as_of_covered(
 ENSURE_SCORE_LOCAL_CATCHUP_DAYS = 30
 
 
-def _iter_weekdays(start: date, end: date) -> list[str]:
-    """Inclusive Mon–Fri ISO dates from *start* through *end*."""
+def _iter_trading_days(start: date, end: date) -> list[str]:
+    """Inclusive A-share trading session ISO dates from *start* through *end*."""
     if end < start:
         return []
     out: list[str] = []
     cursor = start
     while cursor <= end:
-        if cursor.weekday() < 5:
-            out.append(cursor.isoformat())
+        day = cursor.isoformat()
+        if is_ashare_trading_day(day):
+            out.append(day)
         cursor += timedelta(days=1)
     return out
 
@@ -95,8 +96,24 @@ def _candidate_as_ofs(requested: list[str], panel: list[str]) -> list[str]:
         if (want_hi_d - day).days <= ENSURE_SCORE_LOCAL_CATCHUP_DAYS:
             window_lo = min(window_lo, day)
 
-    candidates.update(_iter_weekdays(window_lo, want_hi_d))
+    candidates.update(_iter_trading_days(window_lo, want_hi_d))
     return sorted(candidates)
+
+
+def _non_trading_pit_covered(
+    as_of: str,
+    *,
+    source: str,
+    version: str,
+    min_names: int,
+    max_panel: str,
+) -> bool:
+    """Non-session as_ofs (weekends / holidays) only need PIT coverage."""
+    if not max_panel:
+        return False
+    return _as_of_covered(
+        as_of, source=source, version=version, min_names=min_names
+    )
 
 
 def _missing_as_ofs(
@@ -108,11 +125,11 @@ def _missing_as_ofs(
 ) -> list[str]:
     """Dates that still need infer / import.
 
-    - Exact panel weekday with enough names → covered.
-    - Sat/Sun → PIT cover from prior trading-day scores (strategy lag).
-    - Weekday without an exact panel row → missing, even if PIT would fall
+    - Exact panel trading day with enough names → covered.
+    - Non-trading day (weekend / holiday) → PIT cover from prior session scores.
+    - Trading day without an exact panel row → missing, even if PIT would fall
       back to an older day (prevents permanent interior holes).
-    - Requesting a tip beyond a *nearby* panel tip expands local weekdays only
+    - Requesting a tip beyond a *nearby* panel tip expands local trading days only
       (see ``ENSURE_SCORE_LOCAL_CATCHUP_DAYS``).
     """
     panel = list_external_alpha_as_ofs(source=source, version=version)
@@ -121,26 +138,24 @@ def _missing_as_ofs(
     min_n = max(1, int(min_names))
     missing: list[str] = []
     for d in _candidate_as_ofs(requested, panel):
-        try:
-            weekday = date.fromisoformat(d).weekday()
-        except ValueError:
-            weekday = -1
+        if not is_ashare_trading_day(d):
+            if _non_trading_pit_covered(
+                d,
+                source=source,
+                version=version,
+                min_names=min_n,
+                max_panel=max_panel,
+            ):
+                continue
+            # Infer cannot produce non-session cross-sections; never block ensure.
+            continue
 
         if d in panel_set and _as_of_covered(
             d, source=source, version=version, min_names=min_n
         ):
             continue
 
-        if weekday >= 5:
-            # Weekend lag dates stay PIT-covered when prior scores exist.
-            if max_panel and _as_of_covered(
-                d, source=source, version=version, min_names=min_n
-            ):
-                continue
-            missing.append(d)
-            continue
-
-        # Weekday: require an exact panel cross-section (no PIT hide).
+        # Trading day: require an exact panel cross-section (no PIT hide).
         missing.append(d)
     return missing
 
@@ -254,10 +269,14 @@ def ensure_quant_model_scores(
                 f"所选交易日尚未到来，不会生成未来日真实分数"
                 + (f"，将使用最近已有分数日 {tip_day}" if tip_day else "")
             )
+        # Non-trading lag dates never require infer; only syncable trading gaps block.
+        still_missing = _missing_as_ofs(
+            missing, source=source, version=version, min_names=min_names
+        )
         return {
             "missing_before": missing,
             "inferred": 0,
-            "still_missing": missing,
+            "still_missing": still_missing,
             "effective_as_ofs": _effective_as_ofs_for_requested(requested, panel),
             "sync_reason": reason,
             "user_hint": hint,

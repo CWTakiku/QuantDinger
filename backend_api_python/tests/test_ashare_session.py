@@ -1,7 +1,7 @@
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
-from app.services.market.ashare_session import decide_ashare_daily_sync
+from app.services.market.ashare_session import decide_ashare_daily_sync, is_ashare_trading_day
 
 SH = ZoneInfo("Asia/Shanghai")
 
@@ -53,3 +53,8 @@ def test_future_rejected():
     )
     assert d.ok is False
     assert d.reason == "future"
+
+
+def test_national_day_not_trading_without_override():
+    assert is_ashare_trading_day("2025-10-01") is False
+    assert is_ashare_trading_day("2025-10-09") is True

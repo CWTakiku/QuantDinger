@@ -81,7 +81,8 @@ ADVANCED_KEYS = {
     'FINNHUB_API_KEY', 'FINNHUB_FREE_ONLY',
     'TRADING_ECONOMICS_CLIENT', 'TRADING_ECONOMICS_KEY',
     'COINGLASS_API_KEY', 'CRYPTOQUANT_API_KEY', 'TIINGO_API_KEY',
-    'TWELVE_DATA_API_KEY', 'TUSHARE_TOKEN', 'TUSHARE_HTTP_URL', 'ADANOS_API_KEY',
+    'TWELVE_DATA_API_KEY', 'TUSHARE_API_KEY', 'TUSHARE_REST_URL', 'TUSHARE_REST_BACKUP_URL',
+    'TUSHARE_TOKEN', 'TUSHARE_HTTP_URL', 'ADANOS_API_KEY',
     # Agent gateway (operator-level)
     'AGENT_JOBS_MAX_WORKERS',
     'ENABLE_PENDING_ORDER_WORKER', 'DISABLE_RESTORE_RUNNING_STRATEGIES',
@@ -1100,6 +1101,29 @@ CONFIG_SCHEMA = {
                 'link': 'https://twelvedata.com/apikey',
                 'link_text': 'settings.link.getApiKey',
                 'description': 'Twelve Data API key for CN/HK stock K-lines (free 800 credits/day)'
+            },
+            {
+                'key': 'TUSHARE_API_KEY',
+                'label': 'Tushare REST API Key',
+                'type': 'password',
+                'required': False,
+                'description': 'X-API-Key for the Tushare-compatible REST gateway. When set it takes priority over TUSHARE_TOKEN.'
+            },
+            {
+                'key': 'TUSHARE_REST_URL',
+                'label': 'Tushare REST URL',
+                'type': 'text',
+                'required': False,
+                'default': 'https://tl.kaixin8.top/tushare/pro',
+                'description': 'Primary REST gateway base; requests go to {base}/{api_name}.'
+            },
+            {
+                'key': 'TUSHARE_REST_BACKUP_URL',
+                'label': 'Tushare REST Backup URL',
+                'type': 'text',
+                'required': False,
+                'default': 'http://datahubco.com/app-api/openapi/v1/tushare',
+                'description': 'Backup REST gateway used when the primary fails (API names with dashes).'
             },
             {
                 'key': 'TUSHARE_TOKEN',

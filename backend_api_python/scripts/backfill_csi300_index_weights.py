@@ -6,7 +6,7 @@ Usage (inside backend container or host with DB + Tushare):
     SKIP_STARTUP_HOOKS=1 python scripts/backfill_csi300_index_weights.py \\
         --start 20150101 --end 20210830
 
-Requires TUSHARE_TOKEN (and optional TUSHARE_HTTP_URL) in the environment.
+Requires TUSHARE_API_KEY (REST gateway) or TUSHARE_TOKEN in the environment.
 """
 
 from __future__ import annotations
@@ -50,15 +50,11 @@ def _load_dotenv() -> None:
 
 
 def _build_pro():
-    import tushare as ts
+    from app.data_sources.tushare_cn import _build_pro as build_shared_pro
 
-    token = str(os.environ.get("TUSHARE_TOKEN") or "").strip()
-    if not token:
-        raise RuntimeError("TUSHARE_TOKEN is not set")
-    pro = ts.pro_api(token)
-    http_url = str(os.environ.get("TUSHARE_HTTP_URL") or "").strip()
-    if http_url:
-        pro._DataApi__http_url = http_url
+    pro = build_shared_pro()
+    if pro is None:
+        raise RuntimeError("TUSHARE_API_KEY / TUSHARE_TOKEN is not set")
     return pro
 
 

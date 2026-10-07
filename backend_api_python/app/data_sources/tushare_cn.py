@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
@@ -12,8 +12,12 @@ logger = get_logger(__name__)
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
+def _rest_api_key() -> str:
+    return str(os.environ.get("TUSHARE_API_KEY") or "").strip()
+
+
 def is_tushare_configured() -> bool:
-    return bool(str(os.environ.get("TUSHARE_TOKEN") or "").strip())
+    return bool(_rest_api_key() or str(os.environ.get("TUSHARE_TOKEN") or "").strip())
 
 
 def tencent_code_to_ts_code(code: str) -> str:
@@ -50,17 +54,36 @@ def is_ashare_index_ts_code(ts_code: str) -> bool:
     return False
 
 
-_pro_cache: Dict[tuple[str, str], Any] = {}
+_pro_cache: Dict[tuple[str, ...], Any] = {}
 
 
 def _build_pro():
+    api_key = _rest_api_key()
+    if api_key:
+        from app.data_sources.tushare_rest import (
+            DEFAULT_BACKUP_URL,
+            DEFAULT_REST_URL,
+            TushareRestPro,
+        )
+
+        base_url = str(os.environ.get("TUSHARE_REST_URL") or "").strip() or DEFAULT_REST_URL
+        backup_url = (
+            str(os.environ.get("TUSHARE_REST_BACKUP_URL") or "").strip() or DEFAULT_BACKUP_URL
+        )
+        cache_key = ("rest", api_key, base_url, backup_url)
+        cached = _pro_cache.get(cache_key)
+        if cached is None:
+            cached = TushareRestPro(api_key, base_url=base_url, backup_url=backup_url)
+            _pro_cache[cache_key] = cached
+        return cached
+
     import tushare as ts
 
     token = str(os.environ.get("TUSHARE_TOKEN") or "").strip()
     if not token:
         return None
     http_url = str(os.environ.get("TUSHARE_HTTP_URL") or "").strip()
-    cache_key = (token, http_url)
+    cache_key = ("sdk", token, http_url)
     cached = _pro_cache.get(cache_key)
     if cached is not None:
         return cached
@@ -80,7 +103,12 @@ def _trade_date_to_unix(trade_date: str) -> int:
 
 
 def daily_bars_cover_today(rows: List[Dict[str, Any]]) -> bool:
-    """True when the newest bar is on today's Asia/Shanghai calendar date."""
+    """True when the newest bar reaches the expected Shanghai session day.
+
+    On a trading day that is today; on weekends / holidays it is the latest
+    session before today, so Tushare stays the primary source when no new bar
+    can exist.
+    """
     if not rows:
         return False
     try:
@@ -89,9 +117,12 @@ def daily_bars_cover_today(rows: List[Dict[str, Any]]) -> bool:
         return False
     if last <= 0:
         return False
+    from app.services.market.ashare_session import latest_ashare_trading_day
+
     last_day = datetime.fromtimestamp(last, tz=_SHANGHAI).date()
     today = datetime.now(_SHANGHAI).date()
-    return last_day >= today
+    expected = latest_ashare_trading_day(today) or today
+    return last_day >= expected
 
 
 def fetch_tushare_daily_klines(
@@ -107,22 +138,27 @@ def fetch_tushare_daily_klines(
         return []
     ts_code = tencent_code_to_ts_code(tencent_code)
     lim = max(int(limit or 1), 1)
-    end_date = None
-    if before_time:
-        end_date = datetime.fromtimestamp(int(before_time), tz=timezone.utc).strftime("%Y%m%d")
+    end_dt = (
+        datetime.fromtimestamp(int(before_time), tz=timezone.utc)
+        if before_time
+        else datetime.now(_SHANGHAI)
+    )
+    end_date = end_dt.strftime("%Y%m%d") if before_time else None
+    # Bound the window (≈1.6 calendar days per session + holiday slack) instead
+    # of pulling a symbol's entire history on every call.
+    start_date = (end_dt - timedelta(days=int(lim * 1.6) + 30)).strftime("%Y%m%d")
     use_index = is_ashare_index_ts_code(ts_code)
     api_name = "index_daily" if use_index else "daily"
     try:
-        # 多取一点再截断，兼容 end_date 过滤
         api = getattr(pro, api_name)
-        df = api(ts_code=ts_code, end_date=end_date)
+        df = api(ts_code=ts_code, start_date=start_date, end_date=end_date)
     except Exception as exc:
         logger.warning("Tushare %s failed ts_code=%s: %s", api_name, ts_code, exc)
         return []
     # Index codes occasionally mis-routed: retry the other endpoint once.
     if (df is None or getattr(df, "empty", True)) and not use_index and ts_code.endswith(".SH"):
         try:
-            df = pro.index_daily(ts_code=ts_code, end_date=end_date)
+            df = pro.index_daily(ts_code=ts_code, start_date=start_date, end_date=end_date)
             api_name = "index_daily"
         except Exception as exc:
             logger.warning("Tushare index_daily fallback failed ts_code=%s: %s", ts_code, exc)
