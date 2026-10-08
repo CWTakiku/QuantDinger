@@ -38,6 +38,7 @@ def _ok(fields, items):
 
 
 def _client(session, **kw):
+    kw.setdefault("allow_insecure", True)
     return TushareRestPro(
         "k-123",
         base_url="https://primary/tushare/pro",
@@ -72,7 +73,7 @@ def test_transient_error_retries_then_falls_back_to_dashed_backup(monkeypatch):
         requests.Timeout("slow"),
         _ok(["exchange", "cal_date", "is_open"], [["SSE", "20261008", 1]]),
     ])
-    pro = _client(session)
+    pro = _client(session, retries=2)
 
     df = pro.trade_cal(exchange="SSE", start_date="20261008", end_date="20261008")
 
@@ -111,6 +112,7 @@ def test_has_more_pages_are_concatenated():
     assert df["ts_code"].tolist() == ["a", "b", "c"]
     assert "offset" not in session.calls[0]["params"]
     assert session.calls[1]["params"]["offset"] == 2
+    assert session.calls[1]["params"]["limit"] == 5000
 
 
 def test_build_pro_prefers_rest_key(monkeypatch):
@@ -145,3 +147,14 @@ def test_daily_bars_cover_latest_session_on_holiday(monkeypatch):
 
     assert tushare_cn.daily_bars_cover_today([{"time": sep29}, {"time": sep30}]) is True
     assert tushare_cn.daily_bars_cover_today([{"time": sep29}]) is False
+
+
+def test_http_backup_is_skipped_unless_insecure_is_enabled():
+    session = _Session([_Resp(503, {"ok": False, "error": "down"})])
+    pro = _client(session, allow_insecure=False, retries=1)
+
+    with pytest.raises(TushareRestError, match="no HTTPS|HTTP 503"):
+        pro.daily(ts_code="000001.SZ", start_date="20260101", end_date="20260105")
+
+    assert session.calls
+    assert all(call["url"].startswith("https://") for call in session.calls)

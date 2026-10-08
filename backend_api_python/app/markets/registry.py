@@ -109,9 +109,9 @@ MARKET_MODULES: Dict[str, MarketModule] = {
             DataRequirement(
                 key="tushare",
                 label="Tushare",
-                setting_keys=["TUSHARE_TOKEN"],
+                setting_keys=["TUSHARE_API_KEY", "TUSHARE_TOKEN"],
                 recommended=True,
-                purpose="primary A-share daily OHLCV and factor panels",
+                purpose="primary A-share daily OHLCV, adjustment factors, and limit prices",
             ),
             DataRequirement(
                 key="akshare",

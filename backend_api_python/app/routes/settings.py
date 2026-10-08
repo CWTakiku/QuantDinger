@@ -1122,8 +1122,8 @@ CONFIG_SCHEMA = {
                 'label': 'Tushare REST Backup URL',
                 'type': 'text',
                 'required': False,
-                'default': 'http://datahubco.com/app-api/openapi/v1/tushare',
-                'description': 'Backup REST gateway used when the primary fails (API names with dashes).'
+                'default': '',
+                'description': 'Optional failover base. HTTP endpoints are skipped unless TUSHARE_REST_ALLOW_INSECURE=1, because that would send the API key in cleartext. Backup API names use dashes.'
             },
             {
                 'key': 'TUSHARE_TOKEN',

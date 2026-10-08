@@ -73,6 +73,18 @@ def test_weekly_defers_to_first_trading_day_when_monday_closed():
     assert wednesday == []
 
 
+def test_weekly_missed_on_first_session_fires_on_next_session_once():
+    session, frames = _session()
+
+    friday, _, _ = session.process(frames, schedule_time="2026-10-09 09:40:00+08:00")
+    later, _, _ = session.process(frames, schedule_time="2026-10-09 14:00:00+08:00")
+    next_monday_early, _, _ = session.process(frames, schedule_time="2026-10-12 09:30:00+08:00")
+
+    assert len(friday) == 1
+    assert later == []
+    assert next_monday_early == []
+
+
 def test_fired_period_survives_restart():
     session, frames = _session()
     first, _, _ = session.process(frames, schedule_time="2026-10-12 09:35:00+08:00")

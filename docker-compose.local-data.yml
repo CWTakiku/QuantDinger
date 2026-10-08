@@ -5,9 +5,37 @@
 #
 # Inside the container, bars are read from CNSTOCK_LOCAL_DAILY_DIR=/data/cnstock_daily.
 
+x-local-env: &local-env
+  volumes:
+    # Runtime secrets live in the backend env file. The root .env is Compose
+    # configuration and does not carry the Tushare key.
+    - ./backend_api_python/.env:/app/.env
+
 services:
+  env-sync:
+    <<: *local-env
+  migration:
+    <<: *local-env
+  kafka-init:
+    <<: *local-env
   backend:
+    <<: *local-env
     volumes:
       - ${CNSTOCK_LOCAL_DAILY_HOST_PATH}:/data/cnstock_daily:ro
+      - ./backend_api_python/.env:/app/.env
     environment:
       - CNSTOCK_LOCAL_DAILY_DIR=/data/cnstock_daily
+  trading-worker:
+    <<: *local-env
+  kafka-audit-worker:
+    <<: *local-env
+  strategy-dispatcher-worker:
+    <<: *local-env
+  strategy-evaluator-worker:
+    <<: *local-env
+  scheduler-worker:
+    <<: *local-env
+  celery-worker:
+    <<: *local-env
+  celery-beat:
+    <<: *local-env

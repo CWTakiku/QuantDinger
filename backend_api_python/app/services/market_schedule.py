@@ -33,7 +33,13 @@ def equity_data_market(market: str, product=None, api_family: str = "") -> str:
 def equity_bar_session_date(value, market: str):
     stamp = pd.Timestamp(value)
     stamp = stamp.tz_localize("UTC") if stamp.tzinfo is None else stamp.tz_convert("UTC")
-    return (stamp.tz_convert("Asia/Hong_Kong") if market == "HKStock" else stamp).date()
+    if market == "HKStock":
+        zone = "Asia/Hong_Kong"
+    elif market in {"CNStock", "AStock"}:
+        zone = "Asia/Shanghai"
+    else:
+        zone = ""
+    return (stamp.tz_convert(zone) if zone else stamp).date()
 
 
 def equity_daily_bar_cutoff(market: str, now: Optional[datetime] = None) -> pd.Timestamp:
@@ -42,6 +48,8 @@ def equity_daily_bar_cutoff(market: str, now: Optional[datetime] = None) -> pd.T
     day = pd.Timestamp(session).tz_localize(None)
     if market == "HKStock":
         day = day.tz_localize("Asia/Hong_Kong").tz_convert("UTC").tz_localize(None)
+    elif market in {"CNStock", "AStock"}:
+        day = day.tz_localize("Asia/Shanghai").tz_convert("UTC").tz_localize(None)
     return day + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)
 
 

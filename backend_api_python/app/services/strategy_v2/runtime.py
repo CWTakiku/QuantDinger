@@ -48,6 +48,7 @@ from .contract import CompiledStrategyV2, StrategyV2ContractError, compile_strat
 from .data import MultiAssetDataPortal, StrategyDataError
 from .frequencies import normalize_frequency, periods_per_year
 from .protection import ProtectionDecision, ProtectionEngine, ProtectionSpec, ProtectionState
+from app.markets.cn_stock.costs import execution_fee, max_buy_notional
 from app.markets.cn_stock.lot_rules import cn_stock_lot_spec, cn_stock_min_open
 from app.services.csi300_enhanced import optimize_enhanced_index, optimize_enhanced_index_partial
 from app.services.csi300_enhanced.bench import (
@@ -169,6 +170,16 @@ def get_glass_fiber_industry_week(as_of: object = None) -> dict:
 def _backtest_time_iso(value: Any) -> str:
     """Serialize the UTC-naive market index as an unambiguous UTC instant."""
     return _cached_backtest_time_iso(pd.Timestamp(value))
+
+
+def _ashare_session_date(value: Any) -> date:
+    """Calendar date of a bar stored as a UTC instant, in Asia/Shanghai."""
+    timestamp = pd.Timestamp(value)
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.tz_localize("UTC")
+    else:
+        timestamp = timestamp.tz_convert("UTC")
+    return timestamp.tz_convert("Asia/Shanghai").date()
 
 
 def _utc_naive_timestamp(value: Any) -> pd.Timestamp:
@@ -874,6 +885,8 @@ class MultiAssetSimulationBroker:
         self._protections: dict[str, ProtectionState] = {}
         self.protection_events: list[dict[str, Any]] = []
         self.order_ledger: list[dict[str, Any]] = []
+        # CNStock T+1: shares bought on a session date cannot be sold that day.
+        self._cn_unsettled: dict[str, tuple[date, float]] = {}
         self._resting_deferred_events: dict[str, int] = {}
         self.rebalance_records: list[dict[str, Any]] = []
         self.holding_snapshots: list[dict[str, Any]] = []
@@ -1100,6 +1113,15 @@ class MultiAssetSimulationBroker:
                 batch_event_indexes.append(len(self.order_ledger) - 1)
                 continue
             delta = feasible_delta
+            capped = self._cap_ashare_t1_sell(position_key, order.symbol, current.amount, delta, timestamp)
+            t1_capped = abs(capped) + 1e-9 < abs(delta)
+            delta = capped
+            if abs(requested_delta) > 1e-12 and abs(delta) <= 1e-12:
+                batch_event_indexes.append(self._append_order_event(self._order_event(
+                    order_id, order, timestamp, "rejected", "t_plus_one",
+                    requested_quantity=abs(requested_delta),
+                )))
+                continue
             min_amount = max(0.0, float(rules.min_amount or 0.0))
             min_notional = max(0.0, float(rules.min_notional or 0.0))
             pure_reduction = self._is_pure_reduction(current.amount, delta)
@@ -1139,7 +1161,7 @@ class MultiAssetSimulationBroker:
             )
             execution_status = "partial" if has_tradable_remainder else "filled"
             notional = abs(delta * fill_price)
-            fee = notional * self.commission
+            fee = execution_fee(order.symbol, notional, self.commission, selling=delta < 0)
             projected_cash = self.portfolio.available_cash - delta * fill_price - fee
             old_amount = current.amount
             old_cost = current.avg_cost
@@ -1148,10 +1170,12 @@ class MultiAssetSimulationBroker:
             current.last_price = fill_price
             execution_price_overrides[order.symbol] = fill_price
             self.portfolio.available_cash = projected_cash
+            self._remember_ashare_buy(position_key, order.symbol, delta, timestamp)
             if abs(current.amount) <= 1e-12:
                 current.amount = 0.0
                 self.portfolio.positions.pop(position_key, None)
                 self._protections.pop(position_key, None)
+                self._cn_unsettled.pop(position_key, None)
             else:
                 self.portfolio.positions[position_key] = current
                 new_side = "long" if current.amount > 0 else "short"
@@ -1206,7 +1230,9 @@ class MultiAssetSimulationBroker:
             }
             self.executions.append(execution)
             reason = "margin_liquidation" if forced_liquidation else "filled"
-            if execution_status == "partial":
+            if t1_capped:
+                reason = "t_plus_one"
+            elif execution_status == "partial":
                 reason = constraint_reason or (
                     "insufficient_liquidity"
                     if liquidity_cap is not None and abs(requested_delta) > liquidity_cap
@@ -1358,7 +1384,10 @@ class MultiAssetSimulationBroker:
         if feasible > 0:
             borrowing_floor = -equity * (self.leverage - 1.0)
             spendable = max(0.0, self.portfolio.available_cash - borrowing_floor)
-            cash_cap = spendable / max(fill_price * (1.0 + self.commission), 1e-12)
+            if cn_stock_lot_spec(position_key) is not None:
+                cash_cap = max_buy_notional(spendable, self.commission) / max(fill_price, 1e-12)
+            else:
+                cash_cap = spendable / max(fill_price * (1.0 + self.commission), 1e-12)
             if feasible > cash_cap:
                 feasible = cash_cap
                 reason = "insufficient_cash"
@@ -1415,6 +1444,38 @@ class MultiAssetSimulationBroker:
         if isinstance(item, Mapping):
             return InstrumentRules.from_mapping(item)
         return default_rules_for_symbol(symbol)
+
+    def _cap_ashare_t1_sell(
+        self,
+        position_key: str,
+        symbol: str,
+        current_amount: float,
+        delta: float,
+        timestamp: Any,
+    ) -> float:
+        if delta >= -1e-12 or cn_stock_lot_spec(symbol) is None or current_amount <= 0:
+            return delta
+        session = _ashare_session_date(timestamp)
+        held = self._cn_unsettled.get(position_key)
+        unsettled = held[1] if held and held[0] == session else 0.0
+        sellable = max(0.0, current_amount - unsettled)
+        if -delta <= sellable + 1e-9:
+            return delta
+        return -sellable
+
+    def _remember_ashare_buy(
+        self,
+        position_key: str,
+        symbol: str,
+        delta: float,
+        timestamp: Any,
+    ) -> None:
+        if delta <= 1e-12 or cn_stock_lot_spec(symbol) is None:
+            return
+        session = _ashare_session_date(timestamp)
+        held = self._cn_unsettled.get(position_key)
+        qty = held[1] if held and held[0] == session else 0.0
+        self._cn_unsettled[position_key] = (session, qty + delta)
 
     @staticmethod
     def _is_pure_reduction(current_amount: float, delta: float) -> bool:
@@ -2425,13 +2486,16 @@ class StrategyV2BacktestRunner:
             quantity = float(execution.get("quantity") or 0.0)
             notional = float(execution.get("notional") or 0.0)
             fee = float(execution.get("commission") or 0.0)
-            expected_fee = notional * self.broker.commission
+            symbol = str(execution.get("symbol") or execution.get("position_key") or "")
+            expected_fee = execution_fee(
+                symbol, notional, self.broker.commission, selling=side != "buy"
+            )
             if abs(fee - expected_fee) > max(1e-8, abs(expected_fee) * 1e-9):
                 fee_mismatches.append(index)
             signed_quantity = quantity if side == "buy" else -quantity
             cash -= signed_quantity * float(execution.get("price") or 0.0) + fee
-            symbol = str(execution.get("position_key") or execution.get("symbol") or "")
-            quantities[symbol] = quantities.get(symbol, 0.0) + signed_quantity
+            position_key = str(execution.get("position_key") or symbol)
+            quantities[position_key] = quantities.get(position_key, 0.0) + signed_quantity
 
             reference_price = float(execution.get("reference_price") or 0.0)
             fill_reference = str(execution.get("fill_reference") or "bar_open")
@@ -2618,7 +2682,9 @@ class StrategyV2LiveSession:
         else:
             return None
         effective = next((day for day in candidates if self.trading_day_fn(day)), None)
-        if effective != today:
+        # A period missed on its first session (for example, data not ready)
+        # stays due on later sessions of the same period until it fires.
+        if effective is None or today < effective or not self.trading_day_fn(today):
             return None
         scheduled_at = clock.normalize() + _parse_schedule_time(schedule.time)
         if clock < scheduled_at:

@@ -75,7 +75,7 @@ class CNStockDataSource(BaseDataSource):
         tushare_rows: List[Dict[str, Any]] = []
         if tf in ("1D",) and is_tushare_configured():
             rows = fetch_tushare_daily_klines(
-                tencent_code=code, limit=lim, before_time=before_time
+                tencent_code=code, limit=lim, before_time=before_time, after_time=after_time
             )
             tushare_rows = rows or []
             if rows and (before_time is not None or daily_bars_cover_today(rows)):

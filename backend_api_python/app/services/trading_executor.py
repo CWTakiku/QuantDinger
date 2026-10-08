@@ -1027,6 +1027,7 @@ class TradingExecutor:
 
             while self._is_strategy_running(strategy_id, stop_event):
                 cycle_started = time.monotonic()
+                fired_before_cycle = None
                 bar_event_triggered = bar_event_pending.is_set()
                 if bar_event_triggered:
                     bar_event_pending.clear()
@@ -1165,7 +1166,7 @@ class TradingExecutor:
                             exchange_config=exchange_config,
                             signal_ts=self._intent_signal_timestamp(intent, risk_timestamp),
                             strategy_run_id=run_id,
-                            current_price_override=active_prices.get(str(intent.symbol)),
+                            current_price_override=_symbol_price(active_prices, candidates, intent.symbol),
                             direction_mode=direction_mode,
                         )
                         if not submitted and intent.kind in {
@@ -1225,7 +1226,7 @@ class TradingExecutor:
                             exchange_config=exchange_config,
                             signal_ts=int(time.time()),
                             strategy_run_id=run_id,
-                            current_price_override=active_prices.get(str(intent.symbol)),
+                            current_price_override=_symbol_price(active_prices, candidates, intent.symbol),
                             direction_mode=direction_mode,
                         )
                         if not submitted:
@@ -1291,7 +1292,7 @@ class TradingExecutor:
                                 exchange_config=exchange_config,
                                 signal_ts=self._intent_signal_timestamp(intent, risk_timestamp),
                                 strategy_run_id=run_id,
-                                current_price_override=active_prices.get(str(intent.symbol)),
+                                current_price_override=_symbol_price(active_prices, candidates, intent.symbol),
                                 direction_mode=direction_mode,
                             )
                             if intent.client_order_id:
@@ -1371,6 +1372,7 @@ class TradingExecutor:
                                 if not skip_rebalance:
                                     if callable(begin_signal_cycle):
                                         begin_signal_cycle(run_id)
+                                    fired_before_cycle = dict(session.fired_schedule_periods)
                                     intents, messages, timestamp = session.process(
                                         frames,
                                         frequency_frames=frequency_frames,
@@ -1402,7 +1404,7 @@ class TradingExecutor:
                                             trading_config=trading_config,
                                             exchange_config=exchange_config,
                                             signal_ts=self._intent_signal_timestamp(intent, timestamp),
-                                            current_price_override=active_prices.get(str(intent.symbol)) if daily_policy else None,
+                                            current_price_override=_symbol_price(active_prices, candidates, intent.symbol) if daily_policy else None,
                                             strategy_run_id=run_id,
                                             direction_mode=direction_mode,
                                         )
@@ -1422,6 +1424,7 @@ class TradingExecutor:
                                     )
                                     if callable(finish_signal_cycle):
                                         finish_signal_cycle(run_id)
+                                    fired_before_cycle = None
                                     initial_frames_pending = False
                                     last_signal_bar_token = current_bar_token
                                     last_processed_frame_timestamp = latest_frame_timestamp
@@ -1474,6 +1477,11 @@ class TradingExecutor:
                         last_market_data_failure_key = ""
                         last_market_data_log_at = 0.0
                 except Exception as exc:
+                    if fired_before_cycle is not None:
+                        # Re-arm a scheduled rebalance whose orders failed so the
+                        # next cycle runs it again instead of skipping the period.
+                        session.fired_schedule_periods = fired_before_cycle
+                        fired_before_cycle = None
                     if isinstance(exc, MarketDataUnavailableError) or str(exc) == "strategyV2.noMarketData":
                         next_signal_poll = cycle_started + signal_poll
                         failure = (
@@ -1598,13 +1606,13 @@ class TradingExecutor:
         direction_mode: str = "",
         strategy_equity: float | None = None,
     ) -> bool:
-        member = next(
-            (item for item in candidates if str(item.get("key") or "") == str(intent.symbol)),
-            None,
-        )
+        member = _candidate_for_symbol(candidates, intent.symbol)
         if not member:
             raise RuntimeError(f"strategyV2.instrumentNotFound:{intent.symbol}")
-        frame = frames.get(str(intent.symbol))
+        member_key = str(member.get("key") or "")
+        frame = frames.get(member_key)
+        if frame is None:
+            frame = frames.get(str(intent.symbol))
         price = float(current_price_override or 0)
         if price <= 0 and frame is not None and not frame.empty:
             price = float(frame["close"].iloc[-1])
@@ -1710,9 +1718,9 @@ class TradingExecutor:
                 price_instrument_id=str(member.get("instrument_id") or ""),
                 market_frame=frame,
                 market_frames={
-                    frequency: bundle.get(str(intent.symbol))
+                    frequency: bundle.get(member_key, bundle.get(str(intent.symbol)))
                     for frequency, bundle in (frequency_frames or {}).items()
-                    if bundle.get(str(intent.symbol)) is not None
+                    if bundle.get(member_key, bundle.get(str(intent.symbol))) is not None
                 },
             )) or submitted
         return submitted
@@ -3200,6 +3208,35 @@ def _member_key(member: dict[str, Any]) -> str:
     elif market_type:
         suffix = f"@{market_type}"
     return f"{market}:{symbol}{suffix}"
+
+
+def _candidate_for_symbol(candidates: list[dict[str, Any]], symbol: Any) -> dict[str, Any] | None:
+    """Match an intent symbol to a member; strategy code sees ``CNStock:X`` for ``CNStock:X@spot``."""
+    text = str(symbol or "")
+    exact = next((item for item in candidates if str(item.get("key") or "") == text), None)
+    if exact is not None or not text:
+        return exact
+    from app.services.strategy_v2.instruments import parse_instrument
+
+    try:
+        canonical = parse_instrument(text).key
+    except Exception:
+        return None
+    for item in candidates:
+        try:
+            if parse_instrument(str(item.get("key") or "")).key == canonical:
+                return item
+        except Exception:
+            continue
+    return None
+
+
+def _symbol_price(prices: dict[str, float], candidates: list[dict[str, Any]], symbol: Any) -> float | None:
+    price = prices.get(str(symbol))
+    if price:
+        return price
+    member = _candidate_for_symbol(candidates, symbol)
+    return prices.get(str(member.get("key") or "")) if member else None
 
 
 def _apply_market_data_defaults(candidates: list[dict[str, Any]]) -> None:
