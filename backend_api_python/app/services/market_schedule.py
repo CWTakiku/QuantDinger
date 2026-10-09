@@ -73,6 +73,22 @@ def equity_daily_execution_session(market: str, regular_only: bool = True, now: 
     return _python_utc(calendar.previous_session(today))
 
 
+def is_equity_market_open(market: str, now: Optional[datetime] = None) -> bool:
+    """True inside the continuous trading session (lunch break excluded)."""
+    current = _utc(now)
+    calendar = _calendar(market)
+    today = pd.Timestamp(pd.Timestamp(current).tz_convert(calendar.tz).date())
+    if not calendar.is_session(today):
+        return False
+    if not _python_utc(calendar.session_open(today)) <= current < _python_utc(calendar.session_close(today)):
+        return False
+    break_start = calendar.session_break_start(today)
+    break_end = calendar.session_break_end(today)
+    if pd.notna(break_start) and _python_utc(break_start) <= current < _python_utc(break_end):
+        return False
+    return True
+
+
 def is_equity_bar_close(market: str, closed_at: datetime) -> bool:
     """Return whether a UTC boundary closes a bar inside an equity session."""
     normalized_market = str(market or "").strip()

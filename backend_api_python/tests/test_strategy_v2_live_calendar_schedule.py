@@ -119,3 +119,41 @@ def test_order_for_symbol_without_data_is_skipped_in_live_session():
 
     assert [o.symbol for o in orders] == ["CNStock:000001.SZ"]
     assert any("000002.SZ" in line and "skipped" in line for line in logs)
+
+
+def test_schedule_waits_for_trading_hours():
+    from app.services.market_schedule import is_equity_market_open
+
+    frames = _frames()
+    session = StrategyV2LiveSession(
+        code=_WEEKLY,
+        frames=frames,
+        initial_capital=100000,
+        schedule_timezone="Asia/Shanghai",
+        trading_day_fn=_is_open,
+        market_open_fn=lambda clock: is_equity_market_open("CNStock", clock.to_pydatetime()),
+    )
+
+    night, _, _ = session.process(frames, schedule_time="2026-10-08 22:51:00+08:00")
+    lunch, _, _ = session.process(frames, schedule_time="2026-10-09 12:00:00+08:00")
+    afternoon, _, _ = session.process(frames, schedule_time="2026-10-09 13:05:00+08:00")
+
+    assert night == []
+    assert lunch == []
+    assert len(afternoon) == 1
+
+
+def test_is_equity_market_open_for_ashare_sessions():
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from app.services.market_schedule import is_equity_market_open
+
+    sh = ZoneInfo("Asia/Shanghai")
+    assert is_equity_market_open("CNStock", datetime(2026, 10, 9, 9, 35, tzinfo=sh))
+    assert not is_equity_market_open("CNStock", datetime(2026, 10, 9, 9, 25, tzinfo=sh))
+    assert not is_equity_market_open("CNStock", datetime(2026, 10, 9, 12, 0, tzinfo=sh))
+    assert is_equity_market_open("CNStock", datetime(2026, 10, 9, 14, 59, tzinfo=sh))
+    assert not is_equity_market_open("CNStock", datetime(2026, 10, 9, 15, 0, tzinfo=sh))
+    assert not is_equity_market_open("CNStock", datetime(2026, 10, 8, 22, 51, tzinfo=sh))
+    assert not is_equity_market_open("CNStock", datetime(2026, 10, 5, 10, 0, tzinfo=sh))

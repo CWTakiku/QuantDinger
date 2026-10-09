@@ -36,7 +36,9 @@ class UniverseError(ValueError):
 def parse_as_of(value: Any) -> date:
     """Normalize an as-of value without accepting time-zone ambiguous strings."""
     if value is None or value == "":
-        return date.today()
+        from zoneinfo import ZoneInfo
+
+        return datetime.now(ZoneInfo("Asia/Shanghai")).date()
     if isinstance(value, datetime):
         return value.date()
     if isinstance(value, date):

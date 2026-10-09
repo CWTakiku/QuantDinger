@@ -4,6 +4,7 @@ from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+import pytest
 
 from app.markets.cn_stock.costs import ashare_trading_fee
 from app.services.market_schedule import equity_bar_session_date
@@ -146,3 +147,52 @@ def test_live_intent_with_canonical_key_matches_spot_member():
     )
     assert captured["symbol"] == "000002.SZ"
     assert captured["market_frame"] is frame
+
+
+def test_live_intent_at_limit_up_is_skipped(monkeypatch):
+    from app.services import trading_executor
+    from app.services.trading_executor import TradingExecutor
+
+    logs = []
+    monkeypatch.setattr(trading_executor, "append_strategy_log", lambda *args: logs.append(args))
+    executor = TradingExecutor.__new__(TradingExecutor)
+    executor._get_current_positions = lambda *_: []
+    executor._execute_signal = lambda **_: pytest.fail("order must not be sent at limit up")
+    member = {"key": "CNStock:600048.SH@spot", "symbol": "600048.SH", "market": "CNStock", "market_type": "spot"}
+    frame = pd.DataFrame({"close": [10.0]}, index=pd.to_datetime(["2026-10-08"]))
+
+    submitted = executor._execute_strategy_v2_intent(
+        strategy_id=1, strategy_name="alpha",
+        intent=OrderIntent(symbol="CNStock:600048.SH", kind="target_percent", value=0.05),
+        frames={member["key"]: frame}, candidates=[member], initial_capital=100000, leverage=1,
+        execution_mode="signal", notification_config={}, trading_config={}, exchange_config={},
+        signal_ts=1, strategy_run_id=1, current_price_override=11.0,
+        ashare_quote={"last": 11.0, "previousClose": 10.0, "high": 11.0, "low": 10.1},
+    )
+
+    assert submitted is False
+    assert any("limit_up" in str(entry) for entry in logs)
+
+
+def test_live_intent_without_quote_is_skipped(monkeypatch):
+    from app.services import trading_executor
+    from app.services.trading_executor import TradingExecutor
+
+    logs = []
+    monkeypatch.setattr(trading_executor, "append_strategy_log", lambda *args: logs.append(args))
+    executor = TradingExecutor.__new__(TradingExecutor)
+    executor._get_current_positions = lambda *_: []
+    executor._execute_signal = lambda **_: pytest.fail("order must not be sent without a live quote")
+    member = {"key": "CNStock:600048.SH@spot", "symbol": "600048.SH", "market": "CNStock", "market_type": "spot"}
+    frame = pd.DataFrame({"close": [10.0]}, index=pd.to_datetime(["2026-10-08"]))
+
+    submitted = executor._execute_strategy_v2_intent(
+        strategy_id=1, strategy_name="alpha",
+        intent=OrderIntent(symbol="CNStock:600048.SH", kind="target_percent", value=0.05),
+        frames={member["key"]: frame}, candidates=[member], initial_capital=100000, leverage=1,
+        execution_mode="signal", notification_config={}, trading_config={}, exchange_config={},
+        signal_ts=1, strategy_run_id=1, ashare_quote={},
+    )
+
+    assert submitted is False
+    assert any("no_quote" in str(entry) for entry in logs)

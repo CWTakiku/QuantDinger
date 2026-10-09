@@ -532,6 +532,9 @@ class StrategyV2DeploymentService:
             if market == "HKStock":
                 currencies.add("HKD")
                 continue
+            if market in {"CNStock", "CN"}:
+                currencies.add("CNY")
+                continue
             if market != "Crypto":
                 continue
             symbol = str(item.get("symbol") or "").strip().upper()
@@ -555,6 +558,8 @@ class StrategyV2DeploymentService:
                 currencies.add("USD")
             elif market == "HKStock":
                 currencies.add("HKD")
+            elif market in {"CNStock", "CN"}:
+                currencies.add("CNY")
         if len(currencies) > 1:
             raise StrategyV2ContractError("strategyV2.mixedQuoteCurrencyLiveUnsupported")
         return next(iter(currencies), "USDT")

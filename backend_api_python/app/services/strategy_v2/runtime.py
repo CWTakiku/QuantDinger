@@ -147,12 +147,13 @@ def get_ashare_pe_percentile(
 
 def get_glass_fiber_industry_week(as_of: object = None) -> dict:
     """PIT 行业周信号；无有效行时 industry_available=False。"""
-    from datetime import date
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
 
     from app.services.industry_glass_fiber.store import resolve_glass_fiber_week
 
     if as_of is None:
-        as_of = date.today()
+        as_of = datetime.now(ZoneInfo("Asia/Shanghai")).date()
     row = resolve_glass_fiber_week(as_of)
     if not row:
         return {
@@ -2563,6 +2564,7 @@ class StrategyV2LiveSession:
         universe_resolver=None,
         schedule_timezone: str = "UTC",
         trading_day_fn: Callable[[date], bool] | None = None,
+        market_open_fn: Callable[[pd.Timestamp], bool] | None = None,
     ) -> None:
         self.program = compile_strategy_v2(code)
         self._universe_resolver = universe_resolver
@@ -2580,6 +2582,9 @@ class StrategyV2LiveSession:
         # once on its first session day on/after the nominal day, including a
         # same-day catch-up when the session starts after the scheduled time.
         self.trading_day_fn = trading_day_fn
+        # Calendar schedules fire only while this returns True (trading hours);
+        # a period first checked after the close waits for the next session.
+        self.market_open_fn = market_open_fn
         self.fired_schedule_periods: dict[str, str] = {}
         self.persist_strategy_state = (
             _truthy(self.program.namespace.get("PERSIST_RUNTIME_STATE"))
@@ -2685,6 +2690,8 @@ class StrategyV2LiveSession:
         # A period missed on its first session (for example, data not ready)
         # stays due on later sessions of the same period until it fires.
         if effective is None or today < effective or not self.trading_day_fn(today):
+            return None
+        if self.market_open_fn is not None and not self.market_open_fn(clock):
             return None
         scheduled_at = clock.normalize() + _parse_schedule_time(schedule.time)
         if clock < scheduled_at:

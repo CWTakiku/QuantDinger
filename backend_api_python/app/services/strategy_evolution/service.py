@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
+from app.services.backtest_execution import default_commission_if_missing, default_slippage_if_missing
 from app.services.script_source import get_script_source_service
 from app.services.strategy_v2 import StrategyV2BacktestService
 
@@ -40,8 +41,8 @@ class StrategyEvolutionService:
         initial_capital = max(10.0, float(payload.get("initialCapital") or 10_000))
         leverage_enabled = bool(payload.get("leverageEnabled", False))
         leverage = max(1.0, float(payload.get("leverage") or 1.0))
-        commission = max(0.0, min(1.0, float(payload.get("commission") or 0.0)))
-        slippage = max(0.0, min(1.0, float(payload.get("slippage") or 0.0)))
+        commission = min(1.0, default_commission_if_missing(payload.get("commission")))
+        slippage = min(1.0, default_slippage_if_missing(payload.get("slippage")))
 
         if isinstance(self.backtest_service, StrategyV2BacktestService):
             evaluate = PreparedEvolutionEvaluator(

@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import os
-from datetime import date
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from app.celery_app import celery_app
 
@@ -36,7 +37,7 @@ def run_csi300_enhanced_daily_sync_task(self, trade_date: str | None = None):
         return {"skipped": True}
     from app.services.csi300_enhanced.tushare_sync import run_csi300_enhanced_daily_sync
 
-    day = trade_date or date.today().strftime("%Y%m%d")
+    day = trade_date or datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y%m%d")
     return run_csi300_enhanced_daily_sync(
         trade_date=day,
         skip_industry=_enabled("CSI300_ENHANCED_SYNC_SKIP_INDUSTRY", "false"),

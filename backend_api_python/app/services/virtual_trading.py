@@ -67,6 +67,30 @@ def calculate_virtual_fill(
     return VirtualFillTransition(0.0, size, entry, 0.0, "rejected")
 
 
+ASHARE_DEFAULT_COMMISSION_RATE = 0.00025
+
+
+def _is_ashare(strategy: Mapping[str, Any], symbol: str) -> bool:
+    from app.markets.cn_stock.lot_rules import cn_stock_lot_spec
+
+    market = str(strategy.get("market_category") or "").strip().lower()
+    if market not in {"cnstock", "astock", "cn"} and not str(symbol or "").upper().startswith("CNSTOCK:"):
+        return False
+    return cn_stock_lot_spec(str(symbol or "")) is not None
+
+
+def _ashare_commission_rate(trading_config: Mapping[str, Any]) -> float:
+    """Brokerage rate as a ratio; a configured percent (e.g. 0.025) is accepted too."""
+    for key in ("commission", "commission_rate"):
+        try:
+            value = float(trading_config.get(key))
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value / 100.0 if value >= 0.01 else value
+    return ASHARE_DEFAULT_COMMISSION_RATE
+
+
 def _fill_price(action: str, reference_price: float, slippage_rate: float) -> float:
     is_buy = str(action or "").strip().lower() in {
         "open_long", "add_long", "reduce_short", "close_short",
@@ -170,6 +194,9 @@ def execute_virtual_signal_order(order_row: Mapping[str, Any], payload: Mapping[
         slippage_rate = cost_policy.slippage_rate
         fill_price = forced_fill_price or _fill_price(action, reference_price, slippage_rate)
         market_type = cost_policy.market_type
+        ashare = _is_ashare(strategy, symbol)
+        if ashare:
+            commission_rate = _ashare_commission_rate(trading_config)
 
         cur.execute(
             """
@@ -264,17 +291,74 @@ def execute_virtual_signal_order(order_row: Mapping[str, Any], payload: Mapping[
             (strategy_id, symbol_key, side),
         )
         position = cur.fetchone() or {}
-        transition = calculate_virtual_fill(
-            action=action,
-            requested_quantity=requested_quantity,
-            fill_price=fill_price,
-            current_size=float(position.get("size") or 0.0),
-            current_entry_price=float(position.get("entry_price") or 0.0),
-        )
-        commission = cost_policy.commission_for(
-            quantity=transition.fill_quantity,
-            fill_price=fill_price,
-        )
+        current_size = float(position.get("size") or 0.0)
+        fill_request = requested_quantity
+        reject_reason = ""
+        if ashare and side == "short":
+            reject_reason = "ashare_short_unsupported"
+        elif ashare and action in {"open_long", "add_long"}:
+            from app.markets.cn_stock.lot_rules import cn_stock_lot_spec, round_to_lot
+
+            lot_size, min_open = cn_stock_lot_spec(symbol) or (100.0, 100.0)
+            fill_request = round_to_lot(fill_request, lot_size)
+            if fill_request <= 1e-12 or (current_size <= 1e-12 and fill_request + 1e-12 < min_open):
+                reject_reason = "below_board_lot"
+        elif ashare and action in {"reduce_long", "close_long"} and current_size > 0:
+            # T+1: shares bought on today's Shanghai session cannot be sold today.
+            cur.execute(
+                """
+                SELECT COALESCE(SUM(amount), 0) AS bought
+                FROM qd_strategy_virtual_trades
+                WHERE strategy_id = %s AND symbol_canonical = %s AND side = 'long'
+                  AND type IN ('open_long', 'add_long')
+                  AND (created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Shanghai')::date
+                      = (NOW() AT TIME ZONE 'Asia/Shanghai')::date
+                """,
+                (strategy_id, symbol_key),
+            )
+            bought_today = float((cur.fetchone() or {}).get("bought") or 0.0)
+            sellable = max(0.0, current_size - bought_today)
+            if sellable <= 1e-12:
+                reject_reason = "t_plus_one"
+            elif fill_request <= 0 or fill_request > sellable:
+                fill_request = sellable
+            if not reject_reason and 0 < fill_request < current_size - 1e-12:
+                # Odd lots may only leave the book together with the whole position.
+                from app.markets.cn_stock.lot_rules import cn_stock_lot_size, round_to_lot
+
+                fill_request = round_to_lot(fill_request, cn_stock_lot_size(symbol) or 100.0)
+                if fill_request <= 1e-12:
+                    reject_reason = "below_board_lot"
+        if reject_reason:
+            transition = VirtualFillTransition(
+                0.0, current_size, float(position.get("entry_price") or 0.0), 0.0, "rejected"
+            )
+        else:
+            transition = calculate_virtual_fill(
+                action=action,
+                requested_quantity=fill_request,
+                fill_price=fill_price,
+                current_size=current_size,
+                current_entry_price=float(position.get("entry_price") or 0.0),
+            )
+        if ashare:
+            from app.markets.cn_stock.costs import execution_fee
+
+            commission = (
+                execution_fee(
+                    symbol,
+                    transition.fill_quantity * fill_price,
+                    commission_rate,
+                    selling=action in {"reduce_long", "close_long", "open_short", "add_short"},
+                )
+                if transition.fill_quantity > 0
+                else 0.0
+            )
+        else:
+            commission = cost_policy.commission_for(
+                quantity=transition.fill_quantity,
+                fill_price=fill_price,
+            )
         slippage_quote = cost_policy.slippage_quote_for(
             quantity=transition.fill_quantity,
             reference_price=reference_price,
@@ -318,7 +402,8 @@ def execute_virtual_signal_order(order_row: Mapping[str, Any], payload: Mapping[
                     transition.fill_quantity, reference_price, limit_price, fill_price,
                     cost_policy.exchange_id, market_type, cost_policy.leverage,
                     commission_rate, commission, slippage_rate, slippage_quote,
-                    transition.status, str(payload.get("reason") or "")[:255],
+                    transition.status,
+                    (reject_reason or str(payload.get("reason") or ""))[:255],
                 ),
             )
             virtual_order_id = int((cur.fetchone() or {}).get("id") or 0)
@@ -418,7 +503,7 @@ def execute_virtual_signal_order(order_row: Mapping[str, Any], payload: Mapping[
                      side, position_side, price, quantity, notional, fee, fee_ccy,
                      credential_id, commission_quote, fee_status, filled_at, raw_json)
                 VALUES (%s, %s, %s, 'virtual', %s, %s, %s, %s, %s, %s, %s, %s,
-                        'USDT', 0, %s, 'actual', NOW(), '{}'::jsonb)
+                        %s, 0, %s, 'actual', NOW(), '{}'::jsonb)
                 ON CONFLICT (exchange_id, credential_id, exchange_fill_id)
                 WHERE exchange_fill_id <> '' DO NOTHING
                 """,
@@ -426,7 +511,8 @@ def execute_virtual_signal_order(order_row: Mapping[str, Any], payload: Mapping[
                     order_intent_id, strategy_run_id, strategy_id,
                     str(virtual_order_id), virtual_fill_id, fill_side, side,
                     fill_price, transition.fill_quantity,
-                    transition.fill_quantity * fill_price, commission, commission,
+                    transition.fill_quantity * fill_price, commission,
+                    "CNY" if ashare else "USDT", commission,
                 ),
             )
             cur.execute(

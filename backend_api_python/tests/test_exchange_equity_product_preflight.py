@@ -236,3 +236,14 @@ def test_runtime_product_validation_rejects_non_tradable_status(monkeypatch):
 
     with pytest.raises(ValueError, match="strategyV2.equityProductNotTradable"):
         product_catalog.validate_runtime_products(stored, credential_exchange_id="bitget")
+
+
+def test_live_quote_currency_for_ashare_is_cny():
+    currency = StrategyV2DeploymentService._validate_live_quote_currency(
+        markets=("CNStock",),
+        instruments=[{"market": "CNStock", "symbol": "600048.SH", "market_type": "spot"}],
+        products=[],
+        execution_mode="live",
+    )
+
+    assert currency == "CNY"

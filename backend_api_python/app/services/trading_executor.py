@@ -794,6 +794,18 @@ class TradingExecutor:
             runtime_price_client: Dict[str, Any] = {}
 
             positions = {}
+            session_quote_cache: Dict[str, Any] = {"at": 0.0, "prices": {}}
+
+            def ashare_session_quotes(members: list[dict[str, Any]]) -> dict[str, float]:
+                # Daily frames stop at the previous close; mark held A-shares
+                # with live quotes during the session, refreshed every 30s.
+                if not market_open_fn(pd.Timestamp.now(tz="UTC")):
+                    return {}
+                if time.monotonic() - session_quote_cache["at"] >= 30.0:
+                    session_quote_cache["prices"] = self._live_prices(members)
+                    session_quote_cache["at"] = time.monotonic()
+                return dict(session_quote_cache["prices"])
+
             def runtime_prices() -> dict[str, float]:
                 # Prefer last bar closes from the already-loaded panel.  Portfolio
                 # universes can be hundreds of names; sequential ticker calls
@@ -801,6 +813,8 @@ class TradingExecutor:
                 frame_prices = self._prices_from_frames(frames)
                 priced = pricing_members(candidates, positions)
                 if execution_mode != "live":
+                    if ashare_only and frame_prices and market_open_fn is not None:
+                        return {**frame_prices, **ashare_session_quotes(priced)}
                     return frame_prices or self._live_prices(priced)
                 return self._execution_account_prices(
                     priced,
@@ -816,22 +830,28 @@ class TradingExecutor:
                 raise RuntimeError("strategyV2.invalidInitialCapital")
             runtime_params = dict(trading_config.get("params") or {})
             runtime_params.setdefault("execution_mode", execution_mode)
-            runtime_params.setdefault(
-                "commission",
-                self._to_ratio(trading_config.get("commission") or 0.001),
-            )
             ashare_only = bool(candidates) and all(
                 str(member.get("market") or "").upper() in {"CNSTOCK", "CN"}
                 for member in candidates
             )
+            runtime_params.setdefault(
+                "commission",
+                self._to_ratio(trading_config.get("commission") or (0.025 if ashare_only else 0.001)),
+            )
             if ashare_only:
                 from app.services.market.ashare_session import is_ashare_trading_day
 
+                from app.services.market_schedule import is_equity_market_open
+
                 schedule_timezone = "Asia/Shanghai"
                 trading_day_fn = is_ashare_trading_day
+
+                def market_open_fn(clock: pd.Timestamp) -> bool:
+                    return is_equity_market_open("CNStock", pd.Timestamp(clock).to_pydatetime())
             else:
                 schedule_timezone = self._load_schedule_timezone(user_id)
                 trading_day_fn = None
+                market_open_fn = None
             session = StrategyV2LiveSession(
                 code=code,
                 frames=frames,
@@ -841,6 +861,7 @@ class TradingExecutor:
                 universe_resolver=resolve_universe,
                 schedule_timezone=schedule_timezone,
                 trading_day_fn=trading_day_fn,
+                market_open_fn=market_open_fn,
             )
             primary = candidates[0]
             runtime_run = ensure_strategy_run(
@@ -1015,6 +1036,8 @@ class TradingExecutor:
             strategy_name = str(strategy.get("strategy_name") or f"strategy_{strategy_id}")
             notification_config = _json_object(strategy.get("notification_config"))
             leverage = max(1.0, float(trading_config.get("leverage") or strategy.get("leverage") or 1))
+            if ashare_only:
+                leverage = 1.0
             from app.services.strategy_live_guard import resolve_strategy_direction_mode
 
             direction_mode = resolve_strategy_direction_mode(strategy)
@@ -1388,6 +1411,24 @@ class TradingExecutor:
                                     pending_count += len(intents)
                                     for message in messages:
                                         append_strategy_log(strategy_id, "info", message)
+                                    intent_tickers: dict[str, dict[str, Any]] = {}
+                                    if ashare_only and execution_mode == "signal" and intents:
+                                        # Daily frames end at the previous close; simulated
+                                        # A-share fills use the current quote instead.
+                                        quote_members = [
+                                            member
+                                            for member in (
+                                                _candidate_for_symbol(candidates, intent.symbol)
+                                                for intent in intents
+                                            )
+                                            if member is not None
+                                        ]
+                                        intent_tickers = self._live_tickers(quote_members)
+                                    intent_quotes = {
+                                        key: float(ticker.get("last") or 0.0)
+                                        for key, ticker in intent_tickers.items()
+                                        if float(ticker.get("last") or 0.0) > 0
+                                    }
                                     for intent in intents:
                                         submitted = self._execute_strategy_v2_intent(
                                             strategy_id=strategy_id,
@@ -1404,7 +1445,16 @@ class TradingExecutor:
                                             trading_config=trading_config,
                                             exchange_config=exchange_config,
                                             signal_ts=self._intent_signal_timestamp(intent, timestamp),
-                                            current_price_override=_symbol_price(active_prices, candidates, intent.symbol) if daily_policy else None,
+                                            current_price_override=(
+                                                _symbol_price(active_prices, candidates, intent.symbol)
+                                                if daily_policy
+                                                else _symbol_price(intent_quotes, candidates, intent.symbol)
+                                            ),
+                                            ashare_quote=(
+                                                _symbol_ticker(intent_tickers, candidates, intent.symbol) or {}
+                                                if ashare_only and execution_mode == "signal"
+                                                else None
+                                            ),
                                             strategy_run_id=run_id,
                                             direction_mode=direction_mode,
                                         )
@@ -1605,6 +1655,7 @@ class TradingExecutor:
         current_price_override: float | None = None,
         direction_mode: str = "",
         strategy_equity: float | None = None,
+        ashare_quote: Dict[str, Any] | None = None,
     ) -> bool:
         member = _candidate_for_symbol(candidates, intent.symbol)
         if not member:
@@ -1654,14 +1705,43 @@ class TradingExecutor:
         qualified_symbol = str(intent.symbol or symbol or "")
         if not qualified_symbol.upper().startswith("CNSTOCK:") and market_category.upper() in {"CNSTOCK", "CN"}:
             qualified_symbol = f"CNStock:{symbol}" if symbol else qualified_symbol
+        raw_target_amount = target_amount
         target_amount = adjust_cn_stock_target(
             qualified_symbol or symbol,
             current_amount,
             target_amount,
             market_tag=str(member.get("board") or member.get("segment") or ""),
         )
+        if (
+            abs(raw_target_amount - current_amount) > 1e-12
+            and abs(target_amount - current_amount) <= 1e-12
+        ):
+            append_strategy_log(
+                strategy_id,
+                "info",
+                f"A-share order skipped (below one board lot): {symbol} "
+                f"target={raw_target_amount:g} price={price:g}",
+            )
         if market_type == "spot" and target_amount < -1e-12:
             raise RuntimeError("strategyV2.spotShortUnsupported")
+        if ashare_quote is not None and abs(target_amount - current_amount) > 1e-12:
+            from app.markets.cn_stock.quote_rules import ashare_quote_block_reason
+
+            name = str(ashare_quote.get("name") or "")
+            blocked = ashare_quote_block_reason(
+                ashare_quote,
+                qualified_symbol or symbol,
+                buying=target_amount > current_amount,
+                st="ST" in name.upper(),
+            )
+            if blocked:
+                append_strategy_log(
+                    strategy_id,
+                    "warning",
+                    f"A-share order skipped ({blocked}): {symbol} "
+                    f"target={target_amount:g} current={current_amount:g}",
+                )
+                return False
 
         closes_position = abs(target_amount) <= 1e-12 and abs(current_amount) > 1e-12
         if (
@@ -2953,6 +3033,15 @@ class TradingExecutor:
     @staticmethod
     def _live_prices(candidates: list[dict[str, Any]]) -> dict[str, float]:
         prices: dict[str, float] = {}
+        for key, ticker in TradingExecutor._live_tickers(candidates).items():
+            price = float(ticker.get("last") or ticker.get("close") or 0)
+            if price > 0:
+                prices[key] = price
+        return prices
+
+    @staticmethod
+    def _live_tickers(candidates: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+        tickers: dict[str, dict[str, Any]] = {}
         groups: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
         for member in candidates:
             identity = (
@@ -2973,9 +3062,8 @@ class TradingExecutor:
                 for member in members:
                     symbol = str(member.get("symbol") or "")
                     ticker = quotes.get(symbol) or quotes.get(symbol.upper()) or {}
-                    price = float(ticker.get("last") or ticker.get("close") or 0)
-                    if price > 0:
-                        prices[str(member.get("key") or "")] = price
+                    if ticker:
+                        tickers[str(member.get("key") or "")] = dict(ticker)
             except Exception as exc:
                 logger.warning(
                     "Batch price fetch failed for %s/%s (%s symbol(s)): %s",
@@ -2984,7 +3072,7 @@ class TradingExecutor:
                     len(members),
                     exc,
                 )
-        return prices
+        return tickers
 
     @classmethod
     def _execution_account_prices(
@@ -3237,6 +3325,18 @@ def _symbol_price(prices: dict[str, float], candidates: list[dict[str, Any]], sy
         return price
     member = _candidate_for_symbol(candidates, symbol)
     return prices.get(str(member.get("key") or "")) if member else None
+
+
+def _symbol_ticker(
+    tickers: dict[str, dict[str, Any]], candidates: list[dict[str, Any]], symbol: Any
+) -> dict[str, Any] | None:
+    if not tickers:
+        return None
+    ticker = tickers.get(str(symbol))
+    if ticker:
+        return ticker
+    member = _candidate_for_symbol(candidates, symbol)
+    return tickers.get(str(member.get("key") or "")) if member else None
 
 
 def _apply_market_data_defaults(candidates: list[dict[str, Any]]) -> None:
