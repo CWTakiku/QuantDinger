@@ -323,6 +323,18 @@ def _apply_init_sql(logger, *, strict: bool = False):
             _apply_migration_component(
                 conn,
                 logger,
+                name="ashare-data-platform-20261010",
+                path=Path(__file__).resolve().parent.parent.parent / "migrations" / "20261010_ashare_data_platform.sql",
+            )
+            _apply_migration_component(
+                conn,
+                logger,
+                name="ashare-index-weights-20261011",
+                path=Path(__file__).resolve().parent.parent.parent / "migrations" / "20261011_ashare_index_weights.sql",
+            )
+            _apply_migration_component(
+                conn,
+                logger,
                 name="market-symbols-master",
                 path=symbols_sql,
                 baseline_table="qd_market_symbols",

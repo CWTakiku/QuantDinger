@@ -50,6 +50,7 @@ celery_app.conf.update(
         "app.tasks.qlib_eod",
         "app.tasks.glass_fiber_industry",
         "app.tasks.fundamental_sync",
+        "app.tasks.ashare_data",
     ),
     task_routes={
         "quantdinger.tasks.fast_analysis": {"queue": "ai"},
@@ -62,6 +63,7 @@ celery_app.conf.update(
         "quantdinger.tasks.qlib_eod_sync": {"queue": "maintenance"},
         "quantdinger.tasks.glass_fiber_industry_sync": {"queue": "maintenance"},
         "quantdinger.tasks.fundamental_sync_tick": {"queue": "maintenance"},
+        "quantdinger.tasks.ashare_data_daily_sync": {"queue": "maintenance"},
         "quantdinger.tasks.worker_heartbeat": {"queue": "maintenance"},
         "quantdinger.tasks.cleanup_runtime_metadata": {"queue": "maintenance"},
     },
@@ -97,6 +99,10 @@ celery_app.conf.update(
         "glass-fiber-industry-sync": {
             "task": "quantdinger.tasks.glass_fiber_industry_sync",
             "schedule": max(3600, int(os.getenv("GLASS_FIBER_INDUSTRY_SYNC_INTERVAL_SEC", "21600"))),
+        },
+        "ashare-data-daily-sync": {
+            "task": "quantdinger.tasks.ashare_data_daily_sync",
+            "schedule": max(300, int(os.getenv("ASHARE_DATA_SYNC_INTERVAL_SEC", "1800"))),
         },
         "celery-worker-heartbeat": {
             "task": "quantdinger.tasks.worker_heartbeat",

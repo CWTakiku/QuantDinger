@@ -44,10 +44,14 @@ def publish_quant_model(
     model_key: str | None = None,
     alpha_source: str = "rdagent",
     metrics: dict[str, Any] | None = None,
+    factor_source: str | None = None,
 ) -> dict[str, Any]:
     kind_s = str(kind or "").strip().lower()
     if kind_s not in _VALID_KINDS:
         raise ValueError(f"kind must be one of {sorted(_VALID_KINDS)}")
+    from app.services.quant_models.leak_gate import validate_publish
+
+    metrics = validate_publish(kind=kind_s, metrics=metrics, factor_source=factor_source)
 
     key = str(model_key or "").strip() or _default_model_key(session_id, loop_index, kind_s)
     alpha_version = f"qm_{key}"

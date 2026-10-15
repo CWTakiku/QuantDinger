@@ -241,6 +241,9 @@ def get_positions():
             ),
         }
 
+        from app.services.symbol_name import attach_symbol_names
+        attach_symbol_names(out)
+
         return jsonify({
             'code': 1,
             'msg': 'success',

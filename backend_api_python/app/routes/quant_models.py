@@ -107,6 +107,7 @@ def publish_model():
         metrics = payload.get("metrics")
         if metrics is not None and not isinstance(metrics, dict):
             return jsonify({"code": 0, "msg": "quantModels.invalidMetrics", "data": None}), 400
+        factor_source = payload.get("factor_source") or payload.get("factorSource")
 
         result = publish_quant_model(
             display_name=display_name,
@@ -118,6 +119,7 @@ def publish_model():
             model_key=model_key,
             alpha_source=alpha_source,
             metrics=metrics,
+            factor_source=str(factor_source) if factor_source else None,
         )
         logger.info(
             "quant model published user=%s model_key=%s session=%s loop=%s",

@@ -146,6 +146,7 @@ def start_rdagent_job():
                 get_universe_service(),
                 g.user_id,
                 str(universe_code).strip() if universe_code is not None else None,
+                start_date=start_date,
                 end_date=end_date,
             )
         except ValueError as exc:

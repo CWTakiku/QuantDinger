@@ -1,6 +1,9 @@
 # Optional local A-share daily bars for historical Strategy V2 backtests.
 # Usage:
 #   export CNSTOCK_LOCAL_DAILY_HOST_PATH="/path/to/后复权"
+#   export ASHARE_MINUTE_HOST_PATH="/path/to/ashare_minute"   # yearly 1-minute Parquet
+#   export ASHARE_QLIB_CSV_HOST_PATH="/path/to/qlib_csv"
+#   export ASHARE_QLIB_INSTRUMENTS_HOST_PATH="/path/to/qlib/instruments"
 #   docker compose -f docker-compose.yml -f docker-compose.local-data.yml up -d backend
 #
 # Inside the container, bars are read from CNSTOCK_LOCAL_DAILY_DIR=/data/cnstock_daily.
@@ -22,9 +25,15 @@ services:
     <<: *local-env
     volumes:
       - ${CNSTOCK_LOCAL_DAILY_HOST_PATH}:/data/cnstock_daily:ro
+      - ${ASHARE_MINUTE_HOST_PATH}:/data/ashare_minute:ro
+      - ${ASHARE_QLIB_CSV_HOST_PATH}:/data/qlib_csv
+      - ${ASHARE_QLIB_INSTRUMENTS_HOST_PATH}:/data/qlib_instruments
       - ./backend_api_python/.env:/app/.env
     environment:
       - CNSTOCK_LOCAL_DAILY_DIR=/data/cnstock_daily
+      - ASHARE_MINUTE_DIR=/data/ashare_minute
+      - ASHARE_QLIB_CSV_DIR=/data/qlib_csv
+      - ASHARE_QLIB_INSTRUMENTS=/data/qlib_instruments/qd_universe.txt
   trading-worker:
     <<: *local-env
   kafka-audit-worker:
@@ -37,5 +46,12 @@ services:
     <<: *local-env
   celery-worker:
     <<: *local-env
+    volumes:
+      - ./backend_api_python/.env:/app/.env
+      - ${ASHARE_QLIB_CSV_HOST_PATH}:/data/qlib_csv
+      - ${ASHARE_QLIB_INSTRUMENTS_HOST_PATH}:/data/qlib_instruments
+    environment:
+      - ASHARE_QLIB_CSV_DIR=/data/qlib_csv
+      - ASHARE_QLIB_INSTRUMENTS=/data/qlib_instruments/qd_universe.txt
   celery-beat:
     <<: *local-env

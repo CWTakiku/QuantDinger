@@ -69,11 +69,51 @@ def _as_of_date(end_date: str | None) -> date:
     return datetime.utcnow().date()
 
 
+def _membership_intervals(
+    universe_service,
+    user_id: int,
+    universe_id: int,
+    symbols: list[str],
+    *,
+    start_date: str | None,
+    end_date: str,
+) -> list[dict[str, str]]:
+    tip = str(end_date)[:10]
+    start_default = str(start_date or "2015-01-01")[:10]
+    rows = None
+    if hasattr(universe_service, "candidate_members"):
+        rows = universe_service.candidate_members(
+            int(user_id),
+            int(universe_id),
+            start=start_default,
+            end=tip,
+        )
+    out: list[dict[str, str]] = []
+    for row in rows or []:
+        symbol = str(row.get("symbol") or "")
+        if not symbol:
+            continue
+        valid_from = str(row.get("valid_from") or start_default)[:10]
+        valid_to = row.get("valid_to")
+        out.append({
+            "symbol": symbol,
+            "valid_from": valid_from,
+            "valid_to": str(valid_to)[:10] if valid_to else tip,
+        })
+    if out:
+        return out
+    return [
+        {"symbol": symbol, "valid_from": start_default, "valid_to": tip}
+        for symbol in symbols
+    ]
+
+
 def build_universe_job_payload(
     universe_service,
     user_id: int,
     universe_code: str | None,
     *,
+    start_date: str | None = None,
     end_date: str | None = None,
 ) -> dict[str, Any] | None:
     """Resolve QD members into a bridge ``universe`` object.
@@ -121,6 +161,14 @@ def build_universe_job_payload(
         "source_ref": source_ref,
         "market_id": "qd_universe",
         "members": symbols,
+        "memberships": _membership_intervals(
+            universe_service,
+            int(user_id),
+            uid,
+            symbols,
+            start_date=start_date,
+            end_date=as_of.isoformat(),
+        ),
     }
     # Let bridge infer benchmark; optionally pre-set for clarity
     if code in _INDEX_BENCH_BY_CODE:

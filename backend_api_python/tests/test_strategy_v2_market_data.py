@@ -642,3 +642,36 @@ def test_gate_hk_stock_shared_cache_uses_trading_calendar_coverage(monkeypatch):
     assert len(first) == 5
     assert second.equals(first)
     assert calls == [True]
+
+
+def test_csi500_index_skips_stock_csv_with_the_same_digits(monkeypatch):
+    calls = []
+    monkeypatch.setattr("app.services.market.product_catalog.get_catalog_product", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        "app.services.ashare_data.bars.fetch_platform_daily_klines",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("index must not use the stock table")),
+    )
+    monkeypatch.setattr(
+        "app.data_sources.cn_stock_local_daily.fetch_local_daily_klines",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("index must not use the 6-digit stock csv")),
+    )
+    monkeypatch.setattr(
+        market_data.DataSourceFactory,
+        "get_kline",
+        lambda **kwargs: calls.append(kwargs) or [
+            {"time": 1704153600, "open": 5200, "high": 5250, "low": 5180, "close": 5220, "volume": 1},
+            {"time": 1704240000, "open": 5220, "high": 5300, "low": 5200, "close": 5280, "volume": 1},
+        ],
+    )
+
+    frame = market_data._load_strategy_frame_uncached(
+        "CNStock",
+        "000905.SH",
+        "1d",
+        datetime(2024, 1, 2, tzinfo=timezone.utc),
+        datetime(2024, 1, 5, tzinfo=timezone.utc),
+        market_type="spot",
+    )
+
+    assert calls[0]["symbol"] == "000905.SH"
+    assert float(frame["close"].iloc[-1]) == 5280

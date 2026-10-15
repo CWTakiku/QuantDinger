@@ -48,7 +48,7 @@ from .contract import CompiledStrategyV2, StrategyV2ContractError, compile_strat
 from .data import MultiAssetDataPortal, StrategyDataError
 from .frequencies import normalize_frequency, periods_per_year
 from .protection import ProtectionDecision, ProtectionEngine, ProtectionSpec, ProtectionState
-from app.markets.cn_stock.costs import execution_fee, max_buy_notional
+from app.markets.cn_stock.costs import MIN_COMMISSION, execution_fee, max_buy_notional
 from app.markets.cn_stock.lot_rules import cn_stock_lot_spec, cn_stock_min_open
 from app.services.csi300_enhanced import optimize_enhanced_index, optimize_enhanced_index_partial
 from app.services.csi300_enhanced.bench import (
@@ -1079,6 +1079,7 @@ class MultiAssetSimulationBroker:
             elif closes_position:
                 feasible_delta, constraint_reason = delta, ""
             else:
+                trade_day, min_commission = self._ashare_fee_context(order.symbol, bar, timestamp)
                 feasible_delta, constraint_reason = self._feasible_delta(
                     delta=delta,
                     current=current,
@@ -1086,6 +1087,8 @@ class MultiAssetSimulationBroker:
                     equity=equity,
                     lot_size=lot_size,
                     position_key=position_key,
+                    trade_date=trade_day,
+                    min_commission=min_commission,
                 )
             min_fill = 0.0 if (closes_position or exact_close_remainder) else (lot_size - 1e-12)
             if abs(feasible_delta) < min_fill:
@@ -1162,7 +1165,15 @@ class MultiAssetSimulationBroker:
             )
             execution_status = "partial" if has_tradable_remainder else "filled"
             notional = abs(delta * fill_price)
-            fee = execution_fee(order.symbol, notional, self.commission, selling=delta < 0)
+            trade_day, min_commission = self._ashare_fee_context(order.symbol, bar, timestamp)
+            fee = execution_fee(
+                order.symbol,
+                notional,
+                self.commission,
+                selling=delta < 0,
+                trade_date=trade_day,
+                min_commission=min_commission,
+            )
             projected_cash = self.portfolio.available_cash - delta * fill_price - fee
             old_amount = current.amount
             old_cost = current.avg_cost
@@ -1228,6 +1239,7 @@ class MultiAssetSimulationBroker:
                 "status": execution_status,
                 "requested_quantity": abs(requested_delta),
                 "sub_lot_reconciled": exact_close_remainder,
+                "price_scale": float((bar or {}).get("price_scale") or 1.0),
             }
             self.executions.append(execution)
             reason = "margin_liquidation" if forced_liquidation else "filled"
@@ -1369,6 +1381,21 @@ class MultiAssetSimulationBroker:
             return "limit_down"
         return ""
 
+    def _ashare_fee_context(self, symbol: str, bar: Mapping[str, Any] | None, timestamp: Any):
+        """Session date and the 5 CNY floor expressed in the bar's price units.
+
+        Forward-adjusted prices scale the cash account, so the statutory minimum
+        is multiplied by ``price_scale`` (adjusted / raw). Unadjusted bars use 1.
+        """
+        if cn_stock_lot_spec(symbol) is None:
+            return None, None
+        from app.services.market_schedule import equity_bar_session_date
+
+        scale = float((bar or {}).get("price_scale") or 1.0)
+        if not math.isfinite(scale) or scale <= 0:
+            scale = 1.0
+        return equity_bar_session_date(timestamp, "CNStock"), MIN_COMMISSION * scale
+
     def _feasible_delta(
         self,
         *,
@@ -1378,6 +1405,8 @@ class MultiAssetSimulationBroker:
         equity: float,
         lot_size: float,
         position_key: str,
+        trade_date: object = None,
+        min_commission: float | None = None,
     ) -> tuple[float, str]:
         requested_direction = 1 if delta > 0 else -1 if delta < 0 else 0
         feasible = delta
@@ -1386,7 +1415,12 @@ class MultiAssetSimulationBroker:
             borrowing_floor = -equity * (self.leverage - 1.0)
             spendable = max(0.0, self.portfolio.available_cash - borrowing_floor)
             if cn_stock_lot_spec(position_key) is not None:
-                cash_cap = max_buy_notional(spendable, self.commission) / max(fill_price, 1e-12)
+                cash_cap = max_buy_notional(
+                    spendable,
+                    self.commission,
+                    trade_date=trade_date,
+                    min_commission=min_commission,
+                ) / max(fill_price, 1e-12)
             else:
                 cash_cap = spendable / max(fill_price * (1.0 + self.commission), 1e-12)
             if feasible > cash_cap:
@@ -2488,8 +2522,21 @@ class StrategyV2BacktestRunner:
             notional = float(execution.get("notional") or 0.0)
             fee = float(execution.get("commission") or 0.0)
             symbol = str(execution.get("symbol") or execution.get("position_key") or "")
+            scale = float(execution.get("price_scale") or 1.0)
+            trade_day = None
+            min_commission = None
+            if cn_stock_lot_spec(symbol) is not None:
+                from app.services.market_schedule import equity_bar_session_date
+
+                trade_day = equity_bar_session_date(execution.get("time"), "CNStock")
+                min_commission = MIN_COMMISSION * scale if scale > 0 else MIN_COMMISSION
             expected_fee = execution_fee(
-                symbol, notional, self.broker.commission, selling=side != "buy"
+                symbol,
+                notional,
+                self.broker.commission,
+                selling=side != "buy",
+                trade_date=trade_day,
+                min_commission=min_commission,
             )
             if abs(fee - expected_fee) > max(1e-8, abs(expected_fee) * 1e-9):
                 fee_mismatches.append(index)
@@ -2662,6 +2709,17 @@ class StrategyV2LiveSession:
         if bar_advanced:
             self.last_processed = timestamp
         return orders, logs, timestamp
+
+    def calendar_schedule_pending(self, schedule_time: Any = None) -> bool:
+        """True when a calendar schedule is due now and has not fired for its period."""
+        if self.trading_day_fn is None:
+            return False
+        clock = self._schedule_clock(schedule_time)
+        for index, schedule in enumerate(self.program.manifest.schedules):
+            period = self._calendar_schedule_period_due(schedule, clock)
+            if period is not None and self.fired_schedule_periods.get(self._schedule_key(index, schedule)) != period:
+                return True
+        return False
 
     @staticmethod
     def _schedule_key(index: int, schedule) -> str:

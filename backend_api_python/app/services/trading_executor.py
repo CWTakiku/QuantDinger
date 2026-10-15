@@ -1342,16 +1342,21 @@ class TradingExecutor:
                             initial_frames_pending
                             or current_bar_token != last_signal_bar_token
                         ) and (not daily_policy or signal_session is not None)
-                        if has_new_closed_bar:
+                        # Daily bars complete after the close, so an intraday
+                        # calendar schedule (e.g. 09:35) must run on the
+                        # already-loaded frames.
+                        schedule_pending = not has_new_closed_bar and session.calendar_schedule_pending()
+                        if has_new_closed_bar or schedule_pending:
                             # Startup already warmed the complete frame bundle.
                             # Every later trigger extends the shared cache only
                             # for the newly completed candle window.
-                            if not initial_frames_pending or daily_policy:
+                            if has_new_closed_bar and (not initial_frames_pending or daily_policy):
                                 frequency_frames = fetch_runtime_frames()
                                 frames = frequency_frames[frequency]
                             latest_frame_timestamp = _latest_frame_timestamp(frames)
                             frame_advanced = bool(
                                 initial_frames_pending
+                                or schedule_pending
                                 or last_processed_frame_timestamp is None
                                 or (
                                     latest_frame_timestamp is not None

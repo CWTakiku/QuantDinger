@@ -48,6 +48,24 @@ def test_ashare_fee_adds_minimum_commission_transfer_and_sell_stamp():
     assert ashare_trading_fee(0, 0.0003, selling=True) == 0
 
 
+def test_ashare_fee_uses_the_rate_in_force_on_the_trade_date():
+    assert ashare_trading_fee(10_000, 0.0003, selling=True, trade_date=date(2020, 1, 2)) == pytest.approx(15.2)
+    assert ashare_trading_fee(10_000, 0.0003, selling=False, trade_date=date(2020, 1, 2)) == pytest.approx(5.2)
+    assert ashare_trading_fee(10_000, 0.0003, selling=True, trade_date=date(2023, 8, 28)) == pytest.approx(10.1)
+
+
+def test_backtest_sell_uses_the_historical_stamp_duty():
+    symbol = "CNStock:600519.SH"
+    frame = _frame([10.0, 10.0])
+    frame.index = pd.to_datetime(["2020-01-02", "2020-01-03"])
+    broker = MultiAssetSimulationBroker(initial_capital=100_000, commission=0.00025, slippage=0)
+    broker.execute([_buy(symbol, 1000)], _portal(symbol, frame), frame.index[0])
+    broker.execute([OrderIntent(symbol, "quantity", -1000)], _portal(symbol, frame), frame.index[1])
+
+    assert broker.executions[0]["commission"] == pytest.approx(5.2)
+    assert broker.executions[1]["commission"] == pytest.approx(15.2)
+
+
 def test_cn_stock_cannot_sell_shares_bought_the_same_session():
     symbol = "CNStock:600519.SH"
     frame = _frame([10.0, 10.0])

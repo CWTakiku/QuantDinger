@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -207,25 +208,49 @@ def _load_strategy_frame_uncached(
         )
     try:
         rows = []
-        # Prefer local A-share daily CSV for historical backtests only.
-        # Chart/indicator paths use DataSourceFactory (Tencent qfq), not this loader.
+        # A-share daily backtests use the platform table (raw price, qfq to the
+        # window end, limits and suspensions). The local CSV is the fallback.
+        # Chart/indicator paths use DataSourceFactory, not this loader.
         if str(market).strip() == "CNStock" and provider_timeframe == "1D":
-            try:
-                from app.data_sources.cn_stock_local_daily import fetch_local_daily_klines
+            from app.data_sources.tushare_cn import is_ashare_index_ts_code
+            from app.markets.cn_stock.symbols import canonicalize_cn_symbol
 
-                rows = fetch_local_daily_klines(
-                    symbol=symbol,
-                    limit=limit,
-                    before_time=before_time,
-                    after_time=after_time,
-                )
-            except Exception as local_exc:
-                logger.info(
-                    "Local CNStock daily miss for %s: %s",
-                    symbol,
-                    local_exc,
-                )
-                rows = []
+            # Index codes share a 6-digit stem with stocks (000905.SH is CSI500,
+            # 000905.SZ is a listed company). The local CSV folder is keyed only
+            # by those six digits, so an index must not read it.
+            index_code = is_ashare_index_ts_code(canonicalize_cn_symbol(symbol) or symbol)
+            prefer_csv = os.getenv("ASHARE_BACKTEST_SOURCE", "").strip().lower() == "csv"
+            if index_code:
+                prefer_csv = False
+            if not index_code and not prefer_csv:
+                try:
+                    from app.services.ashare_data.bars import fetch_platform_daily_klines
+
+                    rows = fetch_platform_daily_klines(
+                        symbol=symbol,
+                        after_time=after_time,
+                        before_time=before_time,
+                    )
+                except Exception as platform_exc:
+                    logger.info("A-share platform daily miss for %s: %s", symbol, platform_exc)
+                    rows = []
+            if not index_code and (prefer_csv or not rows):
+                try:
+                    from app.data_sources.cn_stock_local_daily import fetch_local_daily_klines
+
+                    rows = fetch_local_daily_klines(
+                        symbol=symbol,
+                        limit=limit,
+                        before_time=before_time,
+                        after_time=after_time,
+                    )
+                except Exception as local_exc:
+                    logger.info(
+                        "Local CNStock daily miss for %s: %s",
+                        symbol,
+                        local_exc,
+                    )
+                    rows = []
         if not rows and (
             str(market or "").strip().lower() == "crypto"
             and str(exchange_id or "").strip().lower() == "bitget"

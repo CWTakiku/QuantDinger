@@ -299,3 +299,131 @@ def resolve_symbol_name(market: str, symbol: str) -> Optional[str]:
         return s
 
     return None
+
+
+def _cn_name_candidates(symbol: str) -> list[str]:
+    """Local lookup keys for an A-share code. Other markets return nothing."""
+    from app.services.external_alpha.symbols import cnstock_name_lookup_candidates
+
+    text = str(symbol or "").strip()
+    if not text:
+        return []
+    body = text.split("::", 1)[0]
+    if ":" in body:
+        market, rest = body.split(":", 1)
+        if market.strip().upper() != "CNSTOCK":
+            return []
+        body = rest
+    return cnstock_name_lookup_candidates(body)
+
+
+def names_from_local_rows(
+    symbols: list[str],
+    history_rows: list[tuple[str, str]],
+    market_rows: list[tuple[str, str]],
+) -> dict[str, str]:
+    """Prefer the point-in-time name table, then the market symbol catalog."""
+    by_cand: dict[str, str] = {}
+
+    def remember(key: str, name: str, *, overwrite: bool) -> None:
+        token = str(key or "").strip().upper()
+        label = str(name or "").strip()
+        if not token or not label or label.upper() == token:
+            return
+        if overwrite or token not in by_cand:
+            by_cand[token] = label
+
+    for symbol, name in market_rows:
+        remember(str(symbol or ""), str(name or ""), overwrite=False)
+    for ts_code, name in history_rows:
+        ts = str(ts_code or "").strip().upper()
+        if "." not in ts:
+            continue
+        code, exchange = ts.split(".", 1)
+        remember(ts, str(name or ""), overwrite=True)
+        remember(code, str(name or ""), overwrite=True)
+        remember(f"{exchange}{code}", str(name or ""), overwrite=True)
+
+    out: dict[str, str] = {}
+    for raw in symbols:
+        text = str(raw or "").strip()
+        if not text or text in out:
+            continue
+        for cand in _cn_name_candidates(text):
+            label = by_cand.get(cand)
+            if label:
+                out[text] = label
+                break
+    return out
+
+
+def lookup_local_symbol_names(symbols: list[str]) -> dict[str, str]:
+    """Map A-share codes to names already stored locally. No network calls."""
+    wanted = []
+    seen = set()
+    for raw in symbols:
+        text = str(raw or "").strip()
+        if text and text not in seen:
+            seen.add(text)
+            wanted.append(text)
+    candidates = sorted({cand for text in wanted for cand in _cn_name_candidates(text)})
+    if not wanted or not candidates:
+        return {}
+    ts_codes = [cand for cand in candidates if cand.endswith((".SH", ".SZ", ".BJ"))]
+    history: list[tuple[str, str]] = []
+    market: list[tuple[str, str]] = []
+    try:
+        with get_db_connection() as db:
+            cur = db.cursor()
+            if ts_codes:
+                placeholders = ",".join(["?"] * len(ts_codes))
+                cur.execute(
+                    f"""
+                    SELECT DISTINCT ON (ts_code) ts_code, name
+                    FROM qd_ashare_name_history
+                    WHERE ts_code IN ({placeholders})
+                      AND end_date IS NULL
+                      AND name IS NOT NULL AND name <> ''
+                    ORDER BY ts_code, start_date DESC NULLS LAST
+                    """,
+                    tuple(ts_codes),
+                )
+                history = [
+                    (str(row.get("ts_code") or ""), str(row.get("name") or ""))
+                    for row in (cur.fetchall() or [])
+                ]
+            placeholders = ",".join(["?"] * len(candidates))
+            cur.execute(
+                f"""
+                SELECT symbol, name
+                FROM qd_market_symbols
+                WHERE market = 'CNStock'
+                  AND UPPER(symbol) IN ({placeholders})
+                  AND name IS NOT NULL AND name <> ''
+                """,
+                tuple(candidates),
+            )
+            market = [
+                (str(row.get("symbol") or ""), str(row.get("name") or ""))
+                for row in (cur.fetchall() or [])
+            ]
+            cur.close()
+    except Exception:
+        logger.debug("local symbol name lookup failed", exc_info=True)
+        return {}
+    return names_from_local_rows(wanted, history, market)
+
+
+def attach_symbol_names(rows: list, *, key: str = "symbol") -> None:
+    """Add ``name`` onto position or trade rows when a local A-share name exists."""
+    if not rows:
+        return
+    names = lookup_local_symbol_names([
+        row.get(key) for row in rows if isinstance(row, dict)
+    ])
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        label = names.get(str(row.get(key) or "").strip())
+        if label:
+            row["name"] = label

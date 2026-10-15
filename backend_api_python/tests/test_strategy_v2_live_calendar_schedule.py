@@ -143,6 +143,36 @@ def test_schedule_waits_for_trading_hours():
     assert len(afternoon) == 1
 
 
+def test_calendar_schedule_pending_without_new_bar():
+    from app.services.market_schedule import is_equity_market_open
+
+    frames = _frames()
+    session = StrategyV2LiveSession(
+        code=_WEEKLY,
+        frames=frames,
+        initial_capital=100000,
+        schedule_timezone="Asia/Shanghai",
+        trading_day_fn=_is_open,
+        market_open_fn=lambda clock: is_equity_market_open("CNStock", clock.to_pydatetime()),
+    )
+    startup, _, _ = session.process(frames, schedule_time="2026-10-09 08:27:00+08:00")
+
+    assert startup == []
+    assert not session.calendar_schedule_pending("2026-10-09 09:30:00+08:00")
+    assert session.calendar_schedule_pending("2026-10-09 09:35:00+08:00")
+
+    orders, _, _ = session.process(frames, schedule_time="2026-10-09 09:35:00+08:00")
+
+    assert len(orders) == 1
+    assert not session.calendar_schedule_pending("2026-10-09 10:00:00+08:00")
+
+
+def test_calendar_schedule_pending_is_false_without_trading_calendar():
+    session = StrategyV2LiveSession(code=_WEEKLY, frames=_frames(), initial_capital=100000)
+
+    assert not session.calendar_schedule_pending("2026-10-09 09:35:00+08:00")
+
+
 def test_is_equity_market_open_for_ashare_sessions():
     from datetime import datetime
     from zoneinfo import ZoneInfo

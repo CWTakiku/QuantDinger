@@ -74,6 +74,11 @@ def test_publish_sets_alpha_version():
             loop_index=0,
             universe="csi300",
             owner_user_id=42,
+            metrics={
+                "data_tip": "2026-08-05",
+                "code_hash": "a" * 64,
+                "ic": 0.01,
+            },
         )
 
     assert out["model_key"] == "sess-1_loop0_model"

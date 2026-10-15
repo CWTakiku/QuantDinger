@@ -161,6 +161,8 @@ def _virtual_trades_payload(strategy_id: int, *, leverage: float, market_type: s
         for trade in ledger_rows
     ]
     trading_fees = opening_commission + closing_commission
+    from app.services.symbol_name import attach_symbol_names
+    attach_symbol_names(processed_rows)
     return {
         "trades": processed_rows,
         "items": processed_rows,
@@ -346,6 +348,8 @@ def get_trades():
             "pnl_status": "pending" if pnl_pending else "complete",
         }
 
+        from app.services.symbol_name import attach_symbol_names
+        attach_symbol_names(processed_rows)
         return jsonify({'code': 1, 'msg': 'success', 'data': {
             'trades': processed_rows, 'items': processed_rows, 'cost_summary': cost_summary,
         }})

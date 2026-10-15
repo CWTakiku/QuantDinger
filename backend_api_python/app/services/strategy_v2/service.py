@@ -32,7 +32,7 @@ from .frequencies import normalize_frequency, periods_per_year
 from .models import InstrumentSpec, StrategyManifest
 from .market_data import load_strategy_frame
 from .runtime import StrategyV2BacktestRunner
-from .readiness import validate_universe_history, validate_warmup, validate_fundamentals
+from .readiness import validate_universe_history, validate_warmup, validate_fundamentals, warmup_shortfalls
 from .snapshot import MarketDataSnapshotStore, canonical_frame_bytes
 from .storage import StrategyBacktestRepository, _enrich_symbol_display_names
 
@@ -208,6 +208,24 @@ class StrategyV2BacktestService:
         frames = frequency_frames.get(frequency, {})
         if not frames:
             raise StrategyV2ContractError("strategyV2.noMarketData")
+        short_symbols = {
+            symbol
+            for symbol, _detail in warmup_shortfalls(
+                frequency_frames, manifest.warmup_bars, start_date, candidates
+            )
+        }
+        if short_symbols:
+            for bundle in frequency_frames.values():
+                for key in short_symbols:
+                    bundle.pop(key, None)
+            skipped.extend(
+                {"symbol": key, "reason": "strategyV2.insufficientWarmupData"}
+                for key in sorted(short_symbols)
+            )
+            candidates = [item for item in candidates if item.get("key") not in short_symbols]
+            frames = frequency_frames.get(frequency, {})
+        if not frames:
+            raise StrategyV2ContractError("strategyV2.insufficientWarmupData")
         validate_warmup(frequency_frames, manifest.warmup_bars, start_date, candidates)
         if manifest.fundamental_dependencies:
             enricher = self.fundamental_enricher or get_fundamental_data_service().enrich_panel

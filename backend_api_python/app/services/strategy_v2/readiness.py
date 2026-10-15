@@ -14,13 +14,19 @@ def validate_universe_history(universe, start_date):
             )
 
 
-def validate_warmup(frequency_frames, warmup_bars, start_date, members=()):
+def warmup_shortfalls(frequency_frames, warmup_bars, start_date, members=()):
+    """Symbols that do not have ``warmup_bars`` completed sessions before they can trade.
+
+    A name that joins an index soon after listing shows up here. Callers that
+    walk a point-in-time universe should skip these names; the strict check
+    still raises.
+    """
     if warmup_bars <= 0:
-        return
+        return []
     start = pd.Timestamp(start_date)
     start = start.tz_localize("UTC") if start.tzinfo is None else start.tz_convert("UTC")
     joined = {item.get("key"): item.get("valid_from") for item in members}
-    problems = []
+    short = []
     for frequency, frames in frequency_frames.items():
         for symbol, frame in frames.items():
             first_active = start
@@ -30,7 +36,12 @@ def validate_warmup(frequency_frames, warmup_bars, start_date, members=()):
             usable = frame.reindex(columns=["open", "high", "low", "close"]).apply(pd.to_numeric, errors="coerce")
             count = int(((index < first_active) & usable.notna().all(axis=1) & (usable > 0).all(axis=1)).sum())
             if count < warmup_bars:
-                problems.append(f"{symbol}@{frequency}={count}/{warmup_bars}")
+                short.append((symbol, f"{symbol}@{frequency}={count}/{warmup_bars}"))
+    return short
+
+
+def validate_warmup(frequency_frames, warmup_bars, start_date, members=()):
+    problems = [detail for _symbol, detail in warmup_shortfalls(frequency_frames, warmup_bars, start_date, members)]
     if problems:
         raise StrategyV2ContractError("strategyV2.insufficientWarmupData:" + ";".join(problems[:6]))
 
